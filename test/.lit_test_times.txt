@@ -1,7 +1,0 @@
-7.053947e-02 atomics-and-aggregates.ll
-8.665276e-02 basic.ll
-8.874178e-02 globals.ll
-7.960510e-02 narrow-signed.ll
-8.017278e-02 startup.ll
-7.857275e-02 vararg.ll
-7.857919e-02 vectors.ll

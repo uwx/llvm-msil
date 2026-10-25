@@ -7,6 +7,7 @@
 # llvm-msil itself has to be added.
 
 import os
+import re
 
 import lit.formats
 import lit.llvm
@@ -23,9 +24,30 @@ if config.test_exec_root:
     config.test_exec_root = os.path.join(config.test_exec_root,
                                          "msil-test-exec-root")
 
+# A generated lit.site.cfg.py fills these in; running lit straight on this
+# directory does not.
+if not getattr(config, "llvm_tools_dir", None):
+    # lit.util.which wants a native path, so an MSYS-style /c/... one has to be
+    # converted before it will find anything.
+    tools = lit_config.params.get(
+        "llvm_tools_dir",
+        os.environ.get("LLVM_TOOLS_DIR",
+                       "/w/projects/llvm-cbe/llvm-project/llvm/build/build64/bin"))
+    if os.name == "nt" and re.match(r"^/[a-zA-Z]/", tools):
+        tools = tools[1].upper() + ":\\" + tools[3:].replace("/", "\\")
+    config.llvm_tools_dir = tools
+if not getattr(config, "llvm_exe_ext", None):
+    config.llvm_exe_ext = ".exe" if os.name == "nt" else ""
+if lit.llvm.llvm_config is None:
+    lit.llvm.initialize(lit_config, config)
+
 llvm_config = lit.llvm.llvm_config
 llvm_config.use_default_substitutions()
-llvm_config.add_tool_substitutions(["llvm-msil"])
+# use_default_substitutions only resolves tools it was given a directory for;
+# when lit runs on this directory directly there is no build-tree tool dir, so
+# name the executables explicitly (which also covers the .exe suffix).
+llvm_config.add_tool_substitutions(
+    ["llvm-msil", "FileCheck", "not"], [config.llvm_tools_dir])
 
 if not os.path.exists(os.path.join(config.llvm_tools_dir,
                                    "llvm-msil" + config.llvm_exe_ext)):
