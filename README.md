@@ -229,11 +229,21 @@ things:
   build of the same source.
 
 The end-to-end programs are the ones that find real bugs; the hand-written IR
-tests only cover the cases someone thought to write. `int128.sh` and `sdl.sh`
-are self-contained. `sdl.sh` needs SDL2 development files: set `SDL2_DIR` to a
-directory with `include/SDL2` and `lib/SDL2.lib`, and `SDL2_BIN` to `SDL2.dll`
-if it is not in `lib/`. Without them the test reports `sdl: skipped` and the
-gate still passes.
+tests only cover the cases someone thought to write. They sweep `-O0` to `-O3`,
+which matters: the bugs they have caught so far each appeared at a single
+level. `int128.sh` and `sdl.sh` are self-contained. `sdl.sh` needs SDL2
+development files: set `SDL2_DIR` to a directory with `include/SDL2` and
+`lib/SDL2.lib`, and `SDL2_BIN` to `SDL2.dll` if it is not in `lib/`. Without
+them the test reports `sdl: skipped` and the gate still passes.
+
+`doom.sh` runs PureDOOM for a fixed number of tics on a virtual clock and
+hashes the framebuffer; `stb.sh` exercises stb_image (including a PNG
+decode/encode round trip), stb_truetype, stb_rect_pack and stb_ds. Their
+sources are third-party, so they are fetched at a pinned commit into
+`/tmp/msil-thirdparty` and cached (`MSIL_TEST_CACHE` moves the cache). A
+machine with neither the cache nor network reports `skipped` and the gate
+still passes. `stb.sh` needs a TrueType font; `STB_TEST_FONT` overrides the
+default `C:/Windows/Fonts/arial.ttf`.
 
 `cbe_port.py` can be driven directly:
 
@@ -252,9 +262,11 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   signature gets a concrete pinvoke thunk, since `ilasm` rejects `vararg`
   pinvokes. Definitions of vararg functions that forward a `va_list` to a CRT
   internal (the wrappers MSVC's `stdio.h` produces) are dropped and bound to
-  the real export instead. A vararg floating-point argument crosses the
-  boundary as its raw `int64` bits, because the CRT's `va_arg` reads the
-  general-purpose shadow slot on Windows x64.
+  the real export instead. The forward may go through another printf-family
+  wrapper first (`snprintf` reaches `vsnprintf`), so those are matched by name.
+  A vararg floating-point argument crosses the boundary as its raw `int64`
+  bits, because the CRT's `va_arg` reads the general-purpose shadow slot on
+  Windows x64.
 * **`<N x i128>` vectors are broken.** The aggregate class has no valid IL type
   name, so the output does not assemble. There is a `report_fatal_error` on
   element extract/insert, but a vector-typed parameter or return reaches the

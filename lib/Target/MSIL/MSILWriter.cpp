@@ -105,8 +105,14 @@ static cl::opt<std::string> ExternClassName(
 // reached by adding an offset to a raw pointer. The pointer that goes on the
 // stack is the GEP's *base*: ldfld adds the member offset itself, so handing
 // it the already-offset pointer would add the offset a second time.
-StructType *MSILWriter::structFieldOf(const Value *Ptr, unsigned &Field,
-                                      const Value *&Base) {
+//
+// Only an access whose type is exactly the field's type qualifies. A narrower
+// or wider access through the same address (`load i32` from the start of a
+// `{ i32, i32 }` member) is a different value with a different stack type, so
+// it must go through the pointer path: ldfld of the declared type would push
+// the whole member where an int32 is expected, and the JIT rejects the method.
+StructType *MSILWriter::structFieldOf(const Value *Ptr, Type *AccessTy,
+                                      unsigned &Field, const Value *&Base) {
   const auto *GEP = dyn_cast<GEPOperator>(Ptr);
   if (!GEP || GEP->getNumOperands() != 3)
     return nullptr;
@@ -120,6 +126,8 @@ StructType *MSILWriter::structFieldOf(const Value *Ptr, unsigned &Field,
     return nullptr;
   Field = Second->getZExtValue();
   if (Field >= STy->getNumElements())
+    return nullptr;
+  if (STy->getElementType(Field) != AccessTy)
     return nullptr;
   Base = GEP->getPointerOperand();
   return STy;
@@ -770,9 +778,9 @@ void MSILWriter::printConstantExpr(const ConstantExpr *CE) {
 void MSILWriter::printIndirectLoad(const Value *Ptr, Type *Ty) {
   unsigned Field = 0;
   const Value *Base = nullptr;
-  if (StructType *STy = structFieldOf(Ptr, Field, Base)) {
+  if (StructType *STy = structFieldOf(Ptr, Ty, Field, Base)) {
     printValueLoad(Base);
-    out() << "\tldfld " << getTypeName(STy->getElementType(Field)) << " '"
+    out() << "\tldfld " << getTypeName(Ty) << " '"
           << getAggregateName(STy) << "'::'f" << Field << "'\n";
     return;
   }
@@ -787,10 +795,10 @@ void MSILWriter::printIndirectSave(const Value *Ptr, const Value *Val) {
   unsigned Field = 0;
   const Value *Base = nullptr;
   // stfld wants the address first, same as stind, so the order is unchanged.
-  if (StructType *STy = structFieldOf(Ptr, Field, Base)) {
+  if (StructType *STy = structFieldOf(Ptr, Val->getType(), Field, Base)) {
     printValueLoad(Base);
     printValueLoad(Val);
-    out() << "\tstfld " << getTypeName(STy->getElementType(Field)) << " '"
+    out() << "\tstfld " << getTypeName(Val->getType()) << " '"
           << getAggregateName(STy) << "'::'f" << Field << "'\n";
     return;
   }
@@ -2967,14 +2975,27 @@ void MSILWriter::lowerIntrinsics(Function &F) {
   // `printf` wrapper clang emits from MSVC's stdio.h) cannot work: it passes a
   // va_list that only exists in the native ABI. Drop the definition so calls
   // bind to the real exported function through a pinvoke thunk instead.
+  //
+  // The forward can be two hops: `snprintf` wraps `vsnprintf`, which is the
+  // definition that reaches `__stdio_common_vsprintf`. Both get dropped, so
+  // both become declarations and calls bind to the exported functions. The
+  // callee is matched by name, not linkage: the intermediate wrapper is still
+  // a definition when the outer one is examined.
   if (F.isVarArg() && !F.isDeclaration()) {
+    auto IsCRTEntry = [](const Function *Callee) {
+      StringRef N = Callee->getName();
+      if (N.starts_with("__stdio_common_") || N.starts_with("__acrt_"))
+        return true;
+      return N == "printf" || N == "vprintf" || N == "sprintf" ||
+             N == "vsprintf" || N == "snprintf" || N == "vsnprintf" ||
+             N == "_snprintf" || N == "_vsnprintf";
+    };
     bool ForwardsToCRT = false;
     for (BasicBlock &BB : F)
       for (Instruction &I : BB)
         if (auto *CB = dyn_cast<CallBase>(&I))
           if (auto *Callee = CB->getCalledFunction())
-            if (Callee->getName().starts_with("__stdio_common_") ||
-                Callee->getName().starts_with("__acrt_"))
+            if (IsCRTEntry(Callee))
               ForwardsToCRT = true;
     if (ForwardsToCRT) {
       F.deleteBody();

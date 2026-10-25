@@ -37,3 +37,24 @@ define i32 @access(ptr %p) {
   %s = add i32 %v0, %e
   ret i32 %s
 }
+
+; An access narrower than the field it lands in is a different value with a
+; different stack type, so it must not use ldfld/stfld: ldfld of struct.Q would
+; push a 64-bit struct where an i32 is expected, which the JIT rejects with
+; InvalidProgramException. The pointer path is used instead.
+%struct.Q = type { { i32, i32 }, i32 }
+
+define i32 @partial(ptr %p) {
+; CHECK-LABEL: .method static {{.*}} 'partial'
+; CHECK-NOT: ldfld valuetype 'struct.Q'::'f0'
+; CHECK: ldind.i4
+; CHECK-NOT: stfld valuetype 'struct.Q'::'f0'
+; CHECK: stind.i4
+  %f0 = getelementptr inbounds %struct.Q, ptr %p, i32 0, i32 0
+  store i32 5, ptr %f0
+  %v = load i32, ptr %f0
+  %f1 = getelementptr inbounds %struct.Q, ptr %p, i32 0, i32 1
+  %w = load i32, ptr %f1
+  %s = add i32 %v, %w
+  ret i32 %s
+}

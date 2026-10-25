@@ -10,8 +10,9 @@ Use `dotnet prog.exe`, not `prog.exe`. A bare exe has no `runtimeconfig.json`,
 so the host picks a .NET Framework-era resolver, `mscorlib` resolves to the
 Facade and newer types are missing. With a `runtimeconfig.json` naming
 `Microsoft.NETCore.App` and invoking through `dotnet`, assembly references
-resolve normally. (The existing tests get away with a bare exe because they
-only use `mscorlib` types, e.g. `Console`, that the facade does provide.)
+resolve normally. (The lit and llvm-cbe tests get away with a bare exe
+because they only use `mscorlib` types, e.g. `Console`, that the facade does
+provide; `test/programs/*.sh` all write a runtimeconfig and invoke `dotnet`.)
 
 ## Assembly references
 
