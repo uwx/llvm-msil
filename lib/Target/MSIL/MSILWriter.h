@@ -96,6 +96,8 @@ private:
   void printIndirectLoad(const Value *Ptr, Type *Ty);
   void printIndirectSave(const Value *Ptr, const Value *Val);
   void printCastInstruction(unsigned Op, const Value *V, Type *Ty);
+  void printWideBinary(unsigned Op, const Value *L, const Value *R);
+  void printWideICmp(unsigned Pred, const Value *L, const Value *R);
   void printGepInstruction(const User *GEP);
   void printVectorGep(const GEPOperator *GEP);
   /// Expand vector element-wise arithmetic into a per-lane loop.
@@ -183,6 +185,10 @@ private:
   };
   std::vector<PInvoke> PInvokes;
   std::map<std::pair<const Function *, std::string>, std::string> PInvokeNames;
+
+  /// Set once a 128-bit integer reaches the output; decides whether the
+  /// System.Runtime reference is emitted.
+  bool NeedsSystemRuntime = false;
 
   uint64_t UniqID = 0;
   uint64_t getUniqID() { return ++UniqID; }

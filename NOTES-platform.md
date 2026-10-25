@@ -44,8 +44,11 @@ fine through `dotnet`.
 
 ## Int128 / UInt128
 
-These are **not** primitive types and have **no public constructors**. Build
-them through the conversion operator:
+These are **not** primitive types. The one public constructor is
+`.ctor(uint64 upper, uint64 lower)` — **upper first**; the runtime's own
+`Int128` implements the operators through it, so the obvious
+`(uint64 lower, uint64 upper)` reading silently builds the wrong value. For a
+value that fits in `int64`, build it through the conversion operator instead:
 
 ```
 ldc.i8 5
@@ -59,6 +62,22 @@ They are ordinary value types (not byref-like), so `ldloc`/`stloc`/`ldobj`/
 `op_Division`, ...) and comparisons are `op_Equality`, `op_LessThan`, ... So a
 128-bit IR add becomes a `call`, and a 128-bit compare becomes a `call` plus a
 branch, not `add`/`clt`.
+
+Verified details that are not obvious from the API listing:
+
+* Shift counts are `int32` and are reduced **modulo 128** by the method, which
+  matches LLVM's shift semantics. `Int128` also has `op_UnsignedRightShift`
+  (the `>>>` operator) — use it for `lshr`; `op_RightShift` is arithmetic.
+* There is **no unsigned division or comparison on `Int128`**. Convert to
+  `UInt128` with `Int128::op_Explicit`, compute there, convert back with
+  `UInt128::op_Explicit` (the reverse conversion is declared on `UInt128`).
+* `op_Explicit(int64)` truncates to the low half — that is `trunc i128 to i64`.
+  `op_Implicit(uint64)` zero-extends, `op_Implicit(int64)` sign-extends; those
+  are `zext`/`sext` from 64 bits.
+* Value types cross the `call` boundary and sit in locals with `ldloc`/`stloc`
+  directly; `ldobj`/`stobj` work through a `conv.u8` unmanaged pointer too.
+* A local declared `valuetype [System.Runtime]System.Int128` is initialized to
+  zero by `.locals init` — an `initobj` is not needed for the zero constant.
 
 ## Vector<T>
 

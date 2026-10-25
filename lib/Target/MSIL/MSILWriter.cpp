@@ -50,6 +50,44 @@ template <typename T> std::string str(const T *V) {
   V->print(OS);
   return S;
 }
+
+// A 128-bit integer is a .NET value type from System.Runtime, not a primitive:
+// there is no IL arithmetic for it, so every operator below becomes a call.
+const char *const Int128Ty = "valuetype [System.Runtime]System.Int128";
+const char *const UInt128Ty = "valuetype [System.Runtime]System.UInt128";
+// The same types without the `valuetype` keyword, for `Type::Method` after a
+// call's return type.
+const char *const Int128Ref = "[System.Runtime]System.Int128";
+const char *const UInt128Ref = "[System.Runtime]System.UInt128";
+
+bool isWideInt(Type *Ty) { return Ty->isIntegerTy(128); }
+
+/// Types that move with ldobj/stobj rather than ldind/stind.
+bool movesAsBlob(Type *Ty) {
+  return Ty->isAggregateType() || Ty->isVectorTy() || isWideInt(Ty);
+}
+
+/// Operators that are an IL opcode for scalars but a method call for i128.
+bool isWideBinaryOpcode(unsigned Op) {
+  switch (Op) {
+  case Instruction::Add:
+  case Instruction::Sub:
+  case Instruction::Mul:
+  case Instruction::UDiv:
+  case Instruction::SDiv:
+  case Instruction::URem:
+  case Instruction::SRem:
+  case Instruction::And:
+  case Instruction::Or:
+  case Instruction::Xor:
+  case Instruction::Shl:
+  case Instruction::LShr:
+  case Instruction::AShr:
+    return true;
+  default:
+    return false;
+  }
+}
 } // namespace
 
 char MSILWriter::ID = 0;
@@ -139,6 +177,8 @@ std::string MSILWriter::getTypeName(Type *Ty) {
     unsigned N = Ty->getIntegerBitWidth();
     if (N == 1)
       return "bool";
+    if (N == 128)
+      return Int128Ty;
     if (N <= 32)
       return "int" + utostr(N);
     // The CLR has no integer wider than 64 bits; wide IR integers (i33 from
@@ -165,6 +205,8 @@ std::string MSILWriter::getLocalType(Type *Ty) {
     unsigned N = Ty->getIntegerBitWidth();
     if (N == 1)
       return "bool";
+    if (N == 128)
+      return Int128Ty;
     return N <= 32 ? "int32" : "int64";
   }
   return getTypeName(Ty);
@@ -212,7 +254,7 @@ const char *widthConv(Type *Ty) {
 } // namespace
 
 std::string MSILWriter::getMemSuffix(Type *Ty) {
-  if (Ty->isAggregateType())
+  if (movesAsBlob(Ty))
     return "";
   return memSuffixOf(Ty).str();
 }
@@ -288,8 +330,9 @@ void MSILWriter::printValueSave(const Value *V) {
   Type *Ty = V->getType();
   // Store narrow integers in canonical form so unsigned loads are correct.
   // A value computed by a 32-bit IL op arrives as int32 even when its IR type
-  // is i64, so always normalize to the declared width here.
-  if (Ty->isIntegerTy() && !Ty->isIntegerTy(32))
+  // is i64, so always normalize to the declared width here. i128 is a value
+  // type: conv has nothing to normalize, and the local already matches.
+  if (Ty->isIntegerTy() && !Ty->isIntegerTy(32) && !isWideInt(Ty))
     out() << '\t' << widthConv(Ty) << '\n';
   if (isa<Argument>(V))
     out() << "\tstarg\t'" << getValueName(V) << "'\n";
@@ -303,7 +346,9 @@ void MSILWriter::printValueLoadAsInt(const Value *V, bool Signed) {
   if (!Ty->isIntegerTy())
     return;
   unsigned N = Ty->getIntegerBitWidth();
-  if (N == 32 || N == 64)
+  // i128 is stored as a value type, never as a stack int, so it has no
+  // canonical form to restore and no conv applies.
+  if (N == 32 || N == 64 || N == 128)
     return;
   if (N == 16)
     out() << (Signed ? "\tconv.i2\n" : "\tconv.u2\n");
@@ -322,6 +367,23 @@ void MSILWriter::printConstLoad(const Constant *C) {
     unsigned N = Ty->getIntegerBitWidth();
     if (N == 1) {
       out() << "\tldc.i4." << (CI->isZero() ? "0" : "1") << '\n';
+      return;
+    }
+    if (N == 128) {
+      const APInt &V = CI->getValue();
+      // Use the ctor only when the value needs both halves; op_Implicit is the
+      // only way to build the common small case.
+      if (V.isSignedIntN(64)) {
+        out() << "\tldc.i8\t" << V.getSExtValue() << "\n\tcall\t" << Int128Ty
+              << ' ' << Int128Ref << "::op_Implicit(int64)\n";
+      } else {
+        // .ctor(uint64 upper, uint64 lower): the halves are pushed in that
+        // order, and ilasm reads ldc.i8 as signed.
+        out() << "\tldc.i8\t" << (int64_t)V.getHiBits(64).getZExtValue()
+              << "\n\tldc.i8\t" << (int64_t)V.getLoBits(64).getZExtValue()
+              << "\n\tnewobj\tinstance void " << Int128Ty
+              << "::.ctor(uint64, uint64)\n";
+      }
       return;
     }
     out() << "\tldc." << (N <= 32 ? "i4" : "i8") << '\t' << CI->getSExtValue()
@@ -349,7 +411,12 @@ void MSILWriter::printConstLoad(const Constant *C) {
 
   if (isa<UndefValue>(C) || isa<ConstantPointerNull>(C) ||
       isa<ConstantAggregateZero>(C) || C->isNullValue()) {
-    if (Ty->isAggregateType() || Ty->isVectorTy()) {
+    if (isWideInt(Ty)) {
+      out() << "\tldc.i8\t0\n\tcall\t" << Int128Ty << ' ' << Int128Ref
+            << "::op_Implicit(int64)\n";
+      return;
+    }
+    if (movesAsBlob(Ty)) {
       std::string Tmp = newTempLocal(Ty);
       out() << "\tldloca\t'" << Tmp << "'\n\tinitobj\t" << getTypeName(Ty)
           << "\n\tldloc\t'" << Tmp << "'\n";
@@ -447,7 +514,10 @@ void MSILWriter::printConstLoad(const Constant *C) {
             out() << "\tconv.i8\n\tadd\n";
           }
           printConstLoad(V);
-          out() << "\tstind." << getMemSuffix(Ty) << "\n";
+          if (movesAsBlob(Ty))
+            out() << "\tstobj\t" << getTypeName(Ty) << "\n";
+          else
+            out() << "\tstind." << getMemSuffix(Ty) << "\n";
         };
     Store(C, 0);
     out() << "\tldloc\t'" << Tmp << "'\n";
@@ -467,6 +537,10 @@ void MSILWriter::printConstantExpr(const ConstantExpr *CE) {
     return;
   case Instruction::BitCast:
   case Instruction::AddrSpaceCast:
+    if (isWideInt(CE->getType()) || isWideInt(CE->getOperand(0)->getType())) {
+      printCastInstruction(CE->getOpcode(), CE->getOperand(0), CE->getType());
+      return;
+    }
     printValueLoad(CE->getOperand(0));
     return;
   case Instruction::Add:
@@ -478,6 +552,11 @@ void MSILWriter::printConstantExpr(const ConstantExpr *CE) {
   case Instruction::And:
   case Instruction::Or:
   case Instruction::Xor: {
+    // A 128-bit constant expression would need the method-call expansion; none
+    // of these survive to the writer for i128 anyway, and the scalar path
+    // below would emit raw IL opcodes that do not exist for it.
+    if (isWideInt(CE->getType()))
+      report_fatal_error("MSIL: unsupported 128-bit constant expression");
     // InstCombine rewrites GEPs into pointer-offset arithmetic, so pointer
     // math shows up as constant expressions, not just as casts.
     const char *Op = nullptr;
@@ -509,7 +588,7 @@ void MSILWriter::printConstantExpr(const ConstantExpr *CE) {
 
 void MSILWriter::printIndirectLoad(const Value *Ptr, Type *Ty) {
   printValueLoad(Ptr);
-  if (Ty->isAggregateType() || Ty->isVectorTy())
+  if (movesAsBlob(Ty))
     out() << "\tldobj\t" << getTypeName(Ty) << '\n';
   else
     out() << "\tldind." << getMemSuffix(Ty) << '\n';
@@ -518,7 +597,7 @@ void MSILWriter::printIndirectLoad(const Value *Ptr, Type *Ty) {
 void MSILWriter::printIndirectSave(const Value *Ptr, const Value *Val) {
   printValueLoad(Ptr);
   printValueLoad(Val);
-  if (Val->getType()->isAggregateType() || Val->getType()->isVectorTy())
+  if (movesAsBlob(Val->getType()))
     out() << "\tstobj\t" << getTypeName(Val->getType()) << '\n';
   else
     out() << "\tstind." << getMemSuffix(Val->getType()) << '\n';
@@ -529,6 +608,79 @@ void MSILWriter::printIndirectSave(const Value *Ptr, const Value *Val) {
 //===----------------------------------------------------------------------===//
 
 void MSILWriter::printCastInstruction(unsigned Op, const Value *V, Type *Ty) {
+  // i128 conversions are the value type's conversion operators; no IL conv
+  // applies to a value type.
+  Type *SrcTy = V->getType();
+  if (isWideInt(Ty) || isWideInt(SrcTy)) {
+    switch (Op) {
+    case Instruction::Trunc:
+      // op_Explicit(int64) keeps the low half, then narrow as usual.
+      printValueLoad(V);
+      out() << "\tcall\tint64 " << Int128Ref << "::op_Explicit(" << Int128Ty
+            << ")\n";
+      if (Ty->getIntegerBitWidth() <= 32)
+        out() << '\t' << widthConv(Ty) << '\n';
+      return;
+    case Instruction::ZExt:
+    case Instruction::PtrToInt:
+    case Instruction::PtrToAddr:
+      // A narrow or 64-bit value is held zero-extended on the stack, so conv.u8
+      // is the whole zero-extension.
+      printValueLoad(V);
+      out() << "\tconv.u8\n\tcall\t" << Int128Ty << ' ' << Int128Ref
+            << "::op_Implicit(uint64)\n";
+      return;
+    case Instruction::SExt:
+      printValueLoadAsInt(V, true);
+      out() << "\tconv.i8\n\tcall\t" << Int128Ty << ' ' << Int128Ref
+            << "::op_Implicit(int64)\n";
+      return;
+    case Instruction::IntToPtr:
+      printValueLoad(V);
+      out() << "\tcall\tint64 " << Int128Ref << "::op_Explicit(" << Int128Ty
+            << ")\n\tconv.i\n";
+      return;
+    case Instruction::UIToFP:
+      printValueLoad(V);
+      out() << "\tcall\tfloat64 " << UInt128Ref << "::op_Explicit(" << UInt128Ty
+            << ")\n";
+      if (Ty->isFloatTy())
+        out() << "\tconv.r4\n";
+      return;
+    case Instruction::SIToFP:
+      printValueLoad(V);
+      out() << "\tcall\tfloat64 " << Int128Ref << "::op_Explicit(" << Int128Ty
+            << ")\n";
+      if (Ty->isFloatTy())
+        out() << "\tconv.r4\n";
+      return;
+    case Instruction::FPToUI:
+    case Instruction::FPToSI: {
+      // The conversion operators take float64; the float32 case widens first.
+      const char *T = Op == Instruction::FPToUI ? UInt128Ty : Int128Ty;
+      printValueLoad(V);
+      if (SrcTy->isFloatTy())
+        out() << "\tconv.r8\n";
+      out() << "\tcall\t" << T << ' ' << T << "::op_Explicit(float64)\n";
+      return;
+    }
+    case Instruction::BitCast:
+    case Instruction::AddrSpaceCast: {
+      // A 128-bit bitcast is always to or from a same-size blob; move the
+      // bytes through memory because the two value types cannot be assigned
+      // to each other.
+      std::string Tmp = newTempLocal(SrcTy);
+      printValueLoad(V);
+      out() << "\tstloc\t'" << Tmp << "'\n\tldloca\t'" << Tmp
+            << "'\n\tconv.u8\n\tldobj\t" << getTypeName(Ty) << '\n';
+      return;
+    }
+    default:
+      report_fatal_error("MSIL: unsupported 128-bit cast: " +
+                         Twine(Instruction::getOpcodeName(Op)));
+    }
+  }
+
   // Vector casts and bitcasts are byte-level moves between two blobs; the
   // scalar paths below would truncate the aggregate to a single value.
   if (auto *DstVTy = dyn_cast<VectorType>(Ty)) {
@@ -548,6 +700,7 @@ void MSILWriter::printCastInstruction(unsigned Op, const Value *V, Type *Ty) {
       return;
     }
   }
+
   switch (Op) {
   case Instruction::BitCast:
   case Instruction::AddrSpaceCast: {
@@ -930,6 +1083,119 @@ void MSILWriter::printFCmp(unsigned Pred, const Value *L, const Value *R,
 }
 
 //===----------------------------------------------------------------------===//
+// 128-bit integers
+//===----------------------------------------------------------------------===//
+
+// System.Int128 has no IL arithmetic: every operator is a static method on the
+// value type. Operands are already the right value type on the stack, so each
+// case is just "load, load, call".
+namespace {
+/// Reinterpret the Int128 on the stack as UInt128. Used wherever an operation
+/// only exists on the unsigned type, or must be unsigned.
+void emitAsUInt128(raw_ostream &Out) {
+  Out << "\tcall\t" << UInt128Ty << ' ' << Int128Ref << "::op_Explicit("
+      << Int128Ty << ")\n";
+}
+
+/// And back. The reverse conversion exists on UInt128, not Int128.
+void emitFromUInt128(raw_ostream &Out) {
+  Out << "\tcall\t" << Int128Ty << ' ' << UInt128Ref << "::op_Explicit("
+      << UInt128Ty << ")\n";
+}
+} // namespace
+
+void MSILWriter::printWideBinary(unsigned Op, const Value *L,
+                                 const Value *R) {
+  const char *Name;
+  switch (Op) {
+  case Instruction::Add:  Name = "op_Addition"; break;
+  case Instruction::Sub:  Name = "op_Subtraction"; break;
+  case Instruction::Mul:  Name = "op_Multiply"; break;
+  case Instruction::UDiv:
+  case Instruction::SDiv: Name = "op_Division"; break;
+  case Instruction::URem:
+  case Instruction::SRem: Name = "op_Modulus"; break;
+  case Instruction::And:  Name = "op_BitwiseAnd"; break;
+  case Instruction::Or:   Name = "op_BitwiseOr"; break;
+  case Instruction::Xor:  Name = "op_ExclusiveOr"; break;
+  case Instruction::Shl:  Name = "op_LeftShift"; break;
+  case Instruction::LShr: Name = "op_UnsignedRightShift"; break;
+  case Instruction::AShr: Name = "op_RightShift"; break;
+  default:
+    report_fatal_error("MSIL: unsupported 128-bit operation");
+  }
+
+  // Unsigned division and remainder have no Int128 method, so compute on
+  // UInt128 and reinterpret back.
+  if (Op == Instruction::UDiv || Op == Instruction::URem) {
+    printValueLoad(L);
+    emitAsUInt128(out());
+    printValueLoad(R);
+    emitAsUInt128(out());
+    out() << "\tcall\t" << UInt128Ty << ' ' << UInt128Ref << "::" << Name
+          << "(" << UInt128Ty << ", " << UInt128Ty << ")\n";
+    emitFromUInt128(out());
+    return;
+  }
+
+  printValueLoad(L);
+  printValueLoad(R);
+  // The shift methods take an int32 count and reduce it modulo 128, which is
+  // LLVM's shl/lshr/ashr semantics for an out-of-range amount. The IR count is
+  // i128 like the value, so it needs a conversion before conv.i4.
+  bool Shift = Op == Instruction::Shl || Op == Instruction::LShr ||
+               Op == Instruction::AShr;
+  if (Shift) {
+    if (isWideInt(R->getType()))
+      out() << "\tcall\tint64 " << Int128Ref << "::op_Explicit(" << Int128Ty
+            << ")\n";
+    out() << "\tconv.i4\n";
+  }
+  out() << "\tcall\t" << Int128Ty << ' ' << Int128Ref << "::" << Name << "("
+        << Int128Ty << ", " << (Shift ? "int32" : Int128Ty) << ")\n";
+}
+
+// Comparisons return bool from op_Equality/op_LessThan/.... The relational
+// forms are strict, so <= and >= negate the mirror form, as printICmp does.
+void MSILWriter::printWideICmp(unsigned Pred, const Value *L, const Value *R) {
+  bool U = Pred == CmpInst::ICMP_ULT || Pred == CmpInst::ICMP_ULE ||
+           Pred == CmpInst::ICMP_UGT || Pred == CmpInst::ICMP_UGE;
+  const char *T = U ? UInt128Ty : Int128Ty;
+  // <= and >= are the negation of the strict predicate on the same operands.
+  unsigned Mirror = Pred;
+  bool Negate = false;
+  switch (Pred) {
+  case CmpInst::ICMP_ULE: Mirror = CmpInst::ICMP_UGT; Negate = true; break;
+  case CmpInst::ICMP_UGE: Mirror = CmpInst::ICMP_ULT; Negate = true; break;
+  case CmpInst::ICMP_SLE: Mirror = CmpInst::ICMP_SGT; Negate = true; break;
+  case CmpInst::ICMP_SGE: Mirror = CmpInst::ICMP_SLT; Negate = true; break;
+  default: break;
+  }
+  const char *Name;
+  switch (Mirror) {
+  case CmpInst::ICMP_EQ:  Name = "op_Equality"; break;
+  case CmpInst::ICMP_NE:  Name = "op_Inequality"; break;
+  case CmpInst::ICMP_ULT:
+  case CmpInst::ICMP_SLT: Name = "op_LessThan"; break;
+  case CmpInst::ICMP_UGT:
+  case CmpInst::ICMP_SGT: Name = "op_GreaterThan"; break;
+  default:
+    llvm_unreachable("unknown icmp predicate");
+  }
+
+  printValueLoad(L);
+  if (U)
+    emitAsUInt128(out());
+  printValueLoad(R);
+  if (U)
+    emitAsUInt128(out());
+  out() << "\tcall\tbool " << (U ? UInt128Ref : Int128Ref) << "::" << Name
+        << "(" << T << ", " << T << ")\n";
+  if (Negate)
+    printNot();
+}
+
+//===----------------------------------------------------------------------===//
 // Instructions
 //===----------------------------------------------------------------------===//
 
@@ -1221,6 +1487,12 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     }
   }
 
+  // i128 has no IL arithmetic; every operator is a static method call.
+  if (isWideInt(Ty) && isWideBinaryOpcode(Inst->getOpcode())) {
+    printWideBinary(Inst->getOpcode(), Op0, Op1);
+    return;
+  }
+
   switch (Inst->getOpcode()) {
   case Instruction::PHI:
   case Instruction::Alloca:
@@ -1309,6 +1581,8 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     if (auto *RTy = dyn_cast<VectorType>(Ty))
       printVectorCmp(cast<ICmpInst>(Inst)->getPredicate(), Op0, Op1, RTy,
                      /*IsFP=*/false);
+    else if (isWideInt(Op0->getType()))
+      printWideICmp(cast<ICmpInst>(Inst)->getPredicate(), Op0, Op1);
     else
       printICmp(cast<ICmpInst>(Inst)->getPredicate(), Op0, Op1);
     return;
@@ -1408,6 +1682,8 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
   }
   case Instruction::ExtractElement: {
     // Vectors are byte blobs: take the address of the element and load it.
+    if (isWideInt(Ty))
+      report_fatal_error("MSIL: unsupported 128-bit vector element");
     auto *VTy = cast<VectorType>(Inst->getOperand(0)->getType());
     uint64_t ElemSize = DL->getTypeAllocSize(VTy->getElementType())
                             .getFixedValue();
@@ -1423,6 +1699,8 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     return;
   }
   case Instruction::InsertElement: {
+    if (isWideInt(Inst->getOperand(1)->getType()))
+      report_fatal_error("MSIL: unsupported 128-bit vector element");
     auto *VTy = cast<VectorType>(Inst->getOperand(0)->getType());
     uint64_t ElemSize = DL->getTypeAllocSize(VTy->getElementType())
                             .getFixedValue();
@@ -1446,6 +1724,8 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     auto *SrcTy = cast<VectorType>(SVI->getOperand(0)->getType());
     auto *DstTy = cast<VectorType>(Ty);
     Type *EltTy = DstTy->getElementType();
+    if (isWideInt(EltTy))
+      report_fatal_error("MSIL: unsupported 128-bit vector element");
     uint64_t ElemSize = DL->getTypeAllocSize(EltTy).getFixedValue();
     uint64_t NumSrc = SrcTy->getElementCount().getFixedValue();
     // The mask lives on the instruction, not among its operands.
@@ -1510,7 +1790,7 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     printValueLoad(EV->getAggregateOperand());
     out() << "\tstloc\t'" << Tmp << "'\n";
     printAggregateLaneAddr(Tmp, Ty, Off);
-    if (Ty->isAggregateType() || Ty->isVectorTy())
+    if (movesAsBlob(Ty))
       out() << "\tldobj\t" << getTypeName(Ty) << '\n';
     else
       out() << "\tldind." << getMemSuffix(Ty) << '\n';
@@ -1534,7 +1814,7 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     out() << "\tstloc\t'" << Tmp << "'\n";
     printAggregateLaneAddr(Tmp, Ty, Off);
     printValueLoad(IV->getInsertedValueOperand());
-    if (Ty->isAggregateType() || Ty->isVectorTy())
+    if (movesAsBlob(Ty))
       out() << "\tstobj\t" << getTypeName(Ty) << '\n';
     else
       out() << "\tstind." << getMemSuffix(Ty) << '\n';
@@ -1551,6 +1831,8 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     // single-threaded caveat as Fence; upgrade together with it.
     const auto *RMW = cast<AtomicRMWInst>(Inst);
     Type *VTy = RMW->getValOperand()->getType();
+    if (isWideInt(VTy))
+      report_fatal_error("MSIL: unsupported 128-bit atomic");
     std::string Sfx = getMemSuffix(VTy);
     std::string Old = newTempLocal(VTy);
     printValueLoad(RMW->getPointerOperand());
@@ -1588,6 +1870,8 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     // shortcut: plain compare-and-store, not one indivisible step.
     const auto *CX = cast<AtomicCmpXchgInst>(Inst);
     Type *VTy = CX->getNewValOperand()->getType();
+    if (isWideInt(VTy))
+      report_fatal_error("MSIL: unsupported 128-bit atomic");
     std::string Sfx = getMemSuffix(VTy);
     std::string Old = newTempLocal(VTy);
     std::string Done = "IL_cx" + utostr(getUniqID());
@@ -2200,6 +2484,8 @@ void MSILWriter::lowerIntrinsics(Function &F) {
 void MSILWriter::collectType(Type *Ty) {
   if (!Ty)
     return;
+  if (isWideInt(Ty))
+    NeedsSystemRuntime = true;
   if (auto *STy = dyn_cast<StructType>(Ty)) {
     if (AggregateNames.count(Ty))
       return;
@@ -2433,6 +2719,17 @@ void MSILWriter::printStaticConstant(const Constant *C, uint64_t &Offset,
     // ilasm range-checks .data elements against the signed width, so emit
     // sign-extended literals rather than the bit pattern.
     unsigned N = Ty->getIntegerBitWidth();
+    if (N == 128) {
+      // The template is a raw byte blob, so emit the two halves as int64.
+      const APInt &V = CI->getValue();
+      Add("int64 (" + std::to_string((int64_t)V.getLoBits(64).getZExtValue())
+          + ")",
+          8);
+      return Add(
+          "int64 (" + std::to_string((int64_t)V.getHiBits(64).getZExtValue()) +
+              ")",
+          8);
+    }
     std::string Val = std::to_string(CI->getSExtValue());
     if (N <= 8)
       return Add("int8 (" + Val + ")", 1);
@@ -2667,6 +2964,12 @@ bool MSILWriter::runOnModule(Module &M) {
   collectTypes();
 
   out() << ".assembly extern mscorlib {}\n";
+  // Int128/UInt128 live in System.Runtime, and a framework reference only
+  // resolves with the real identity (see NOTES-platform.md). Only assemblies
+  // that use them need the reference at all.
+  if (NeedsSystemRuntime)
+    out() << ".assembly extern System.Runtime { .ver 9:0:0:0\n"
+             "  .publickeytoken = (B0 3F 5F 7F 11 D5 0A 3A ) }\n";
   out() << ".assembly MSIL {}\n\n";
 
   // Class declarations must precede the globals that name them as templates.

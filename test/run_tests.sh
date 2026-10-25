@@ -1,37 +1,53 @@
 #!/usr/bin/env bash
-# Runs every check this project has, against a given llvm-msil binary.
+# Runs every check this project has against a given llvm-msil binary.
 #
-#   ./run_tests.sh <path-to-llvm-msil> [cbe-tests-dir]
+#   ./run_tests.sh <path-to-llvm-msil> [lit-executable]
 #
-# Used as the shared correctness gate while several people work on the
-# backend at once: if this passes for a worktree, that worktree has not
-# regressed anything it did not mean to.
+# Used as the shared correctness gate: if this passes for a worktree, that
+# worktree has not regressed anything it did not mean to.
+#
+# Paths assume this is the checkout under llvm/projects/llvm-msil. Override
+# the environment variables to point elsewhere.
 
 set -u
 
-MSIL=${1:?usage: run_tests.sh <llvm-msil> [cbe-tests-dir]}
+MSIL=${1:?usage: run_tests.sh <llvm-msil> [lit]}
 HERE=$(cd "$(dirname "$0")" && pwd)
-CBE=${2:-$HERE/../../llvm-cbe/test}
+# lit runs each test from its own directory, so a relative path would not
+# resolve there.
+MSIL=$(cd "$(dirname "$MSIL")" && pwd)/$(basename "$MSIL")
+LLVMBIN=$(cd "$(dirname "$MSIL")" && pwd)
 
 CLANG=${CLANG:-I:/Downloads/llvm-project-18.1.7/bin/clang.exe}
 ILASM=${ILASM:-/tmp/tools/ilasm-core.exe}
-LLI=${LLI:-$(dirname "$MSIL")/lli.exe}
-LIT=${LIT:-$(dirname "$MSIL")/llvm-lit.cmd}
+# The standalone build only contains llvm-msil; lli and lit come from the
+# LLVM build it links against.
+LLVM_BIN_DIR=${LLVM_BIN_DIR:-/w/projects/llvm-cbe/llvm-project/llvm/build/build64/bin}
+if [ -x "$LLVMBIN/lli.exe" ]; then LLI=${LLI:-$LLVMBIN/lli.exe};
+else LLI=${LLI:-$LLVM_BIN_DIR/lli.exe}; fi
+if [ -f "$LLVMBIN/llvm-lit.cmd" ]; then LITDEFAULT=$LLVMBIN/llvm-lit.cmd;
+else LITDEFAULT=$LLVM_BIN_DIR/llvm-lit.cmd; fi
+LIT=${2:-${LIT:-$LITDEFAULT}}
+CBE=${CBE:-/w/projects/llvm-cbe/llvm-project/llvm/projects/llvm-cbe/test}
 
 fail=0
 note() { printf '%s\n' "$*"; }
 
 note "== lit =="
-if [ -x "$LIT" ] || [ -f "$LIT" ]; then
-  if "$LIT" "$HERE" > /tmp/msil-lit.log 2>&1; then
+if [ -f "$LIT" ]; then
+  # The lit suite needs a generated site config, so run it through the build
+  # tree's lit when there is one, else fall back to plain lit. The tool
+  # substitution resolves llvm-msil by name in the LLVM tool directory, which
+  # is not necessarily the binary being tested; pin it.
+  if "$LIT" -D "llvm-msil=$MSIL" "$HERE" > /tmp/msil-lit.log 2>&1; then
     note "lit: ok"
   else
     note "lit: FAILED (see /tmp/msil-lit.log)"
-    tail -20 /tmp/msil-lit.log
+    tail -30 /tmp/msil-lit.log
     fail=1
   fi
 else
-  note "lit: skipped (no llvm-lit next to $MSIL)"
+  note "lit: skipped (no lit at $LIT)"
 fi
 
 note "== llvm-cbe suite =="
@@ -50,15 +66,16 @@ else
 fi
 
 note "== real programs =="
-# The stb and PureDOOM harnesses compare against a native build rather than
-# against fixed expected values, so a change that alters both identically
-# still passes.
-if [ -n "${PROGS:-}" ]; then
-  for p in $PROGS; do
-    if [ -x "$HERE/programs/$p.sh" ]; then
-      if "$HERE/programs/$p.sh" "$MSIL"; then note "$p: ok"; else
-        note "$p: FAILED"; fail=1
-      fi
+if [ -d "${PROGS_DIR:-$HERE/programs}" ]; then
+  for p in "${PROGS_DIR:-$HERE/programs}"/*.sh; do
+    [ -f "$p" ] || continue
+    name=$(basename "$p" .sh)
+    if "$p" "$MSIL" > /tmp/msil-$name.log 2>&1; then
+      note "$name: ok"
+    else
+      note "$name: FAILED (see /tmp/msil-$name.log)"
+      tail -20 /tmp/msil-$name.log
+      fail=1
     fi
   done
 fi
