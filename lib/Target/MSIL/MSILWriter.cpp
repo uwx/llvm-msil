@@ -37,6 +37,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -51,6 +52,14 @@ template <typename T> std::string str(const T *V) {
   return S;
 }
 } // namespace
+
+// Naming the emitted class lets C# call into the module without reflection:
+// `MSIL.Program.Main()`. Without it everything is a free-standing member of
+// `<Module>`, which is legitimate IL but awkward to reference from C#.
+static cl::opt<std::string> ExternClassName(
+    "msil-class-name", cl::desc("Emit members inside this class instead of "
+                                "<Module>, so C# can call them directly"),
+    cl::value_desc("namespace.Name"), cl::init(""));
 
 char MSILWriter::ID = 0;
 
@@ -2674,10 +2683,22 @@ bool MSILWriter::runOnModule(Module &M) {
   collectPInvokes();
   printExternals();
   printGlobals();
+
+  // Everything the C# side should be able to call or read goes inside this
+  // class. The entry point cannot: IL requires .entrypoint to be a member of
+  // <Module>, so $MSIL_Startup stays outside and calls in.
+  bool Wrap = !ExternClassName.empty();
+  if (Wrap)
+    out() << ".class public auto ansi beforefieldinit '" << ExternClassName
+          << "' extends [mscorlib]System.Object\n{\n";
+
   printFunctions();
   printAllocHelper();
   printArgHelper();
   printInitializer();
+
+  if (Wrap)
+    out() << "}\n";
   printModuleStartup();
   return false;
 }
