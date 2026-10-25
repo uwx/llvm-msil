@@ -108,6 +108,26 @@ define <8 x i32> @scalar_srem(<8 x i32> %a, <8 x i32> %b) {
   ret <8 x i32> %r
 }
 
+; The bitwise helpers are named for the operation, not for the CIL operator:
+; `xor` is Vector::Xor. Vector::ExclusiveOr does not exist, and emitting it
+; assembles fine but throws MissingMethodException the first time it runs.
+define <4 x i64> @simd_xor(<4 x i64> %a, <4 x i64> %b) {
+; CHECK-LABEL: .method static {{.*}} 'simd_xor'
+; CHECK: Vector::Xor<int64>
+; CHECK-NOT: Vector::ExclusiveOr
+  %r = xor <4 x i64> %a, %b
+  ret <4 x i64> %r
+}
+
+define <4 x i64> @simd_andor(<4 x i64> %a, <4 x i64> %b) {
+; CHECK-LABEL: .method static {{.*}} 'simd_andor'
+; CHECK: Vector::BitwiseAnd<int64>
+; CHECK: Vector::BitwiseOr<int64>
+  %m = and <4 x i64> %a, %b
+  %r = or <4 x i64> %m, %b
+  ret <4 x i64> %r
+}
+
 ; A GEP with a vector index produces one pointer per lane, always scalar.
 @tbl = internal global [8 x i32] zeroinitializer
 
