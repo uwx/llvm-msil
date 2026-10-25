@@ -36,6 +36,13 @@ if not getattr(config, "llvm_tools_dir", None):
     if os.name == "nt" and re.match(r"^/[a-zA-Z]/", tools):
         tools = tools[1].upper() + ":\\" + tools[3:].replace("/", "\\")
     config.llvm_tools_dir = tools
+# The backend under test is not necessarily in the LLVM tool directory: a
+# worktree builds its own llvm-msil, and the shared one is stale. run_tests.sh
+# passes the directory of the binary it was given; search it first so the
+# tests exercise that binary and not whichever copy happens to be installed.
+msil_dir = lit_config.params.get("llvm_msil_dir", config.llvm_tools_dir)
+if os.name == "nt" and re.match(r"^/[a-zA-Z]/", msil_dir):
+    msil_dir = msil_dir[1].upper() + ":\\" + msil_dir[3:].replace("/", "\\")
 if not getattr(config, "llvm_exe_ext", None):
     config.llvm_exe_ext = ".exe" if os.name == "nt" else ""
 if lit.llvm.llvm_config is None:
@@ -47,8 +54,10 @@ llvm_config.use_default_substitutions()
 # when lit runs on this directory directly there is no build-tree tool dir, so
 # name the executables explicitly (which also covers the .exe suffix).
 llvm_config.add_tool_substitutions(
-    ["llvm-msil", "FileCheck", "not"], [config.llvm_tools_dir])
+    ["llvm-msil"], [msil_dir])
+llvm_config.add_tool_substitutions(
+    ["FileCheck", "not", "count"], [config.llvm_tools_dir])
 
-if not os.path.exists(os.path.join(config.llvm_tools_dir,
+if not os.path.exists(os.path.join(msil_dir,
                                    "llvm-msil" + config.llvm_exe_ext)):
     config.unsupported = True

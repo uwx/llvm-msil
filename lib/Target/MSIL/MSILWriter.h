@@ -128,6 +128,9 @@ private:
   // Module emission.
   //===------------------------------------------------------------------===//
   void lowerIntrinsics(Function &F);
+  /// The C name a symbol denotes, with a C++ mangled declaration demangled.
+  std::string getCName(const Function *F) const;
+  /// The CRT export getCName names, after POSIX-only spellings are mapped.
   std::string getImportName(const Function *F) const;
   StringRef getLibraryFor(StringRef Symbol);
   void collectPInvokes();
@@ -136,6 +139,36 @@ private:
   void collectConstant(const Constant *C);
   void printAggregateDeclarations();
   void printExternals();
+
+  //===------------------------------------------------------------------===//
+  // Managed C runtime (-msil-libc, -msil-alloc).
+  //===------------------------------------------------------------------===//
+  /// A user-supplied managed type. An empty assembly means this module.
+  struct ManagedType {
+    std::string Assembly;
+    std::string Type;
+  };
+
+  /// Read the two options into LibcType/AllocType; reports a malformed one.
+  void resolveLibcOptions();
+
+  /// Where an external function binds instead of the CRT, if anywhere.
+  bool getManagedTarget(const Function *F, ManagedType &Out) const;
+
+  /// `[assembly]Type::Member`, or `Type::Member` for this module.
+  std::string getManagedName(const ManagedType &T, StringRef Member) const;
+
+  /// An IL method with the C symbol's signature and name \p Name, calling the
+  /// managed method \p T provides for it.
+  void printManagedForwarder(const Function *F, const ManagedType &T,
+                             StringRef Name);
+
+  /// The built-in platform-independent libc, emitted into this module.
+  void printBuiltinLibc();
+  /// One method of it. \p Body is the instruction text; \p Params is the
+  /// signature's parameter list in the same spelling getTypeName produces.
+  void printLibcMethod(StringRef Name, StringRef Ret, StringRef Params,
+                       StringRef Body);
   void printGlobals();
   void printStaticConstant(const Constant *C, uint64_t &Offset,
                            std::string &Buffer);
@@ -162,9 +195,16 @@ private:
   DenseMap<const Value *, std::string> ArgIterators;
   unsigned NumVA = 0;
 
-  /// A global's read-only initializer image; the writable storage is a heap
-  /// block allocated and filled from it by $MSIL_Init.
-  std::vector<std::pair<const GlobalVariable *, std::string>> Templates;
+  /// A global's initializer image. A writable global gets a heap copy filled
+  /// from its image by $MSIL_Init; a constant global is never written, so the
+  /// image is its storage and $MSIL_Init only points the address at it.
+  struct GlobalImage {
+    const GlobalVariable *GV;
+    /// The template field's name; empty for a zero-sized global.
+    std::string Template;
+    bool Writable;
+  };
+  std::vector<GlobalImage> Templates;
 
   struct DynInit {
     const GlobalVariable *GV;
@@ -183,6 +223,12 @@ private:
   };
   std::vector<PInvoke> PInvokes;
   std::map<std::pair<const Function *, std::string>, std::string> PInvokeNames;
+
+  /// Set by resolveLibcOptions; an empty Type means "use the CRT".
+  ManagedType LibcType;
+  ManagedType AllocType;
+  /// Emit the built-in libc's own IL, rather than referring to a user's.
+  bool EmitLibc = false;
 
   uint64_t UniqID = 0;
   uint64_t getUniqID() { return ++UniqID; }
