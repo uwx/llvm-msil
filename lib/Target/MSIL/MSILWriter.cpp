@@ -30,6 +30,7 @@
 #include "MSILWriter.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/CodeGen/IntrinsicLowering.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/IRBuilder.h"
@@ -124,6 +125,22 @@ StructType *MSILWriter::structFieldOf(const Value *Ptr, unsigned &Field) {
     return nullptr;
   return STy;
 }
+// Binding external C functions to managed code rather than the CRT. Both are
+// off by default, so the emitted module is unchanged unless asked.
+static cl::opt<std::string> LibcSpec(
+    "msil-libc",
+    cl::desc("Bind external C functions to managed code instead of the Windows "
+             "CRT. 'builtin' emits the platform-independent implementation into "
+             "this module; '<assembly>[:<type>]' calls a type you supply "
+             "(type defaults to MSIL.Libc). Functions the built-in does not "
+             "implement, and all vararg functions, still pinvoke the CRT."),
+    cl::value_desc("builtin|assembly[:type]"), cl::init(""));
+
+static cl::opt<std::string> AllocSpec(
+    "msil-alloc",
+    cl::desc("Route malloc/free/calloc/realloc to methods of the same name on "
+             "this type, so unmanaged allocations can be instrumented"),
+    cl::value_desc("assembly:type"), cl::init(""));
 
 char MSILWriter::ID = 0;
 
@@ -2875,11 +2892,25 @@ void MSILWriter::printAggregateDeclarations() {
   out() << '\n';
 }
 
-std::string MSILWriter::getImportName(const Function *F) const {
+std::string MSILWriter::getCName(const Function *F) const {
   // The C runtime exports C names, but a C++ translation unit may call them
   // through a mangled declaration (`_Z6printfPKcz`). Recover the base name
   // when the mangled form denotes a global function in the C runtime.
   StringRef Name = F->getName();
+  if (!Name.starts_with("_Z"))
+    return Name.str();
+  std::string D = demangle(Name.str());
+  size_t Paren = D.find('(');
+  if (Paren == std::string::npos)
+    return Name.str();
+  StringRef Base = StringRef(D).substr(0, Paren);
+  if (Base.empty())
+    return Name.str();
+  return Base.str();
+}
+
+std::string MSILWriter::getImportName(const Function *F) const {
+  std::string Name = getCName(F);
   // POSIX-only names (from an implicit declaration, so the MSVC header never
   // rewrote them) only exist under their underscore spelling in the CRT.
   // shortcut: hand-written list; grow it as programs need more names. Also
@@ -2891,20 +2922,629 @@ std::string MSILWriter::getImportName(const Function *F) const {
       {"snprintf", "_snprintf"},   {"vsnprintf", "_vsnprintf"},
       {"scprintf", "_scprintf"},   {"snscanf", "_snscanf"},
   };
-  if (!Name.starts_with("_Z")) {
-    for (auto &R : PosixRenames)
-      if (Name == R[0])
-        return R[1];
-    return Name.str();
+  for (auto &R : PosixRenames)
+    if (Name == R[0])
+      return R[1];
+  return Name;
+}
+
+namespace {
+/// The set the built-in libc implements; a symbol outside it keeps its pinvoke.
+bool isBuiltinSymbol(StringRef N) {
+  static const char *const Names[] = {
+      "malloc",  "free",    "calloc",  "realloc", "memcpy", "memmove",
+      "memset",  "memcmp",  "strlen",  "strcmp",  "strncmp", "strcpy",
+      "strncpy", "strcat",  "strchr",  "strrchr", "strstr", "strdup",
+  };
+  return is_contained(Names, N);
+}
+} // namespace
+
+void MSILWriter::resolveLibcOptions() {
+  // `assembly:type`, or just `assembly` when a default type is given.
+  auto Parse = [](StringRef Spec, StringRef DefaultType, StringRef Option) {
+    ManagedType T;
+    size_t Colon = Spec.rfind(':');
+    T.Assembly = (Colon == StringRef::npos ? Spec : Spec.substr(0, Colon)).str();
+    T.Type = Colon == StringRef::npos ? DefaultType.str()
+                                      : Spec.substr(Colon + 1).str();
+    if (T.Assembly.empty() || T.Type.empty())
+      report_fatal_error("MSIL: " + Option +
+                         " needs <assembly>:<type>, got '" + Spec + "'");
+    return T;
+  };
+  if (!AllocSpec.empty())
+    AllocType = Parse(AllocSpec, "", "-msil-alloc");
+  if (LibcSpec.empty())
+    return;
+  if (LibcSpec == "builtin") {
+    EmitLibc = true;
+    LibcType = {"", "$MSIL_Libc"};
+    return;
   }
-  std::string D = demangle(Name.str());
-  size_t Paren = D.find('(');
-  if (Paren == std::string::npos)
-    return Name.str();
-  StringRef Base = StringRef(D).substr(0, Paren);
-  if (Base.empty())
-    return Name.str();
-  return Base.str();
+  LibcType = Parse(LibcSpec, "MSIL.Libc", "-msil-libc");
+}
+
+bool MSILWriter::getManagedTarget(const Function *F, ManagedType &Out) const {
+  // A vararg function cannot cross a managed boundary in a way ilasm accepts,
+  // so it keeps its pinvoke thunk.
+  if (F->getFunctionType()->isVarArg())
+    return false;
+  StringRef Name = getCName(F);
+  // The allocator hook wins: it exists precisely to intercept these calls.
+  if (!AllocType.Type.empty() &&
+      (Name == "malloc" || Name == "free" || Name == "calloc" ||
+       Name == "realloc")) {
+    Out = AllocType;
+    return true;
+  }
+  if (LibcType.Type.empty())
+    return false;
+  // The built-in libc implements a fixed set; anything else keeps its pinvoke,
+  // so a program can use both.
+  if (EmitLibc && !isBuiltinSymbol(Name))
+    return false;
+  Out = LibcType;
+  return true;
+}
+
+std::string MSILWriter::getManagedName(const ManagedType &T,
+                                       StringRef Member) const {
+  std::string S = T.Assembly.empty() ? "" : "[" + T.Assembly + "]";
+  return S + T.Type + "::" + Member.str();
+}
+
+void MSILWriter::printManagedForwarder(const Function *F, const ManagedType &T,
+                                       StringRef Name) {
+  FunctionType *FTy = F->getFunctionType();
+  std::string Params;
+  for (unsigned I = 0, E = FTy->getNumParams(); I != E; ++I) {
+    if (I)
+      Params += ", ";
+    Params += getTypeName(FTy->getParamType(I));
+  }
+  out() << ".method public static hidebysig "
+      << getCallSignature(FTy, nullptr, "'" + Name.str() + "'")
+      << " cil managed\n{\n";
+  out() << "\t.maxstack\t" << std::max<unsigned>(1, FTy->getNumParams())
+      << "\n";
+  for (unsigned I = 0, E = FTy->getNumParams(); I != E; ++I)
+    out() << "\tldarg\t" << I << '\n';
+  out() << "\tcall\t" << getTypeName(FTy->getReturnType()) << ' '
+      << getManagedName(T, getCName(F)) << '(' << Params << ")\n";
+  out() << "\tret\n}\n";
+}
+
+//===----------------------------------------------------------------------===//
+// The built-in libc
+//===----------------------------------------------------------------------===//
+
+// These are byte loops rather than calls into something faster, because the
+// point is a runtime that depends on nothing but the CLR itself. `ldind.u1`
+// zero-extends, which is exactly what C's unsigned-char comparisons want.
+// Every parameter is unnamed, so bodies address arguments positionally.
+// None of the methods recurse, so `.maxstack 4` cannot be amplified by depth.
+
+static const char *const LibcStrlen = R"(
+	.locals init (int64 'i')
+	ldc.i4.0
+	conv.i8
+	stloc 'i'
+	br IL_libc_test
+IL_libc_loop:
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+IL_libc_test:
+	ldarg.0
+	ldloc 'i'
+	add
+	ldind.u1
+	brtrue IL_libc_loop
+	ldloc 'i'
+	ret)";
+
+static const char *const LibcStrcmp = R"(
+	.locals init (int64 'i', int32 'x', int32 'y')
+	ldc.i4.0
+	conv.i8
+	stloc 'i'
+IL_libc_loop:
+	ldarg.0
+	ldloc 'i'
+	add
+	ldind.u1
+	stloc 'x'
+	ldarg.1
+	ldloc 'i'
+	add
+	ldind.u1
+	stloc 'y'
+	ldloc 'x'
+	ldloc 'y'
+	bne.un IL_libc_diff
+	ldloc 'x'
+	brfalse IL_libc_same
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+	br IL_libc_loop
+IL_libc_diff:
+	ldloc 'x'
+	ldloc 'y'
+	sub
+	ret
+IL_libc_same:
+	ldc.i4.0
+	ret)";
+
+static const char *const LibcStrncmp = R"(
+	.locals init (int64 'i', int32 'x', int32 'y')
+	ldc.i4.0
+	conv.i8
+	stloc 'i'
+IL_libc_loop:
+	ldloc 'i'
+	ldarg.2
+	bge IL_libc_same
+	ldarg.0
+	ldloc 'i'
+	add
+	ldind.u1
+	stloc 'x'
+	ldarg.1
+	ldloc 'i'
+	add
+	ldind.u1
+	stloc 'y'
+	ldloc 'x'
+	ldloc 'y'
+	bne.un IL_libc_diff
+	ldloc 'x'
+	brfalse IL_libc_same
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+	br IL_libc_loop
+IL_libc_diff:
+	ldloc 'x'
+	ldloc 'y'
+	sub
+	ret
+IL_libc_same:
+	ldc.i4.0
+	ret)";
+
+static const char *const LibcMemcmp = R"(
+	.locals init (int64 'i', int32 'x', int32 'y')
+	ldc.i4.0
+	conv.i8
+	stloc 'i'
+IL_libc_loop:
+	ldloc 'i'
+	ldarg.2
+	bge IL_libc_same
+	ldarg.0
+	ldloc 'i'
+	add
+	ldind.u1
+	stloc 'x'
+	ldarg.1
+	ldloc 'i'
+	add
+	ldind.u1
+	stloc 'y'
+	ldloc 'x'
+	ldloc 'y'
+	bne.un IL_libc_diff
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+	br IL_libc_loop
+IL_libc_diff:
+	ldloc 'x'
+	ldloc 'y'
+	sub
+	ret
+IL_libc_same:
+	ldc.i4.0
+	ret)";
+
+static const char *const LibcStrcpy = R"(
+	.locals init (int64 'i', int32 'c')
+	ldc.i4.0
+	conv.i8
+	stloc 'i'
+IL_libc_loop:
+	ldarg.1
+	ldloc 'i'
+	add
+	ldind.u1
+	stloc 'c'
+	ldarg.0
+	ldloc 'i'
+	add
+	ldloc 'c'
+	stind.i1
+	ldloc 'c'
+	brfalse IL_libc_done
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+	br IL_libc_loop
+IL_libc_done:
+	ldarg.0
+	ret)";
+
+static const char *const LibcStrncpy = R"(
+	.locals init (int64 'i', int32 'c')
+	ldc.i4.0
+	conv.i8
+	stloc 'i'
+IL_libc_loop:
+	ldloc 'i'
+	ldarg.2
+	bge IL_libc_done
+	ldarg.1
+	ldloc 'i'
+	add
+	ldind.u1
+	stloc 'c'
+	ldarg.0
+	ldloc 'i'
+	add
+	ldloc 'c'
+	stind.i1
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+	ldloc 'c'
+	brtrue IL_libc_loop
+IL_libc_pad:
+	ldloc 'i'
+	ldarg.2
+	bge IL_libc_done
+	ldarg.0
+	ldloc 'i'
+	add
+	ldc.i4.0
+	stind.i1
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+	br IL_libc_pad
+IL_libc_done:
+	ldarg.0
+	ret)";
+
+static const char *const LibcStrcat = R"(
+	.locals init (int64 'i', int64 'j', int32 'c')
+	ldc.i4.0
+	conv.i8
+	stloc 'i'
+IL_libc_find:
+	ldarg.0
+	ldloc 'i'
+	add
+	ldind.u1
+	brfalse IL_libc_copy_init
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+	br IL_libc_find
+IL_libc_copy_init:
+	ldc.i4.0
+	conv.i8
+	stloc 'j'
+IL_libc_copy:
+	ldarg.1
+	ldloc 'j'
+	add
+	ldind.u1
+	stloc 'c'
+	ldarg.0
+	ldloc 'i'
+	add
+	ldloc 'c'
+	stind.i1
+	ldloc 'c'
+	brfalse IL_libc_done
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+	ldloc 'j'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'j'
+	br IL_libc_copy
+IL_libc_done:
+	ldarg.0
+	ret)";
+
+static const char *const LibcStrchr = R"(
+	.locals init (int64 'i', int32 'c')
+	ldc.i4.0
+	conv.i8
+	stloc 'i'
+IL_libc_loop:
+	ldarg.0
+	ldloc 'i'
+	add
+	ldind.u1
+	stloc 'c'
+	ldloc 'c'
+	ldarg.1
+	conv.u1
+	beq IL_libc_found
+	ldloc 'c'
+	brfalse IL_libc_missing
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+	br IL_libc_loop
+IL_libc_found:
+	ldarg.0
+	ldloc 'i'
+	add
+	ret
+IL_libc_missing:
+	ldc.i4.0
+	conv.u
+	ret)";
+
+static const char *const LibcStrrchr = R"(
+	.locals init (int64 'i', int32 'c', void* 'r')
+	ldc.i4.0
+	conv.i8
+	stloc 'i'
+	ldc.i4.0
+	conv.u
+	stloc 'r'
+IL_libc_loop:
+	ldarg.0
+	ldloc 'i'
+	add
+	ldind.u1
+	stloc 'c'
+	ldloc 'c'
+	ldarg.1
+	conv.u1
+	bne.un IL_libc_not
+	ldarg.0
+	ldloc 'i'
+	add
+	stloc 'r'
+IL_libc_not:
+	ldloc 'c'
+	brfalse IL_libc_done
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+	br IL_libc_loop
+IL_libc_done:
+	ldloc 'r'
+	ret)";
+
+static const char *const LibcStrstr = R"(
+	.locals init (int64 'i', int64 'j', int32 'c')
+	ldarg.1
+	ldind.u1
+	brtrue IL_libc_outer_init
+	ldarg.0
+	ret
+IL_libc_outer_init:
+	ldc.i4.0
+	conv.i8
+	stloc 'i'
+IL_libc_outer:
+	ldarg.0
+	ldloc 'i'
+	add
+	ldind.u1
+	brfalse IL_libc_missing
+	ldc.i4.0
+	conv.i8
+	stloc 'j'
+IL_libc_inner:
+	ldarg.1
+	ldloc 'j'
+	add
+	ldind.u1
+	stloc 'c'
+	ldloc 'c'
+	brfalse IL_libc_found
+	ldarg.0
+	ldloc 'i'
+	add
+	ldloc 'j'
+	add
+	ldind.u1
+	ldloc 'c'
+	bne.un IL_libc_next
+	ldloc 'j'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'j'
+	br IL_libc_inner
+IL_libc_next:
+	ldloc 'i'
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'i'
+	br IL_libc_outer
+IL_libc_found:
+	ldarg.0
+	ldloc 'i'
+	add
+	ret
+IL_libc_missing:
+	ldc.i4.0
+	conv.u
+	ret)";
+
+// strdup is a builtin that is not a symbol: it is the one caller inside the
+// libc, and calling malloc/memcpy by name keeps the -msil-alloc hook in effect.
+static const char *const LibcStrdup = R"(
+	.locals init (void* 'p', int64 'n')
+	ldarg.0
+	call	int64 '$MSIL_Libc'::strlen(void*)
+	ldc.i4.1
+	conv.i8
+	add
+	stloc 'n'
+	ldloc 'n'
+	call	void* '$MSIL_Libc'::malloc(int64)
+	stloc 'p'
+	ldloc 'p'
+	brfalse IL_libc_done
+	ldloc 'p'
+	ldarg.0
+	ldloc 'n'
+	call	void* '$MSIL_Libc'::memcpy(void*, void*, int64)
+	pop
+IL_libc_done:
+	ldloc 'p'
+	ret)";
+
+namespace {
+/// One method of the built-in libc.
+struct LibcMethod {
+  const char *Name;
+  const char *Ret;
+  const char *Params;
+  const char *Body;
+};
+} // namespace
+
+void MSILWriter::printLibcMethod(StringRef Name, StringRef Ret,
+                                 StringRef Params, StringRef Body) {
+  out() << ".method public static hidebysig " << Ret << " '" << Name << "'("
+      << Params << ") cil managed\n{\n\t.maxstack\t4\n"
+      << Body << "\n}\n\n";
+}
+
+void MSILWriter::printBuiltinLibc() {
+  // Emit only what the module can reach, so the libc costs nothing a program
+  // does not use. strdup calls malloc and memcpy, so it pulls both in.
+  llvm::StringSet<> Wanted;
+  for (Function &F : *Mod)
+    if (F.isDeclaration() && !F.isIntrinsic())
+      Wanted.insert(getCName(&F));
+  // With a hook, the module's allocator calls bind straight to it; the only
+  // remaining user of the libc's own allocator wrappers is strdup.
+  if (!AllocType.Type.empty())
+    for (const char *N : {"malloc", "calloc", "realloc", "free"})
+      Wanted.erase(N);
+  if (Wanted.count("strdup")) {
+    Wanted.insert("malloc");
+    Wanted.insert("memcpy");
+  }
+
+  // NativeMemory lives in the implementation assembly; System.Runtime forwards
+  // many types but not that one.
+  out() << ".assembly extern System.Private.CoreLib { .ver 9:0:0:0\n"
+           "  .publickeytoken = (B0 3F 5F 7F 11 D5 0A 3A ) }\n";
+  out() << ".class public auto ansi abstract sealed beforefieldinit '"
+      << LibcType.Type << "' extends [mscorlib]System.Object\n{\n";
+
+  // The allocator hook, when given, replaces the four allocating calls only:
+  // the rest of the libc still runs on NativeMemory, and because strdup calls
+  // malloc by name, its block goes through the hook as well. The two paths
+  // differ in more than the callee: NativeMemory takes `native uint` sizes
+  // where a hook keeps the C `int64`, so only the NativeMemory body converts.
+  static const char *const Mem =
+      "[System.Private.CoreLib]System.Runtime.InteropServices.NativeMemory::";
+  const bool Hook = !AllocType.Type.empty();
+  std::string HMalloc = getManagedName(AllocType, "malloc");
+  std::string HCalloc = getManagedName(AllocType, "calloc");
+  std::string HRealloc = getManagedName(AllocType, "realloc");
+  std::string HFree = getManagedName(AllocType, "free");
+
+  if (Wanted.count("malloc"))
+    printLibcMethod("malloc", "void*", "int64",
+                    Hook ? "\tldarg.0\n\tcall\tvoid* " + HMalloc +
+                               "(int64)\n\tret"
+                         : "\tldarg.0\n\tconv.u\n\tcall\tvoid* " +
+                               std::string(Mem) + "Alloc(native uint)\n\tret");
+  if (Wanted.count("calloc"))
+    printLibcMethod(
+        "calloc", "void*", "int64, int64",
+        Hook ? "\tldarg.0\n\tldarg.1\n\tcall\tvoid* " + HCalloc +
+                   "(int64, int64)\n\tret"
+             : "\tldarg.0\n\tconv.u\n\tldarg.1\n\tconv.u\n\tcall\tvoid* " +
+                   std::string(Mem) +
+                   "AllocZeroed(native uint, native uint)\n\tret");
+  if (Wanted.count("realloc"))
+    printLibcMethod(
+        "realloc", "void*", "void*, int64",
+        Hook ? "\tldarg.0\n\tldarg.1\n\tcall\tvoid* " + HRealloc +
+                   "(void*, int64)\n\tret"
+             : "\tldarg.0\n\tldarg.1\n\tconv.u\n\tcall\tvoid* " +
+                   std::string(Mem) + "Realloc(void*, native uint)\n\tret");
+  if (Wanted.count("free"))
+    printLibcMethod(
+        "free", "void", "void*",
+        Hook ? "\tldarg.0\n\tcall\tvoid " + HFree + "(void*)\n\tret"
+             : "\tldarg.0\n\tcall\tvoid " + std::string(Mem) + "Free(void*)"
+                   "\n\tret");
+
+  // NativeMemory.Copy is overlap-safe, so it is memmove too; the two differ
+  // only in the promise memcpy does not make. Both take (source, destination,
+  // count), the reverse of memcpy's order.
+  static const LibcMethod Methods[] = {
+      {"memcmp", "int32", "void*, void*, int64", LibcMemcmp},
+      {"strlen", "int64", "void*", LibcStrlen},
+      {"strcmp", "int32", "void*, void*", LibcStrcmp},
+      {"strncmp", "int32", "void*, void*, int64", LibcStrncmp},
+      {"strcpy", "void*", "void*, void*", LibcStrcpy},
+      {"strncpy", "void*", "void*, void*, int64", LibcStrncpy},
+      {"strcat", "void*", "void*, void*", LibcStrcat},
+      {"strchr", "void*", "void*, int32", LibcStrchr},
+      {"strrchr", "void*", "void*, int32", LibcStrrchr},
+      {"strstr", "void*", "void*, void*", LibcStrstr},
+      {"strdup", "void*", "void*", LibcStrdup},
+  };
+  for (const char *Name : {"memcpy", "memmove"})
+    if (Wanted.count(Name))
+      printLibcMethod(Name, "void*", "void*, void*, int64",
+                      "\tldarg.1\n\tldarg.0\n\tldarg.2\n\tconv.u\n\tcall\tvoid " +
+                          std::string(Mem) +
+                          "Copy(void*, void*, native uint)\n\tldarg.0\n\tret");
+  if (Wanted.count("memset"))
+    printLibcMethod("memset", "void*", "void*, int32, int64",
+                    "\tldarg.0\n\tldarg.2\n\tconv.u\n\tldarg.1\n\tconv.u1\n"
+                    "\tcall\tvoid " +
+                        std::string(Mem) +
+                        "Fill(void*, native uint, uint8)\n\tldarg.0\n\tret");
+  for (const LibcMethod &M : Methods)
+    if (Wanted.count(M.Name))
+      printLibcMethod(M.Name, M.Ret, M.Params, M.Body);
+  out() << "}\n\n";
 }
 
 StringRef MSILWriter::getLibraryFor(StringRef Symbol) {
@@ -2955,15 +3595,25 @@ void MSILWriter::collectPInvokes() {
 }
 
 void MSILWriter::printExternals() {
-  for (Function &F : *Mod) {
-    if (!F.isDeclaration() || F.isIntrinsic() || F.getFunctionType()->isVarArg())
-      continue;
+  // Binds external declarations to managed code instead of the CRT. A symbol
+  // with no managed target keeps its pinvoke.
+  auto EmitExternal = [&](const Function &F, StringRef Name) {
+    ManagedType T;
+    if (getManagedTarget(&F, T)) {
+      printManagedForwarder(&F, T, Name);
+      return;
+    }
     out() << ".method public static hidebysig pinvokeimpl(\""
         << getLibraryFor(getImportName(&F)) << "\" as \"" << getImportName(&F)
         << "\" cdecl) "
-        << getCallSignature(F.getFunctionType(), nullptr,
-                            "'" + getValueName(&F) + "'")
+        << getCallSignature(F.getFunctionType(), nullptr, "'" + Name.str() + "'")
         << " preservesig {}\n";
+  };
+
+  for (Function &F : *Mod) {
+    if (!F.isDeclaration() || F.isIntrinsic() || F.getFunctionType()->isVarArg())
+      continue;
+    EmitExternal(F, getValueName(&F));
   }
   for (const PInvoke &P : PInvokes)
     out() << ".method public static hidebysig pinvokeimpl(\""
@@ -3093,6 +3743,7 @@ void MSILWriter::printGlobals() {
       continue;
     std::string Buffer;
     uint64_t Offset = 0;
+    size_t FirstDynInit = DynInits.size();
     CurGV = &G;
     printStaticConstant(G.getInitializer(), Offset, Buffer);
     CurGV = nullptr;
@@ -3102,6 +3753,11 @@ void MSILWriter::printGlobals() {
     // ilasm rejects both an empty and a zero-count `.data`, and a zero-sized
     // aggregate has nothing to copy anyway: just give it a pointer.
     bool Empty = DL->getTypeAllocSize(G.getValueType()) == 0;
+    // A constant global is never stored through, so its read-only image can be
+    // its storage and $MSIL_Init only has to point the address at it. A
+    // pointer-valued initializer is the exception: relocations are patched
+    // into the writable copy at startup, which the image cannot take.
+    bool Writable = !G.isConstant() || Empty || DynInits.size() != FirstDynInit;
     if (!Empty) {
       // $MSIL_Init runs from inside the emitted class and reads this blob, so
       // it has to be reachable from there.
@@ -3114,7 +3770,7 @@ void MSILWriter::printGlobals() {
         << "void* '" << Name << "'\n\n";
     // Zero-sized globals still get an entry so $MSIL_Init gives each its own
     // address; there is just no template to copy from.
-    Templates.emplace_back(&G, Empty ? "" : Name + "$tpl");
+    Templates.push_back({&G, Empty ? "" : Name + "$tpl", Writable});
   }
 }
 
@@ -3135,9 +3791,19 @@ void MSILWriter::printInitializer() {
         << " void '$MSIL_Init'() cil managed\n{\n";
   out() << "\t.maxstack\t8\n";
   for (auto &T : Templates) {
-    const GlobalVariable &G = *T.first;
+    const GlobalVariable &G = *T.GV;
     uint64_t Size = DL->getTypeAllocSize(G.getValueType()).getFixedValue();
     out() << "\t// " << G.getName() << "\n";
+    if (!T.Writable && Size) {
+      // A constant global is never stored through, so the image is the
+      // storage. `ldsflda` still gives each global its own address, so
+      // address comparisons stay distinct.
+      out() << "\tldsflda\tvaluetype '" << getAggregateName(G.getValueType())
+          << "' '" << T.Template << "'\n";
+      out() << "\tconv.u8\n";
+      out() << "\tstsfld\tvoid* '" << G.getName() << "'\n";
+      continue;
+    }
     // Allocate the real, writable storage. A zero-sized global still needs a
     // distinct address: LLVM gives every global its own, so comparing two of
     // them must not compare equal.
@@ -3149,7 +3815,7 @@ void MSILWriter::printInitializer() {
     // Copy the template bytes in.
     out() << "\tldsfld\tvoid* '" << G.getName() << "'\n";
     out() << "\tldsflda\tvaluetype '" << getAggregateName(G.getValueType())
-        << "' '" << T.second << "'\n";
+        << "' '" << T.Template << "'\n";
     out() << "\tconv.u8\n";
     out() << "\tldc.i4\t" << Size << "\n";
     out() << "\tcpblk\n";
@@ -3260,6 +3926,7 @@ bool MSILWriter::runOnModule(Module &M) {
   Mod = &M;
   DL = &M.getDataLayout();
   IL = std::make_unique<IntrinsicLowering>(*DL);
+  resolveLibcOptions();
 
   // An alias is just another name for its target; resolve it away so an alias
   // of a function is not mistaken for a variable.
@@ -3279,12 +3946,21 @@ bool MSILWriter::runOnModule(Module &M) {
   if (NeedsSystemRuntime)
     out() << ".assembly extern System.Runtime { .ver 9:0:0:0\n"
              "  .publickeytoken = (B0 3F 5F 7F 11 D5 0A 3A ) }\n";
+  // A user-supplied runtime is a separate assembly, so it needs a reference.
+  // The built-in one lives in this module, and its CoreLib reference is
+  // emitted with its class declaration.
+  if (!LibcType.Type.empty() && !EmitLibc && !LibcType.Assembly.empty())
+    out() << ".assembly extern '" << LibcType.Assembly << "' {}\n";
+  if (!AllocType.Type.empty())
+    out() << ".assembly extern '" << AllocType.Assembly << "' {}\n";
   out() << ".assembly MSIL {}\n\n";
 
   // Class declarations must precede the globals that name them as templates.
   printAggregateDeclarations();
   collectPInvokes();
   printExternals();
+  if (EmitLibc)
+    printBuiltinLibc();
   printGlobals();
 
   // Everything the C# side should be able to call or read goes inside this
