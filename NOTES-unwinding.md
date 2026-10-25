@@ -219,8 +219,9 @@ Implement the subset only if the goal is "a C++ program that throws does not
 abort the process", and only with the typed-handler fallback above. Do not
 claim landing-pad support: the personality-routine and funclet model cannot be
 represented, and the C++ ABI bridge needs a runtime this backend does not
-have. The five tests should stay xfail, with the `xfail` reason updated from
-"no landingpad support" to name the specific blockers, so the next person does
-not rediscover this.
+have. The five tests should stay xfail. Their reason strings live in the
+upstream llvm-cbe checkout (`test/cpp_tests/*.cpp`), which is a dependency and
+is only edited when the vendored copy is updated; the blockers are named above
+instead of in those files.
 
 The atomics work in this branch is independent and stands on its own.
