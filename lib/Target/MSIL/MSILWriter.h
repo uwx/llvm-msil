@@ -59,6 +59,7 @@ private:
   // Names and types.
   //===------------------------------------------------------------------===//
   std::string getValueName(const Value *V);
+  std::string getFunctionRef(const Function *F) const;
   std::string getLabelName(const BasicBlock *BB);
   std::string getAggregateName(Type *Ty);
 
@@ -157,6 +158,9 @@ private:
 
   std::map<Type *, std::string> AggregateNames;
   std::vector<Type *> AggregateTypes;
+
+  std::string ClassPrefix() const;
+  const char *HelperVis() const;
 
   std::vector<std::pair<std::string, std::string>> ExtraLocals;
   DenseMap<const Value *, std::string> ArgIterators;

@@ -34,7 +34,9 @@ note "== lit =="
 if [ -f "$LIT" ]; then
   # The lit suite needs a generated site config, so run it through the build
   # tree's lit when there is one, else fall back to plain lit.
-  if "$LIT" "$HERE" > /tmp/msil-lit.log 2>&1; then
+  # The tool substitution resolves llvm-msil by name in the LLVM tool
+  # directory, which is not necessarily the binary being tested; pin it.
+  if "$LIT" -D "llvm-msil=$MSIL" "$HERE" > /tmp/msil-lit.log 2>&1; then
     note "lit: ok"
   else
     note "lit: FAILED (see /tmp/msil-lit.log)"

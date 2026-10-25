@@ -109,6 +109,28 @@ std::string MSILWriter::getValueName(const Value *V) {
   return "l" + utostr(It->second);
 }
 
+// "`Class'::" when members are wrapped in a class, "" otherwise. ilasm needs
+// even intra-class helper references qualified once a class is involved, so
+// every reference site goes through here.
+std::string MSILWriter::ClassPrefix() const {
+  return ExternClassName.empty() ? std::string()
+                                 : "'" + ExternClassName + "'::";
+}
+
+// A helper called from $MSIL_Startup cannot be private once it lives inside a
+// class, since <Module> is a different type.
+const char *MSILWriter::HelperVis() const {
+  return ExternClassName.empty() ? "private" : "assembly";
+}
+
+// A function moved into the emitted class is no longer a global member, so a
+// reference to it from outside that class has to name the class.
+std::string MSILWriter::getFunctionRef(const Function *F) const {
+  if (ExternClassName.empty() || F->isDeclaration())
+    return "'" + F->getName().str() + "'";
+  return "'" + ExternClassName + "'::'" + F->getName().str() + "'";
+}
+
 std::string MSILWriter::getLabelName(const BasicBlock *BB) {
   auto It = LabelIDs.find(BB);
   assert(It != LabelIDs.end() && "block used before it was numbered");
@@ -1024,7 +1046,7 @@ void MSILWriter::printFunctionCall(const Value *FnVal, const CallBase *CB) {
   }
 
   out() << "\tcall\t"
-      << getCallSignature(FTy, CB, "'" + getValueName(Callee) + "'") << '\n';
+      << getCallSignature(FTy, CB, getFunctionRef(Callee)) << '\n';
 }
 
 void MSILWriter::printCallInstruction(const CallBase *CB) {
@@ -2517,11 +2539,14 @@ void MSILWriter::printGlobals() {
     // aggregate has nothing to copy anyway: just give it a pointer.
     bool Empty = DL->getTypeAllocSize(G.getValueType()) == 0;
     if (!Empty) {
-      out() << ".field static private valuetype '" << Cls << "' '" << Name
-          << "$tpl' at '" << Name << "$tpl$data'\n";
+      // $MSIL_Init runs from inside the emitted class and reads this blob, so
+      // it has to be reachable from there.
+      out() << ".field static " << HelperVis() << " valuetype '" << Cls << "' '"
+          << Name << "$tpl' at '" << Name << "$tpl$data'\n";
       out() << ".data '" << Name << "$tpl$data' = { " << Buffer << " }\n";
     }
-    out() << ".field static " << (G.hasLocalLinkage() ? "private " : "public ")
+    out() << ".field static "
+        << (G.hasLocalLinkage() ? std::string(HelperVis()) + " " : "public ")
         << "void* '" << Name << "'\n\n";
     // Zero-sized globals still get an entry so $MSIL_Init gives each its own
     // address; there is just no template to copy from.
@@ -2530,8 +2555,8 @@ void MSILWriter::printGlobals() {
 }
 
 void MSILWriter::printAllocHelper() {
-  out() << "\n.method static private void* '$MSIL_Alloc'(int64 size) cil managed\n"
-         "{\n";
+  out() << "\n.method static " << HelperVis()
+        << " void* '$MSIL_Alloc'(int64 size) cil managed\n{\n";
   out() << "\t.maxstack\t2\n";
   out() << "\tldarg.0\n\tconv.i\n";
   out() << "\tcall\tnative int [mscorlib]System.Runtime.InteropServices.Marshal::"
@@ -2542,7 +2567,8 @@ void MSILWriter::printAllocHelper() {
 void MSILWriter::printInitializer() {
   if (Templates.empty())
     return;
-  out() << "\n.method static private void '$MSIL_Init'() cil managed\n{\n";
+  out() << "\n.method static " << HelperVis()
+        << " void '$MSIL_Init'() cil managed\n{\n";
   out() << "\t.maxstack\t8\n";
   for (auto &T : Templates) {
     const GlobalVariable &G = *T.first;
@@ -2552,7 +2578,7 @@ void MSILWriter::printInitializer() {
     // distinct address: LLVM gives every global its own, so comparing two of
     // them must not compare equal.
     out() << "\tldc.i8\t" << (Size ? Size : 1) << "\n";
-    out() << "\tcall\tvoid* '$MSIL_Alloc'(int64)\n";
+    out() << "\tcall\tvoid* " << ClassPrefix() << "'$MSIL_Alloc'(int64)\n";
     out() << "\tstsfld\tvoid* '" << G.getName() << "'\n";
     if (!Size)
       continue;
@@ -2591,8 +2617,12 @@ void MSILWriter::printModuleStartup() {
   out() << "\n.method static public int32 '$MSIL_Startup'() cil managed\n{\n";
   out() << "\t.entrypoint\n\t.maxstack\t8\n";
 
+  // IL puts .entrypoint in <Module>, so this method stays outside the class
+  // and every helper it reaches has to be named through the class.
+  std::string C = ExternClassName.empty() ? "" : "'" + ExternClassName + "'::";
+
   if (!Templates.empty())
-    out() << "\tcall\tvoid '$MSIL_Init'()\n";
+    out() << "\tcall\tvoid " << C << "'$MSIL_Init'()\n";
 
   if (!Main || Main->isDeclaration()) {
     out() << "\tldc.i4.0\n\tret\n}\n";
@@ -2603,14 +2633,14 @@ void MSILWriter::printModuleStartup() {
   // shortcut: argument strings are leaked; a real main() usually exits soon.
   bool WantArgs = Main->arg_size() >= 1;
   if (WantArgs) {
-    out() << "\tcall\tvoid '$MSIL_MakeArgs'()\n";
-    out() << "\tldsfld\tvoid* '$MSIL::argc'\n\tldind.i4\n";
+    out() << "\tcall\tvoid " << C << "'$MSIL_MakeArgs'()\n";
+    out() << "\tldsfld\tvoid* " << C << "'$MSIL::argc'\n\tldind.i4\n";
     if (Main->arg_size() >= 2)
-      out() << "\tldsfld\tvoid* '$MSIL::argv'\n";
+      out() << "\tldsfld\tvoid* " << C << "'$MSIL::argv'\n";
   }
 
-  out() << "\tcall\t" << getTypeName(Main->getReturnType()) << " '"
-        << getValueName(Main) << "'(";
+  out() << "\tcall\t" << getTypeName(Main->getReturnType()) << " "
+        << getFunctionRef(Main) << "(";
   for (unsigned I = 0, E = Main->arg_size(); I != E; ++I) {
     if (I)
       out() << ", ";
@@ -2626,9 +2656,10 @@ void MSILWriter::printModuleStartup() {
 
 void MSILWriter::printArgHelper() {
   // Allocate argc/argv and fill them from Environment.GetCommandLineArgs().
-  out() << "\n.field static private void* '$MSIL::argc'\n";
-  out() << ".field static private void* '$MSIL::argv'\n";
-  out() << "\n.method static private void '$MSIL_MakeArgs'() cil managed\n{\n";
+  out() << "\n.field static " << HelperVis() << " void* '$MSIL::argc'\n";
+  out() << ".field static " << HelperVis() << " void* '$MSIL::argv'\n";
+  out() << "\n.method static " << HelperVis()
+        << " void '$MSIL_MakeArgs'() cil managed\n{\n";
   out() << "\t.maxstack\t4\n\t.locals init (int32 'n')\n"
            "\t.locals init (void* 'p')\n"
            "\t.locals init (string[] 'a')\n"
@@ -2638,17 +2669,19 @@ void MSILWriter::printArgHelper() {
            "GetCommandLineArgs()\n\tstloc\t'a'\n";
   out() << "\tldloc\t'a'\n\tldlen\n\tconv.i4\n\tstloc\t'n'\n";
   // argc storage
-  out() << "\tldc.i4.4\n\tcall\tvoid* '$MSIL_Alloc'(int64)\n"
-           "\tstsfld\tvoid* '$MSIL::argc'\n";
-  out() << "\tldsfld\tvoid* '$MSIL::argc'\n\tldloc\t'n'\n\tstind.i4\n";
+  std::string CP = ClassPrefix();
+  out() << "\tldc.i4.4\n\tcall\tvoid* " << CP << "'$MSIL_Alloc'(int64)\n"
+           "\tstsfld\tvoid* " << CP << "'$MSIL::argc'\n";
+  out() << "\tldsfld\tvoid* " << CP << "'$MSIL::argc'\n\tldloc\t'n'\n\tstind.i4\n";
   // argv = (char**)alloca(n * 8)
-  out() << "\tldloc\t'n'\n\tconv.i8\n\tldc.i4.8\n\tconv.i8\n\tmul\n"
-           "\tcall\tvoid* '$MSIL_Alloc'(int64)\n\tstsfld\tvoid* '$MSIL::argv'\n";
+  out() << "\tldloc\t'n'\n\tconv.i8\n\tldc.i4.8\n\tconv.i8\n\tmul\n\tcall\tvoid* "
+        << CP << "'$MSIL_Alloc'(int64)\n\tstsfld\tvoid* " << CP
+        << "'$MSIL::argv'\n";
   // for i in 0..n: argv[i] = StringToHGlobalAnsi(a[i])
   out() << "\tldc.i4.0\n\tstloc\t'i'\n";
   out() << "IL_args_loop:\n";
   out() << "\tldloc\t'i'\n\tldloc\t'n'\n\tbge\tIL_args_done\n";
-  out() << "\tldsfld\tvoid* '$MSIL::argv'\n\tldloc\t'i'\n\tconv.i8\n"
+  out() << "\tldsfld\tvoid* " << CP << "'$MSIL::argv'\n\tldloc\t'i'\n\tconv.i8\n"
            "\tldc.i4.8\n\tconv.i8\n\tmul\n\tadd\n";
   out() << "\tldloc\t'a'\n\tldloc\t'i'\n\tldelem.ref\n";
   out() << "\tcall\tnative int [mscorlib]System.Runtime.InteropServices."
