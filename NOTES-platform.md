@@ -111,3 +111,15 @@ Interlocked.Add(int64&, int64) -> int64      System.Private.CoreLib
 An `InvalidProgramException` at JIT time still means a stack imbalance or a
 type mismatch, exactly as with the rest of this backend — it is not specific
 to these calls.
+
+## Typed pointers in signatures
+
+IL accepts a typed pointer (`valuetype 'X'*`) wherever `void*` goes, including
+in a `pinvokeimpl`, and it resolves and marshals identically: verified by
+declaring `SDL_SetRenderDrawColor(valuetype 'SDL_Renderer'*, uint8×4)` as a
+pinvoke on the real SDL2.dll and observing both calls execute. `ldfld`/`stfld`
+work through the typed pointer, and it can be passed along as an argument.
+
+So the emitter is not what prevents typed signatures — see
+`NOTES-typed-pointers.md` for why the IR cannot supply the type.
+
