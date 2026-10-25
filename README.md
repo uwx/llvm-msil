@@ -101,16 +101,23 @@ python -I cbe_port.py \
   casts, shuffles and folds (including `llvm.vector.reduce.*`) are expanded
   lane by lane; there is no SIMD. This is enough for `-O2`/`-O3` output from
   clang.
-* **Atomics** (`atomicrmw`, `cmpxchg`, `fence`) lower to ordinary
-  load/compute/store. That is not a single indivisible step; it is correct
-  only because these assemblies are single-threaded, the same assumption the
-  TLS note below makes. Upgrade together with it.
+* **Atomics** (`atomicrmw`, `cmpxchg`, `fence`, and atomic loads/stores) use
+  the real primitives: `System.Threading.Interlocked` for int32/int64/native
+  int, a CompareExchange loop for the operations .NET Framework has no
+  overload for (`and`, `or`, `xor`, min/max, float add/sub), and the
+  `volatile.` prefix for atomic loads and stores. Narrow integers (i8/i16)
+  have no Interlocked overload, so they are serialized on a module-wide
+  monitor; that is atomic against other narrow accesses in the same assembly,
+  not against native code or a second thread bypassing it. See
+  `NOTES-atomics.md`.
 * **Wide integers** above 64 bits are truncated to `int64`.
 * **C runtime binding** is heuristic (`msvcrt.dll` vs `ucrtbase.dll`); only the
   symbols `clang` emits for the common C library are covered.
 * **Exceptions** raised by `unreachable` / `abort` go through
   `System.Exception`. Landing pads are not implemented, which is why the
-  C++ exception tests in `cbe_port.py` are xfail.
+  C++ exception tests in `cbe_port.py` are xfail. A C++ `throw` arrives at the
+  CLR as `SEHException` and terminates the program; the reason a faithful
+  lowering is out of reach is written up in `NOTES-unwinding.md`.
 * The 64-bit CLR layout is the only one. `argc`/`argv` are built from
   `Environment.GetCommandLineArgs()` and leaked for the program's lifetime.
   Thread-locals are ordinary globals, so there is no `[ThreadStatic]`.

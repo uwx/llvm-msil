@@ -1194,6 +1194,264 @@ void MSILWriter::printVectorCast(unsigned Op, const Value *V, Type *Ty) {
   out() << "\tldloc\t'" << R << "'\n";
 }
 
+//===----------------------------------------------------------------------===//
+// Atomics
+//===----------------------------------------------------------------------===//
+//
+// The CLR has no atomic instructions, but it has `System.Threading.Interlocked`
+// for int32/int64/native int, the `volatile.` prefix for any access width, and
+// `Monitor` for the rest. Three verified facts shape the lowering:
+//
+//  * `Interlocked` takes a managed `T&`. An unmanaged `void*` is accepted as
+//    one, so pointers need no pinning or marshalling. This holds both on the
+//    .NET Framework 4.0 `mscorlib` a bare exe binds to and on .NET 9.
+//  * Only int32/int64/native-int have `Add`; `Exchange` and `CompareExchange`
+//    add float32/float64. `And`/`Or` do not exist on .NET Framework, so those
+//    use a CompareExchange loop rather than a call.
+//  * Narrow integers have no overload at all. They are serialized on
+//    `$MSIL::atomicLock`; NOTES-atomics.md records what that does and does
+//    not guarantee.
+
+StringRef MSILWriter::interlockedTypeName(Type *Ty) {
+  if (Ty->isPointerTy())
+    return "native int";
+  switch (Ty->getTypeID()) {
+  case Type::IntegerTyID:
+    switch (Ty->getIntegerBitWidth()) {
+    case 32:
+      return "int32";
+    case 64:
+      return "int64";
+    default:
+      return "";
+    }
+  case Type::FloatTyID:
+    return "float32";
+  case Type::DoubleTyID:
+    return "float64";
+  default:
+    return "";
+  }
+}
+
+// `volatile.` is a prefix, not an opcode: it goes between the address and the
+// ldind/stind it applies to. It is the only way to ask for an atomic access of
+// a width Interlocked does not cover.
+void MSILWriter::printAtomicLoad(const Value *Ptr, Type *Ty) {
+  printValueLoad(Ptr);
+  out() << "\tvolatile.\n";
+  if (Ty->isAggregateType() || Ty->isVectorTy())
+    out() << "\tldobj\t" << getTypeName(Ty) << '\n';
+  else
+    out() << "\tldind." << getMemSuffix(Ty) << '\n';
+}
+
+void MSILWriter::printAtomicStore(const Value *Ptr, const Value *Val) {
+  Type *Ty = Val->getType();
+  printValueLoad(Ptr);
+  printValueLoad(Val);
+  out() << "\tvolatile.\n";
+  if (Ty->isAggregateType() || Ty->isVectorTy())
+    out() << "\tstobj\t" << getTypeName(Ty) << '\n';
+  else
+    out() << "\tstind." << getMemSuffix(Ty) << '\n';
+}
+
+// Run Body with the module's atomic lock held. `leave` is the only way out of a
+// protected region, and the finally runs Monitor.Exit on both the normal and
+// the exceptional path, so a throwing body cannot leak the lock.
+void MSILWriter::printUnderAtomicLock(function_ref<void()> Body) {
+  NeedsAtomicLock = true;
+  std::string Lock = "t" + utostr(getUniqID());
+  std::string Done = "IL_unlock" + utostr(getUniqID());
+  ExtraLocals.emplace_back("object", Lock);
+  out() << "\tldsfld\tobject '$MSIL::atomicLock'\n\tstloc\t'" << Lock
+        << "'\n\tldloc\t'" << Lock << "'\n";
+  out() << "\tcall\tvoid [mscorlib]System.Threading.Monitor::Enter(object)\n";
+  out() << "\t.try\n\t{\n";
+  Body();
+  out() << "\tleave\t" << Done << "\n\t}\n\tfinally\n\t{\n";
+  out() << "\tldloc\t'" << Lock << "'\n";
+  out() << "\tcall\tvoid [mscorlib]System.Threading.Monitor::Exit(object)\n";
+  out() << "\tendfinally\n\t}\n" << Done << ":\n";
+}
+
+// Leave `<bits of A> != <bits of B>` on the stack. IL has no bitwise float
+// compare and ceq is false for NaN, so both values are re-read as integers.
+// The CLR's own float CompareExchange is bitwise, which is what makes this the
+// right test for "did the exchange happen".
+void MSILWriter::printFloatBitsNe(const std::string &A, const std::string &B,
+                                  Type *Ty) {
+  Type *ITy = Ty->isFloatTy() ? Type::getInt32Ty(Ty->getContext())
+                              : Type::getInt64Ty(Ty->getContext());
+  std::string ABits = newTempLocal(ITy), BBits = newTempLocal(ITy);
+  const char *Sfx = Ty->isFloatTy() ? "i4" : "i8";
+  out() << "\tldloca\t'" << A << "'\n\tconv.u8\n\tldind." << Sfx
+        << "\n\tstloc\t'" << ABits << "'\n";
+  out() << "\tldloca\t'" << B << "'\n\tconv.u8\n\tldind." << Sfx
+        << "\n\tstloc\t'" << BBits << "'\n";
+  out() << "\tldloc\t'" << ABits << "'\n\tldloc\t'" << BBits << "'\n\tceq\n";
+  printNot();
+}
+
+void MSILWriter::printAtomicRMW(const AtomicRMWInst *RMW) {
+  Type *RTy = RMW->getType();
+  AtomicRMWInst::BinOp Op = RMW->getOperation();
+  StringRef ILTy = interlockedTypeName(RTy);
+
+  // The forms C atomics actually produce: exchange, add, and sub (which
+  // Interlocked spells as an add of the two's complement).
+  if (!ILTy.empty() &&
+      (Op == AtomicRMWInst::Xchg || Op == AtomicRMWInst::Add ||
+       Op == AtomicRMWInst::Sub)) {
+    printValueLoad(RMW->getPointerOperand());
+    printValueLoad(RMW->getValOperand());
+    if (Op == AtomicRMWInst::Sub)
+      out() << "\tneg\n";
+    out() << "\tcall\t" << ILTy << " [mscorlib]System.Threading.Interlocked::"
+          << (Op == AtomicRMWInst::Xchg ? "Exchange" : "Add") << "(" << ILTy
+          << "&, " << ILTy << ")\n";
+    return;
+  }
+
+  // Everything else is a CompareExchange loop, which needs no overload beyond
+  // the one for the value's own type.
+  std::string Old = newTempLocal(RTy), Val = newTempLocal(RTy),
+              New = newTempLocal(RTy);
+  printValueLoad(RMW->getValOperand());
+  out() << "\tstloc\t'" << Val << "'\n";
+
+  auto Compute = [&] {
+    if (Op == AtomicRMWInst::Xchg) {
+      // The new value is simply the operand, with no old value read.
+      out() << "\tldloc\t'" << Val << "'\n";
+      return;
+    }
+    out() << "\tldloc\t'" << Old << "'\n\tldloc\t'" << Val << "'\n";
+    switch (Op) {
+    case AtomicRMWInst::Add:
+    case AtomicRMWInst::FAdd:
+      out() << "\tadd\n";
+      return;
+    case AtomicRMWInst::Sub:
+    case AtomicRMWInst::FSub:
+      out() << "\tsub\n";
+      return;
+    case AtomicRMWInst::And:
+      out() << "\tand\n";
+      return;
+    case AtomicRMWInst::Or:
+      out() << "\tor\n";
+      return;
+    case AtomicRMWInst::Xor:
+      out() << "\txor\n";
+      return;
+    case AtomicRMWInst::Nand:
+      out() << "\tand\n";
+      printNot();
+      return;
+    default:
+      report_fatal_error("MSIL: unsupported atomicrmw operation " +
+                         Twine((unsigned)Op));
+    }
+  };
+
+  if (ILTy.empty()) {
+    // No Interlocked overload (i8/i16): the lock is what makes the
+    // read-modify-write indivisible. `conv.uN` normalizes the loaded value to
+    // the zero-extended form every other narrow value has.
+    printUnderAtomicLock([&] {
+      printValueLoad(RMW->getPointerOperand());
+      out() << "\tldind." << getMemSuffix(RTy) << "\n\t" << widthConv(RTy)
+            << "\n\tstloc\t'" << Old << "'\n";
+      Compute();
+      out() << "\tstloc\t'" << New << "'\n";
+      printValueLoad(RMW->getPointerOperand());
+      out() << "\tldloc\t'" << New << "'\n\tstind." << getMemSuffix(RTy)
+            << "\n";
+    });
+    out() << "\tldloc\t'" << Old << "'\n";
+    return;
+  }
+
+  std::string Prev = newTempLocal(RTy);
+  std::string Loop = "IL_rmw" + utostr(getUniqID());
+  out() << Loop << ":\n";
+  printAtomicLoad(RMW->getPointerOperand(), RTy);
+  out() << "\tstloc\t'" << Old << "'\n";
+  Compute();
+  out() << "\tstloc\t'" << New << "'\n";
+  printValueLoad(RMW->getPointerOperand());
+  out() << "\tldloc\t'" << New << "'\n\tldloc\t'" << Old << "'\n";
+  out() << "\tcall\t" << ILTy << " [mscorlib]System.Threading.Interlocked::"
+        << "CompareExchange(" << ILTy << "&, " << ILTy << ", " << ILTy
+        << ")\n\tstloc\t'" << Prev << "'\n";
+  if (RTy->isFloatingPointTy()) {
+    printFloatBitsNe(Prev, Old, RTy);
+    out() << "\tbrtrue\t" << Loop << "\n";
+  } else {
+    out() << "\tldloc\t'" << Prev << "'\n\tldloc\t'" << Old
+          << "'\n\tbne.un\t" << Loop << "\n";
+  }
+  out() << "\tldloc\t'" << Old << "'\n";
+}
+
+void MSILWriter::printAtomicCmpXchg(const AtomicCmpXchgInst *CX) {
+  Type *VTy = CX->getNewValOperand()->getType();
+  StringRef ILTy = interlockedTypeName(VTy);
+  std::string Old = newTempLocal(VTy);
+
+  if (ILTy.empty()) {
+    std::string Done = "IL_cx" + utostr(getUniqID());
+    printUnderAtomicLock([&] {
+      printValueLoad(CX->getPointerOperand());
+      out() << "\tldind." << getMemSuffix(VTy) << "\n\t" << widthConv(VTy)
+            << "\n\tstloc\t'" << Old << "'\n";
+      // Both sides of the compare must be in the same form: `Old` was
+      // zero-extended above, so the comparand has to be too.
+      printValueLoad(CX->getCompareOperand());
+      out() << '\t' << widthConv(VTy) << "\n\tldloc\t'" << Old
+            << "'\n\tbne.un\t" << Done << "\n";
+      printValueLoad(CX->getPointerOperand());
+      printValueLoad(CX->getNewValOperand());
+      out() << "\tstind." << getMemSuffix(VTy) << "\n" << Done << ":\n";
+    });
+  } else {
+    printValueLoad(CX->getPointerOperand());
+    printValueLoad(CX->getNewValOperand());
+    printValueLoad(CX->getCompareOperand());
+    out() << "\tcall\t" << ILTy << " [mscorlib]System.Threading.Interlocked::"
+          << "CompareExchange(" << ILTy << "&, " << ILTy << ", " << ILTy
+          << ")\n\tstloc\t'" << Old << "'\n";
+  }
+
+  // The result is { old, success }; success is re-derived from the same
+  // comparison, and the struct's second field sits at the first's alloc size.
+  std::string Res = newTempLocal(CX->getType());
+  out() << "\tldloca\t'" << Res << "'\n\tconv.u8\n\tldloc\t'" << Old
+        << "'\n\tstind." << getMemSuffix(VTy) << "\n";
+  printAggregateLaneAddr(Res, Type::getInt8Ty(CX->getContext()),
+                         DL->getTypeAllocSize(VTy).getFixedValue());
+  // Compare in the same zero-extended form `Old` was stored in, or a negative
+  // narrow comparand would never match.
+  printValueLoad(CX->getCompareOperand());
+  out() << '\t' << widthConv(VTy) << "\n\tldloc\t'" << Old
+        << "'\n\tceq\n\tstind.i1\n";
+  out() << "\tldloc\t'" << Res << "'\n";
+}
+
+// The lock is a single shared object, emitted only for a module that has a
+// narrow atomic access. `<Module>.cctor` runs before any static method of the
+// module, so it is initialized before the first atomic operation can reach it.
+void MSILWriter::printAtomicLock() {
+  if (!NeedsAtomicLock)
+    return;
+  out() << "\n.field static assembly object '$MSIL::atomicLock'\n";
+  out() << "\n.method static void .cctor() cil managed\n{\n";
+  out() << "\t.maxstack\t2\n";
+  out() << "\tnewobj\tinstance void [mscorlib]System.Object::.ctor()\n";
+  out() << "\tstsfld\tobject '$MSIL::atomicLock'\n\tret\n}\n";
+}
 void MSILWriter::printInstruction(const Instruction *Inst) {
   const Value *Op0 = Inst->getNumOperands() > 0 ? Inst->getOperand(0) : nullptr;
   const Value *Op1 = Inst->getNumOperands() > 1 ? Inst->getOperand(1) : nullptr;
@@ -1366,12 +1624,20 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     out() << L << "_e:\n";
     return;
   }
-  case Instruction::Load:
-    printIndirectLoad(cast<LoadInst>(Inst)->getPointerOperand(), Ty);
+  case Instruction::Load: {
+    const auto *LI = cast<LoadInst>(Inst);
+    if (LI->isAtomic())
+      printAtomicLoad(LI->getPointerOperand(), Ty);
+    else
+      printIndirectLoad(LI->getPointerOperand(), Ty);
     return;
+  }
   case Instruction::Store: {
     const auto *SI = cast<StoreInst>(Inst);
-    printIndirectSave(SI->getPointerOperand(), SI->getValueOperand());
+    if (SI->isAtomic())
+      printAtomicStore(SI->getPointerOperand(), SI->getValueOperand());
+    else
+      printIndirectSave(SI->getPointerOperand(), SI->getValueOperand());
     return;
   }
   case Instruction::GetElementPtr:
@@ -1551,74 +1817,19 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     return;
   }
   case Instruction::Fence:
-    // shortcut: no memory ordering. The assembly runs single-threaded (see the
-    // README's TLS note), so a barrier orders nothing observable; upgrade if
-    // concurrent code ever runs on this backend.
+    // Every CLR atomic access is already a full barrier (volatile. is
+    // release/acquire, Interlocked is seq_cst), so a standalone fence has
+    // nothing left to order. The call is kept so the ordering is not merely
+    // assumed: it is what the JIT emits for a seq_cst fence.
+    out() << "\tcall\tvoid [mscorlib]System.Threading.Interlocked::"
+           "MemoryBarrier()\n";
     return;
-  case Instruction::AtomicRMW: {
-    // shortcut: plain load/op/store, not one indivisible step. Same
-    // single-threaded caveat as Fence; upgrade together with it.
-    const auto *RMW = cast<AtomicRMWInst>(Inst);
-    Type *VTy = RMW->getValOperand()->getType();
-    std::string Sfx = getMemSuffix(VTy);
-    std::string Old = newTempLocal(VTy);
-    printValueLoad(RMW->getPointerOperand());
-    out() << "\tldind." << Sfx << "\n\tstloc\t'" << Old << "'\n";
-    // The destination address stays on the stack while the new value is built.
-    printValueLoad(RMW->getPointerOperand());
-    switch (RMW->getOperation()) {
-    case AtomicRMWInst::Xchg:
-      printValueLoad(RMW->getValOperand());
-      break;
-    case AtomicRMWInst::Add:
-    case AtomicRMWInst::Sub:
-    case AtomicRMWInst::And:
-    case AtomicRMWInst::Or:
-    case AtomicRMWInst::Xor: {
-      const char *Op = RMW->getOperation() == AtomicRMWInst::Add ? "add"
-                       : RMW->getOperation() == AtomicRMWInst::Sub ? "sub"
-                       : RMW->getOperation() == AtomicRMWInst::And ? "and"
-                       : RMW->getOperation() == AtomicRMWInst::Or  ? "or"
-                                                                  : "xor";
-      out() << "\tldloc\t'" << Old << "'\n";
-      printValueLoad(RMW->getValOperand());
-      out() << '\t' << Op << '\n';
-      break;
-    }
-    default:
-      report_fatal_error("MSIL: unsupported atomicrmw operation " +
-                         Twine((unsigned)RMW->getOperation()));
-    }
-    out() << "\tstind." << Sfx << "\n";
-    out() << "\tldloc\t'" << Old << "'\n";  // every form yields the old value
+  case Instruction::AtomicRMW:
+    printAtomicRMW(cast<AtomicRMWInst>(Inst));
     return;
-  }
-  case Instruction::AtomicCmpXchg: {
-    // shortcut: plain compare-and-store, not one indivisible step.
-    const auto *CX = cast<AtomicCmpXchgInst>(Inst);
-    Type *VTy = CX->getNewValOperand()->getType();
-    std::string Sfx = getMemSuffix(VTy);
-    std::string Old = newTempLocal(VTy);
-    std::string Done = "IL_cx" + utostr(getUniqID());
-    printValueLoad(CX->getPointerOperand());
-    out() << "\tldind." << Sfx << "\n\tstloc\t'" << Old << "'\n";
-    printValueLoad(CX->getCompareOperand());
-    out() << "\tldloc\t'" << Old << "'\n\tbne.un\t" << Done << "\n";
-    printValueLoad(CX->getPointerOperand());
-    printValueLoad(CX->getNewValOperand());
-    out() << "\tstind." << Sfx << "\n" << Done << ":\n";
-    // The result is { old, success }; success is re-derived from the same
-    // comparison, and the struct's second field sits at the first's alloc size.
-    std::string Res = newTempLocal(Inst->getType());
-    out() << "\tldloca\t'" << Res << "'\n\tconv.u8\n\tldloc\t'" << Old
-          << "'\n\tstind." << Sfx << "\n";
-    printAggregateLaneAddr(Res, Type::getInt8Ty(Inst->getContext()),
-                           DL->getTypeAllocSize(VTy).getFixedValue());
-    printValueLoad(CX->getCompareOperand());
-    out() << "\tldloc\t'" << Old << "'\n\tceq\n\tstind.i1\n";
-    out() << "\tldloc\t'" << Res << "'\n";
+  case Instruction::AtomicCmpXchg:
+    printAtomicCmpXchg(cast<AtomicCmpXchgInst>(Inst));
     return;
-  }
   default:
     report_fatal_error("MSIL: unsupported instruction " +
                        Twine(Inst->getOpcodeName()));
@@ -2699,6 +2910,10 @@ bool MSILWriter::runOnModule(Module &M) {
 
   if (Wrap)
     out() << "}\n";
+  // The lock lives on <Module> so a class-wrapped module can still reach it:
+  // a field's accessibility is checked against the declaring type, and a
+  // private <Module> field is not visible from inside a class.
+  printAtomicLock();
   printModuleStartup();
   return false;
 }

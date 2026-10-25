@@ -33,8 +33,10 @@ note() { printf '%s\n' "$*"; }
 note "== lit =="
 if [ -f "$LIT" ]; then
   # The lit suite needs a generated site config, so run it through the build
-  # tree's lit when there is one, else fall back to plain lit.
-  if "$LIT" "$HERE" > /tmp/msil-lit.log 2>&1; then
+  # tree's lit when there is one, else fall back to plain lit. Point it at the
+  # binary under test: without this it searches the LLVM tool directory, which
+  # holds a stale copy in a worktree setup.
+  if "$LIT" --param llvm_msil_dir="$LLVMBIN" "$HERE" > /tmp/msil-lit.log 2>&1; then
     note "lit: ok"
   else
     note "lit: FAILED (see /tmp/msil-lit.log)"
