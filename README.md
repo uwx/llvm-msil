@@ -93,10 +93,34 @@ storage and `cpblk`s the template into it. A zero-sized global gets no template
 but still gets its own allocation, since LLVM gives every global a distinct
 address.
 
+## Importing from a DLL that is not the CRT
+
+An external function is bound to `msvcrt.dll` or `ucrtbase.dll` by a name
+heuristic, which cannot know about a third-party library. `-msil-lib-map`
+names one, matched against the symbol as the module references it (not the
+export spelling it is bound to):
+
+```
+llvm-msil demo.ll -o demo.il -msil-lib-map 'SDL_*=SDL2.dll'
+llvm-msil gpu.ll  -o gpu.il  -msil-lib-map 'vk*=vulkan-1.dll'
+```
+
+`*` matches any suffix and the option repeats. Library-specific options are
+consulted first, so a mapped symbol never falls back to the CRT. The
+[`sdl_demo.c`](test/programs/sdl_demo.c) program is a working example: SDL2,
+native-thread callbacks, function pointers from `SDL_GL_GetProcAddress`, and a
+frame checksum compared against a native build.
+
 ## Tests
 
 `test/` is its own lit suite (`check-msil`, or run `llvm-lit` on it
 directly). Those tests check the emitted IL with `FileCheck`.
+
+`test/programs/sdl_demo.c` is the SDL2 demo, built both natively and through
+the backend and compared line for line (`test/programs/sdl.sh`). It needs SDL2
+development files: set `SDL2_DIR` to a directory with `include/SDL2` and
+`lib/SDL2.lib`, and `SDL2_BIN` to `SDL2.dll` if it is not in `lib/`. Without
+them the test reports `sdl: skipped` and the gate still passes.
 
 `cbe_port.py` runs the upstream llvm-cbe suite (C, C++ and `.ll` tests, four
 optimization levels) against this backend; both sides of that suite only
@@ -136,7 +160,11 @@ python -I cbe_port.py \
 * **Integers between 65 and 127 bits** are truncated to `int64` (`i128` itself
   maps to `Int128`).
 * **C runtime binding** is heuristic (`msvcrt.dll` vs `ucrtbase.dll`); only the
-  symbols `clang` emits for the common C library are covered.
+  symbols `clang` emits for the common C library are covered. A symbol from any
+  other DLL has to be named with `-msil-lib-map` (see below), since nothing in
+  the IR says which library an import came from: neither the SDL headers nor
+  `vulkan.h` expand to `__declspec(dllimport)` by default, and `dllimport` is
+  not consulted even when it is present.
 * **Exceptions** raised by `unreachable` / `abort` go through
   `System.Exception`. Landing pads are not implemented, which is why the
   C++ exception tests in `cbe_port.py` are xfail. A C++ `throw` arrives at the

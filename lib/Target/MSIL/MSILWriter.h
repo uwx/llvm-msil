@@ -197,6 +197,7 @@ private:
   /// The CRT export getCName names, after POSIX-only spellings are mapped.
   std::string getImportName(const Function *F) const;
   StringRef getLibraryFor(StringRef Symbol);
+  StringRef getLibraryForCRT(StringRef Symbol);
   void collectPInvokes();
   /// True when any type in \p M needs the Vector<T> assembly reference.
   bool vectorNeeded(Module &M);
@@ -295,9 +296,12 @@ private:
     std::string Name;
     std::string Signature;
     std::string Export;
+    std::string Symbol;
   };
   std::vector<PInvoke> PInvokes;
   std::map<std::pair<const Function *, std::string>, std::string> PInvokeNames;
+  /// -msil-lib-map entries as (pattern, dll), parsed once per module.
+  std::vector<std::pair<std::string, std::string>> LibMap;
 
   /// Set by resolveLibcOptions; an empty Type means "use the CRT".
   ManagedType LibcType;

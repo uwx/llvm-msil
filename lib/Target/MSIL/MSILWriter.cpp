@@ -141,6 +141,16 @@ static cl::opt<std::string> AllocSpec(
              "this type, so unmanaged allocations can be instrumented"),
     cl::value_desc("assembly:type"), cl::init(""));
 
+// A symbol this module imports from a native library other than the CRT. The
+// CRT split in getLibraryFor is a name heuristic, which cannot know about a
+// third-party DLL, so these are consulted first.
+static cl::list<std::string> LibMapSpec(
+    "msil-lib-map",
+    cl::desc("Bind matching imported symbols to a native library, e.g. "
+             "'SDL_*=SDL2.dll'. <pattern>=<dll>, '*' matches any suffix; "
+             "checked before the C runtime heuristic"),
+    cl::value_desc("pattern=dll"));
+
 char MSILWriter::ID = 0;
 
 MSILWriter::MSILWriter(raw_pwrite_stream &Sink)
@@ -1607,7 +1617,8 @@ bool MSILWriter::tryPrintSimdBinary(const Instruction *Inst) {
   case Instruction::FDiv: Name = "Divide"; break;
   case Instruction::And: Name = "BitwiseAnd"; break;
   case Instruction::Or: Name = "BitwiseOr"; break;
-  case Instruction::Xor: Name = "ExclusiveOr"; break;
+  // The static helper is Xor; only the instance operator is op_ExclusiveOr.
+  case Instruction::Xor: Name = "Xor"; break;
   case Instruction::Shl: Name = "ShiftLeft"; Shift = true; break;
   case Instruction::LShr: Name = "ShiftRightLogical"; Shift = true; break;
   case Instruction::AShr: Name = "ShiftRightArithmetic"; Shift = true; break;
@@ -3638,6 +3649,14 @@ void MSILWriter::resolveLibcOptions() {
   };
   if (!AllocSpec.empty())
     AllocType = Parse(AllocSpec, "", "-msil-alloc");
+  for (const std::string &Spec : LibMapSpec) {
+    size_t Eq = Spec.find('=');
+    if (Eq == std::string::npos || Eq + 1 == Spec.size())
+      report_fatal_error(Twine("MSIL: -msil-lib-map needs <pattern>=<dll>, "
+                               "got '") + Spec + "'");
+    LibMap.emplace_back(StringRef(Spec).substr(0, Eq).str(),
+                        StringRef(Spec).substr(Eq + 1).str());
+  }
   if (LibcSpec.empty())
     return;
   if (LibcSpec == "builtin") {
@@ -4231,6 +4250,21 @@ void MSILWriter::printBuiltinLibc() {
 }
 
 StringRef MSILWriter::getLibraryFor(StringRef Symbol) {
+  // An explicit map wins over everything: it exists to name a DLL the CRT
+  // heuristic below has no way to know about.
+  for (const auto &Pat : LibMap) {
+    StringRef P = Pat.first;
+    if (P.ends_with("*")) {
+      if (Symbol.starts_with(P.drop_back()))
+        return Pat.second;
+    } else if (Symbol == P) {
+      return Pat.second;
+    }
+  }
+  return getLibraryForCRT(Symbol);
+}
+
+StringRef MSILWriter::getLibraryForCRT(StringRef Symbol) {
   // The C runtime is split: the classic msvcrt.dll forwards printf & friends,
   // while the UCRT-internal entry points clang emits (__acrt_*, __stdio_*),
   // the C99 math functions (rint, sinh, llrint, fmin, ...) and everything
@@ -4281,7 +4315,7 @@ void MSILWriter::collectPInvokes() {
       }
       Sig += ")";
       PInvokeNames[{&F, Key}] = Name;
-      PInvokes.push_back({Name, Sig, getImportName(&F)});
+      PInvokes.push_back({Name, Sig, getImportName(&F), F.getName().str()});
     }
   }
 }
@@ -4296,7 +4330,7 @@ void MSILWriter::printExternals() {
       return;
     }
     out() << ".method public static hidebysig pinvokeimpl(\""
-        << getLibraryFor(getImportName(&F)) << "\" as \"" << getImportName(&F)
+        << getLibraryFor(F.getName()) << "\" as \"" << getImportName(&F)
         << "\" cdecl) "
         << getCallSignature(F.getFunctionType(), nullptr, "'" + Name.str() + "'")
         << " preservesig {}\n";
@@ -4309,7 +4343,7 @@ void MSILWriter::printExternals() {
   }
   for (const PInvoke &P : PInvokes)
     out() << ".method public static hidebysig pinvokeimpl(\""
-        << getLibraryFor(P.Export) << "\" as \"" << P.Export
+        << getLibraryFor(P.Symbol) << "\" as \"" << P.Export
         << "\" cdecl) " << P.Signature << " preservesig {}\n";
   out() << '\n';
 
