@@ -1,0 +1,25 @@
+@LIT_SITE_CFG_IN_HEADER@
+
+import sys
+
+config.llvm_tools_dir = lit_config.substitute(path(r"@LLVM_TOOLS_DIR@"))
+config.llvm_shlib_dir = lit_config.substitute(path(r"@SHLIBDIR@"))
+config.llvm_shlib_ext = "@SHLIBEXT@"
+config.llvm_plugin_ext = "@LLVM_PLUGIN_EXT@"
+config.llvm_exe_ext = "@EXEEXT@"
+config.lit_tools_dir = path(r"@LLVM_LIT_TOOLS_DIR@")
+config.errc_messages = "@LLVM_LIT_ERRC_MESSAGES@"
+config.python_executable = "@Python3_EXECUTABLE@"
+config.host_triple = "@LLVM_HOST_TRIPLE@"
+config.target_triple = "@LLVM_TARGET_TRIPLE@"
+config.enable_assertions = @ENABLE_ASSERTIONS@
+config.targets_to_build = "@TARGETS_TO_BUILD@"
+config.native_target = "@LLVM_NATIVE_ARCH@"
+config.build_shared_libs = @BUILD_SHARED_LIBS@
+
+import lit.llvm
+
+lit.llvm.initialize(lit_config, config)
+
+# This file is generated into the build directory, so point at the source tree.
+lit_config.load_config(config, path(r"@LLVM_MSIL_TEST_SOURCE_DIR@/lit.cfg.py"))
