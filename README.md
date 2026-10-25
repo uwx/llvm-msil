@@ -37,7 +37,8 @@ size any aggregate type.
 |----|-----|
 | `i1` | `bool` |
 | `i8`, `i16`, `i32` | `int8`, `int16`, `int32` in globals and signatures; `int32` in locals |
-| `i64`, `i33`, ... | `int64` |
+| `i33` ... `i64` | `int64` |
+| `i128` | `System.Int128` (a value type; see below) |
 | `float`, `double` | `float32`, `float64` |
 | pointers | unmanaged `void*` |
 | structs, arrays, vectors | explicit-layout value classes (`valuetype`, byte-exact size) |
@@ -56,6 +57,28 @@ Likewise, `stloc` into a local of a different type *converts*; it does not
 reinterpret. A bitcast between integer and float therefore goes through memory
 of the source type (`stloc` / `ldloca` / `conv.u8` / `ldind.<dst>`), not
 through a local of the destination type.
+
+## 128-bit integers
+
+`i128` maps to `System.Int128` from `System.Runtime`; the assembly reference is
+emitted only for modules that use it, since a framework reference needs the
+real `.ver`/public key token.
+
+`Int128` is an ordinary value type, so it lives in a local and moves with
+`ldobj`/`stobj`. It has no IL arithmetic at all: every operator is a static
+method (`op_Addition`, `op_Multiply`, `op_Division`, `op_ShiftLeft`,
+`op_Equality`, `op_LessThan`, ...), and comparisons return `bool`. Constants
+come from `op_Implicit(int64)`, or the `(uint64 upper, uint64 lower)`
+constructor when the value needs both halves.
+
+Unsigned operations use `UInt128`: `udiv`, `urem` and unsigned compares
+reinterpret with `Int128::op_Explicit` and back with `UInt128::op_Explicit`.
+Signed shifts use `op_RightShift`; `lshr` uses `op_UnsignedRightShift`. Shift
+counts become `int32`, which the methods reduce modulo 128 — the same thing
+LLVM's shift semantics do with an oversized count.
+
+Not supported: i128 lanes inside a vector, and 128-bit atomics. Both abort with
+a diagnostic rather than emitting wrong code.
 
 ## Globals are writable
 
@@ -105,7 +128,8 @@ python -I cbe_port.py \
   load/compute/store. That is not a single indivisible step; it is correct
   only because these assemblies are single-threaded, the same assumption the
   TLS note below makes. Upgrade together with it.
-* **Wide integers** above 64 bits are truncated to `int64`.
+* **Integers between 65 and 127 bits** are truncated to `int64` (`i128` itself
+  maps to `Int128`).
 * **C runtime binding** is heuristic (`msvcrt.dll` vs `ucrtbase.dll`); only the
   symbols `clang` emits for the common C library are covered.
 * **Exceptions** raised by `unreachable` / `abort` go through

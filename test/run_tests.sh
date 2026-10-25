@@ -13,6 +13,9 @@ set -u
 
 MSIL=${1:?usage: run_tests.sh <llvm-msil> [lit]}
 HERE=$(cd "$(dirname "$0")" && pwd)
+# lit runs each test from its own directory, so a relative path would not
+# resolve there.
+MSIL=$(cd "$(dirname "$MSIL")" && pwd)/$(basename "$MSIL")
 LLVMBIN=$(cd "$(dirname "$MSIL")" && pwd)
 
 CLANG=${CLANG:-I:/Downloads/llvm-project-18.1.7/bin/clang.exe}
@@ -32,8 +35,6 @@ note() { printf '%s\n' "$*"; }
 
 note "== lit =="
 if [ -f "$LIT" ]; then
-  # The lit suite needs a generated site config, so run it through the build
-  # tree's lit when there is one, else fall back to plain lit.
   # The tool substitution resolves llvm-msil by name in the LLVM tool
   # directory, which is not necessarily the binary being tested; pin it.
   if "$LIT" -D "llvm-msil=$MSIL" "$HERE" > /tmp/msil-lit.log 2>&1; then
@@ -64,7 +65,7 @@ fi
 
 note "== real programs =="
 if [ -d "${PROGS_DIR:-$HERE/programs}" ]; then
-  for p in "$PROGS_DIR"/*.sh "$HERE"/programs/*.sh; do
+  for p in "${PROGS_DIR:-$HERE/programs}"/*.sh; do
     [ -f "$p" ] || continue
     name=$(basename "$p" .sh)
     if "$p" "$MSIL" > /tmp/msil-$name.log 2>&1; then
