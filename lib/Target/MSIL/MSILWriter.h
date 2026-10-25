@@ -111,6 +111,29 @@ private:
   void printVectorCast(unsigned Op, const Value *V, Type *Ty);
   void printVectorCmp(unsigned Pred, const Value *L, const Value *R,
                       VectorType *ResTy, bool IsFP);
+
+  //===------------------------------------------------------------------===//
+  // SIMD (System.Numerics.Vector<T>).
+  //===------------------------------------------------------------------===//
+  /// True when \p Ty is a vector held in a `Vector<T>` local: an element-wise
+  /// vector whose bit width is exactly one SIMD register on this target.
+  bool isSimdVectorTy(Type *Ty) const;
+
+  /// `<elem>` of the Vector<T> for \p VTy (int32, int64, float32, float64).
+  std::string getVectorElemName(Type *EltTy);
+
+  /// Full IL name of the `Vector<T>` that holds \p VTy.
+  std::string getVectorTypeName(Type *VTy);
+
+  /// Emit a SIMD select, optionally fusing the comparison that produces the
+  /// mask: a Vector<T> compare yields a full-width mask, which cannot be
+  /// stored in the i1-vector blob, so a one-use compare is consumed here.
+  bool tryPrintSimdSelect(const Instruction *Inst);
+
+  bool tryPrintSimdBinary(const Instruction *Inst);
+  /// Emit a SIMD compare and leave the mask on the stack as a Vector<T>.
+  bool tryPrintSimdCmpToStack(const User *Cmp, bool IsFP);
+  bool tryPrintSimdCast(const Instruction *Inst);
   void printAggregateLaneAddr(const std::string &Base, Type *EltTy,
                               uint64_t Off);
 
@@ -166,6 +189,10 @@ private:
   std::string getImportName(const Function *F) const;
   StringRef getLibraryFor(StringRef Symbol);
   void collectPInvokes();
+  /// True when any type in \p M needs the Vector<T> assembly reference.
+  bool vectorNeeded(Module &M);
+  /// True when \p Ty is or contains a register-wide vector type.
+  bool vectorTypeIn(Type *Ty);
   void collectTypes();
   void collectType(Type *Ty);
   void collectConstant(const Constant *C);
@@ -229,6 +256,10 @@ private:
   std::vector<std::pair<std::string, std::string>> ExtraLocals;
   DenseMap<const Value *, std::string> ArgIterators;
   unsigned NumVA = 0;
+
+  /// Set once any Vector<T> operation is emitted; the assembly reference has
+  /// to follow the type references, so it is written after the functions.
+  bool UsesVector = false;
 
   /// A global's initializer image. A writable global gets a heap copy filled
   /// from its image by $MSIL_Init; a constant global is never written, so the
