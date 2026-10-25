@@ -35,9 +35,9 @@ note() { printf '%s\n' "$*"; }
 
 note "== lit =="
 if [ -f "$LIT" ]; then
-  # The tool substitution resolves llvm-msil by name in the LLVM tool
-  # directory, which is not necessarily the binary being tested; pin it.
-  if "$LIT" -D "llvm-msil=$MSIL" "$HERE" > /tmp/msil-lit.log 2>&1; then
+  # Point it at the binary under test: without this it searches the LLVM tool
+  # directory, which holds a stale copy in a worktree setup.
+  if "$LIT" --param llvm_msil_dir="$LLVMBIN" "$HERE" > /tmp/msil-lit.log 2>&1; then
     note "lit: ok"
   else
     note "lit: FAILED (see /tmp/msil-lit.log)"

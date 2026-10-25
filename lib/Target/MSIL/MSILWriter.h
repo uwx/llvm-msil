@@ -14,6 +14,7 @@
 #define LLVM_LIB_TARGET_MSIL_MSILWRITER_H
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
@@ -34,6 +35,8 @@ class BranchInst;
 class BasicBlock;
 class Instruction;
 class VectorType;
+class AtomicRMWInst;
+class AtomicCmpXchgInst;
 
 /// Emits a whole module as CIL text suitable for `ilasm`.
 ///
@@ -129,6 +132,31 @@ private:
   std::string newTempLocal(Type *Ty);
 
   //===------------------------------------------------------------------===//
+  // Atomics.
+  //===------------------------------------------------------------------===//
+  /// Load/store with the `volatile.` prefix, which the CLR defines as a
+  /// release/acquire access. Every atomic memory access the IR asks for is
+  /// at least relaxed, and IL has no weaker atomic access.
+  void printAtomicLoad(const Value *Ptr, Type *Ty);
+  void printAtomicStore(const Value *Ptr, const Value *Val);
+
+  /// Emit an `atomicrmw`, leaving the previous value on the stack.
+  void printAtomicRMW(const AtomicRMWInst *RMW);
+  void printAtomicCmpXchg(const AtomicCmpXchgInst *CX);
+
+  /// Run \p Body with `$MSIL::atomicLock` held.
+  void printUnderAtomicLock(function_ref<void()> Body);
+
+  /// Leave `<bits of A> != <bits of B>` on the stack for a float value.
+  void printFloatBitsNe(const std::string &A, const std::string &B, Type *Ty);
+
+  /// The Interlocked overload name for a type, or "" when it has none.
+  static StringRef interlockedTypeName(Type *Ty);
+
+  /// Emit the shared lock object, if a narrow atomic needed one.
+  void printAtomicLock();
+
+  //===------------------------------------------------------------------===//
   // Module emission.
   //===------------------------------------------------------------------===//
   void lowerIntrinsics(Function &F);
@@ -197,6 +225,9 @@ private:
 
   uint64_t UniqID = 0;
   uint64_t getUniqID() { return ++UniqID; }
+
+  /// Set when a narrow atomic access needed `$MSIL::atomicLock`.
+  bool NeedsAtomicLock = false;
 };
 
 } // namespace llvm
