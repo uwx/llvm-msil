@@ -141,6 +141,14 @@ static cl::opt<std::string> AllocSpec(
              "this type, so unmanaged allocations can be instrumented"),
     cl::value_desc("assembly:type"), cl::init(""));
 
+// On by default: a pinvoke into the CRT is the one thing that ties the output
+// to Windows, and System.Math covers nearly every libm call a C program makes.
+// Off for a target that must match a specific CRT's rounding bit-for-bit.
+static cl::opt<bool> MathBind(
+    "msil-math", cl::desc("Bind libm calls to System.Math/System.MathF "
+                          "instead of pinvoking the C runtime"),
+    cl::init(true));
+
 char MSILWriter::ID = 0;
 
 MSILWriter::MSILWriter(raw_pwrite_stream &Sink)
@@ -2623,23 +2631,39 @@ void MSILWriter::printFunctions() {
 // Intrinsic lowering
 //===----------------------------------------------------------------------===//
 
-// IntrinsicLowering only knows a handful of libm functions, and the ones it
-// does know are the C89 spellings in msvcrt.dll. Everything else here is a C99
-// name that only ucrtbase.dll exports, which is why the bound library comes
-// from getLibraryFor and not from the intrinsic lowering.
+// IntrinsicLowering only knows a handful of libm functions, and it resolves
+// the ones it does know to a bare CRT call. Rewriting every math intrinsic to
+// the C symbol here means one binding decision later, in getManagedTarget,
+// rather than two spellings that can disagree.
 bool MSILWriter::lowerLibmIntrinsic(CallInst *CI) {
   // float spelling, double spelling
   const char *F32 = nullptr, *F64 = nullptr;
   switch (CI->getCalledFunction()->getIntrinsicID()) {
+  case Intrinsic::sqrt:      F32 = "sqrtf";      F64 = "sqrt";      break;
+  case Intrinsic::sin:       F32 = "sinf";       F64 = "sin";       break;
+  case Intrinsic::cos:       F32 = "cosf";       F64 = "cos";       break;
+  case Intrinsic::tan:       F32 = "tanf";       F64 = "tan";       break;
+  case Intrinsic::exp:       F32 = "expf";       F64 = "exp";       break;
+  case Intrinsic::log:       F32 = "logf";       F64 = "log";       break;
+  case Intrinsic::log2:      F32 = "log2f";      F64 = "log2";      break;
+  case Intrinsic::log10:     F32 = "log10f";     F64 = "log10";     break;
+  case Intrinsic::exp2:      F32 = "exp2f";      F64 = "exp2";      break;
+  case Intrinsic::exp10:     F32 = "exp10f";     F64 = "exp10";     break;
+  case Intrinsic::floor:     F32 = "floorf";     F64 = "floor";     break;
+  case Intrinsic::ceil:      F32 = "ceilf";      F64 = "ceil";      break;
+  case Intrinsic::trunc:     F32 = "truncf";     F64 = "trunc";     break;
+  case Intrinsic::round:     F32 = "roundf";     F64 = "round";     break;
+  case Intrinsic::roundeven: F32 = "roundevenf"; F64 = "roundeven"; break;
   case Intrinsic::rint:      F32 = "rintf";      F64 = "rint";      break;
   case Intrinsic::nearbyint: F32 = "nearbyintf"; F64 = "nearbyint"; break;
-  case Intrinsic::exp10:     F32 = "exp10f";     F64 = "exp10";     break;
   case Intrinsic::sinh:      F32 = "sinhf";      F64 = "sinh";      break;
   case Intrinsic::cosh:      F32 = "coshf";      F64 = "cosh";      break;
   case Intrinsic::tanh:      F32 = "tanhf";      F64 = "tanh";      break;
   case Intrinsic::asin:      F32 = "asinf";      F64 = "asin";      break;
   case Intrinsic::acos:      F32 = "acosf";      F64 = "acos";      break;
   case Intrinsic::atan:      F32 = "atanf";      F64 = "atan";      break;
+  case Intrinsic::pow:       F32 = "powf";       F64 = "pow";       break;
+  case Intrinsic::fabs:      F32 = "fabsf";      F64 = "fabs";      break;
   case Intrinsic::lround:    F32 = "lroundf";    F64 = "lround";    break;
   case Intrinsic::llround:   F32 = "llroundf";   F64 = "llround";   break;
   case Intrinsic::lrint:     F32 = "lrintf";     F64 = "lrint";     break;
@@ -2652,11 +2676,16 @@ bool MSILWriter::lowerLibmIntrinsic(CallInst *CI) {
   if (!ArgTy->isFloatTy() && !ArgTy->isDoubleTy())
     return false;
   const char *Name = ArgTy->isFloatTy() ? F32 : F64;
+  // The C symbol takes the intrinsic's own operands, which is one argument
+  // for the unary functions and two for pow.
+  SmallVector<Type *, 2> ParamTys;
+  for (Value *A : CI->args())
+    ParamTys.push_back(A->getType());
   Module *M = CI->getModule();
   FunctionCallee FC = M->getOrInsertFunction(
-      Name, FunctionType::get(RetTy, ArgTy, false));
+      Name, FunctionType::get(RetTy, ParamTys, false));
   IRBuilder<> B(CI);
-  Value *New = B.CreateCall(FC, CI->getArgOperand(0));
+  Value *New = B.CreateCall(FC, SmallVector<Value *, 2>(CI->args()));
   CI->replaceAllUsesWith(New);
   CI->eraseFromParent();
   return true;
@@ -2704,35 +2733,26 @@ bool MSILWriter::lowerExpandedIntrinsic(CallInst *CI) {
     return true;
   }
   case Intrinsic::powi: {
-    // An integer exponent, so square-and-multiply. The loop walks the low
-    // Bits-1 bits, which is the magnitude for both signs; the sign bit is
-    // consumed by the reciprocal instead of the loop.
+    // Math.Pow takes a double exponent, so an integer one becomes a convert
+    // and one call. Unlike a square-and-multiply loop this keeps the libm
+    // accuracy the intrinsic promises.
     Value *Base = CI->getArgOperand(0);
     Value *Exp = CI->getArgOperand(1);
     auto *ITy = dyn_cast<IntegerType>(Exp->getType());
     if (!ITy)
       return false;
-    unsigned Bits = ITy->getBitWidth();
-    Value *One = ConstantFP::get(Ty, 1.0);
-    Value *Result = One;
-    Value *B2 = Base;
-    for (unsigned I = 0; I + 1 < Bits; ++I) {
-      Value *Bit = B.CreateICmpNE(
-          B.CreateAnd(B.CreateLShr(Exp, I), ConstantInt::get(ITy, 1)),
-          ConstantInt::get(ITy, 0));
-      Result = B.CreateSelect(Bit, B.CreateFMul(Result, B2), Result);
-      B2 = B.CreateFMul(B2, B2);
-    }
-    Value *Neg = B.CreateICmpSLT(Exp, ConstantInt::get(ITy, 0));
+    const char *Name = Ty->isFloatTy() ? "powf" : "pow";
+    FunctionCallee FC = CI->getModule()->getOrInsertFunction(
+        Name, FunctionType::get(Ty, {Ty, Ty}, false));
     CI->replaceAllUsesWith(
-        B.CreateSelect(Neg, B.CreateFDiv(One, Result), Result));
+        B.CreateCall(FC, {Base, B.CreateSIToFP(Exp, Ty)}));
     CI->eraseFromParent();
     return true;
   }
   case Intrinsic::ldexp: {
-    // x * 2^n; the second operand is already the int the ABI wants.
+    // x * 2^n is Math.ScaleB, which has exactly that definition.
     Value *X = CI->getArgOperand(0), *E = CI->getArgOperand(1);
-    const char *Name = Ty->isFloatTy() ? "ldexpf" : "ldexp";
+    const char *Name = Ty->isFloatTy() ? "scalbnf" : "scalbn";
     FunctionCallee FC = CI->getModule()->getOrInsertFunction(
         Name, FunctionType::get(Ty, {Ty, E->getType()}, false));
     CI->replaceAllUsesWith(B.CreateCall(FC, {X, E}));
@@ -2974,8 +2994,10 @@ void MSILWriter::lowerIntrinsics(Function &F) {
         case Intrinsic::sqrt:
       case Intrinsic::sin:
       case Intrinsic::cos:
+      case Intrinsic::tan:
       case Intrinsic::exp:
       case Intrinsic::exp2:
+      case Intrinsic::exp10:
       case Intrinsic::log:
       case Intrinsic::log2:
       case Intrinsic::log10:
@@ -2991,11 +3013,16 @@ void MSILWriter::lowerIntrinsics(Function &F) {
       case Intrinsic::round:
       case Intrinsic::roundeven:
       case Intrinsic::rint:
-      case Intrinsic::nearbyint: {
-        // IntrinsicLowering resolves these to one libm call, which cannot
-        // carry a vector, and it only knows the C89 spellings in msvcrt;
-        // the C99 ones get their own table. A vector lowers one scalar call
-        // per lane either way.
+      case Intrinsic::nearbyint:
+      case Intrinsic::pow:
+      case Intrinsic::copysign:
+      case Intrinsic::lround:
+      case Intrinsic::llround:
+      case Intrinsic::lrint:
+      case Intrinsic::llrint: {
+        // One C symbol per intrinsic, so the CRT-or-Math choice happens in
+        // exactly one place (getManagedTarget). A vector lowers to one scalar
+        // call per lane of the same intrinsic.
         auto *VTy = dyn_cast<VectorType>(CI->getType());
         if (!VTy) {
           if (!lowerLibmIntrinsic(CI))
@@ -3653,7 +3680,13 @@ bool MSILWriter::getManagedTarget(const Function *F, ManagedType &Out) const {
   // so it keeps its pinvoke thunk.
   if (F->getFunctionType()->isVarArg())
     return false;
-  StringRef Name = getCName(F);
+  // Held by value: getCName returns a temporary, and a StringRef over it
+  // would dangle before the first use below.
+  std::string Name = getCName(F);
+  // Math/MathF first: these are platform ABI, so they must win over a
+  // -msil-libc the user supplied, which is about malloc and friends.
+  if (MathBind && getMathTarget(Name, F->getReturnType(), Out))
+    return true;
   // The allocator hook wins: it exists precisely to intercept these calls.
   if (!AllocType.Type.empty() &&
       (Name == "malloc" || Name == "free" || Name == "calloc" ||
@@ -3668,6 +3701,60 @@ bool MSILWriter::getManagedTarget(const Function *F, ManagedType &Out) const {
   if (EmitLibc && !isBuiltinSymbol(Name))
     return false;
   Out = LibcType;
+  return true;
+}
+
+// The C libm names that have a System.Math/MathF equivalent with identical
+// semantics. Everything else keeps its CRT pinvoke: `exp2` and `exp10` have no
+// managed counterpart at all, and fmin/fmax deliberately do not because
+// Math.Min/Max propagate NaN where the C functions return the other operand.
+bool MSILWriter::getMathTarget(StringRef Symbol, Type *Ty,
+                               ManagedType &Out) const {
+  bool IsF32 = Ty->isFloatTy();
+  if (!IsF32 && !Ty->isDoubleTy())
+    return false;
+
+  // C name -> Math/MathF member. Where the C name is already the managed one,
+  // the member is left empty and getCName's own name is used.
+  static const StringMap<const char *> Members = {
+      {"sqrt", "Sqrt"},   {"fabs", "Abs"},     {"floor", "Floor"},
+      {"ceil", "Ceiling"}, {"trunc", "Truncate"}, {"round", "Round"},
+      {"sin", "Sin"},     {"cos", "Cos"},      {"tan", "Tan"},
+      {"asin", "Asin"},   {"acos", "Acos"},    {"atan", "Atan"},
+      {"sinh", "Sinh"},   {"cosh", "Cosh"},    {"tanh", "Tanh"},
+      {"exp", "Exp"},     {"log", "Log"},      {"log2", "Log2"},
+      {"log10", "Log10"}, {"pow", "Pow"},      {"copysign", "CopySign"},
+      {"scalbn", "ScaleB"},
+      // rint, nearbyint and roundeven all round to even under the default
+      // rounding mode, which is Math.Round with no MidpointRounding argument.
+      // (fabs is not here: the intrinsic lowering already clears the sign bit,
+      // which is exact and cheaper than a call.)
+      {"rint", "Round"}, {"nearbyint", "Round"}, {"roundeven", "Round"},
+  };
+  // The C names carry an `f` suffix on the float spelling.
+  StringRef Base = Symbol;
+  if (IsF32 && Base.ends_with("f") && Base != "fabs" && !Members.count(Base))
+    Base = Base.drop_back();
+
+  auto It = Members.find(Base);
+  if (It == Members.end()) {
+    // lrint/llrint/lround/llround are the integer-returning roundings; the
+    // managed Round returns the float, so those keep their pinvoke.
+    if (Base == "fmin" || Base == "fmax")
+      return false;
+    return false;
+  }
+
+  std::string Member = It->second;
+  Out.Assembly = "System.Runtime";
+  Out.Type = IsF32 ? "System.MathF" : "System.Math";
+  Out.Member = Member;
+  Out.ExtraArg.clear();
+  // Math.Round is banker's rounding, which is C's round() only for roundeven;
+  // C's round() rounds half away from zero, i.e. MidpointRounding.AwayFromZero.
+  // `roundeven` maps to Round by default, so only `round` takes the argument.
+  if (Base == "round")
+    Out.ExtraArg = "\tldc.i4.1\n";
   return true;
 }
 
@@ -3686,15 +3773,30 @@ void MSILWriter::printManagedForwarder(const Function *F, const ManagedType &T,
       Params += ", ";
     Params += getTypeName(FTy->getParamType(I));
   }
+  // A member whose signature is wider than the C function's takes the extra
+  // argument as a literal before the forwarded ones.
+  if (!T.ExtraArg.empty()) {
+    std::string Base = std::string(", ")
+        + (T.Type == "System.MathF" ? "valuetype " : "valuetype ")
+        + "[System.Runtime]System.MidpointRounding";
+    if (Params.empty())
+      Params = Base.substr(2);
+    else
+      Params += Base;
+  }
   out() << ".method public static hidebysig "
       << getCallSignature(FTy, nullptr, "'" + Name.str() + "'")
       << " cil managed\n{\n";
-  out() << "\t.maxstack\t" << std::max<unsigned>(1, FTy->getNumParams())
+  out() << "\t.maxstack\t" << std::max<unsigned>(1, FTy->getNumParams() + 1)
       << "\n";
   for (unsigned I = 0, E = FTy->getNumParams(); I != E; ++I)
     out() << "\tldarg\t" << I << '\n';
+  out() << T.ExtraArg;
+  // By value: the ternary would otherwise yield a temporary std::string and
+  // the StringRef would point into it after it dies.
+  std::string Member = T.Member.empty() ? getCName(F) : T.Member;
   out() << "\tcall\t" << getTypeName(FTy->getReturnType()) << ' '
-      << getManagedName(T, getCName(F)) << '(' << Params << ")\n";
+      << getManagedName(T, Member) << '(' << Params << ")\n";
   out() << "\tret\n}\n";
 }
 
@@ -4231,18 +4333,20 @@ void MSILWriter::printBuiltinLibc() {
 }
 
 StringRef MSILWriter::getLibraryFor(StringRef Symbol) {
-  // The C runtime is split: the classic msvcrt.dll forwards printf & friends,
-  // while the UCRT-internal entry points clang emits (__acrt_*, __stdio_*),
-  // the C99 math functions (rint, sinh, llrint, fmin, ...) and everything
-  // lround-shaped are only exported from ucrtbase.dll.
+  // The C runtime is split: msvcrt.dll has the C89 functions, and every C99
+  // addition is only exported from ucrtbase.dll. This list is checked against
+  // the real export tables rather than guessed — `ldexp`, `sinh` and `atan`
+  // are C89 and live in msvcrt, while `trunc`, `round`, `exp2`, `log2` and
+  // `scalbn` are C99 and do not.
   // shortcut: name-based split, not an import-library driven map.
   static const StringSet<> Ucrt = {
-      "rint",    "rintf",    "nearbyint", "nearbyintf", "sinh",   "sinhf",
-      "cosh",    "coshf",    "tanh",      "tanhf",      "asin",   "asinf",
-      "acos",    "acosf",    "atan",      "atanf",      "lround", "lroundf",
-      "llround", "llroundf", "lrint",     "lrintf",     "llrint", "llrintf",
-      "ldexp",   "ldexpf",   "fmin",      "fminf",      "fmax",   "fmaxf",
-      "exp10",   "exp10f",   "roundeven", "roundevenf"};
+      "rint",     "rintf",     "nearbyint", "nearbyintf",
+      "lround",   "lroundf",   "llround",   "llroundf",
+      "lrint",    "lrintf",    "llrint",    "llrintf",
+      "trunc",    "truncf",    "round",     "roundf",
+      "exp2",     "exp2f",     "log2",      "log2f",
+      "scalbn",   "scalbnf",   "copysign",  "copysignf",
+      "fmin",     "fminf",     "fmax",      "fmaxf"};
   if (Symbol.starts_with("__acrt_") || Symbol.starts_with("__stdio_") ||
       Symbol.starts_with("_except") || Symbol.starts_with("__crt") ||
       Ucrt.count(Symbol))
@@ -4292,6 +4396,8 @@ void MSILWriter::printExternals() {
   auto EmitExternal = [&](const Function &F, StringRef Name) {
     ManagedType T;
     if (getManagedTarget(&F, T)) {
+      if (T.Assembly == "System.Runtime")
+        UsesMath = true;
       printManagedForwarder(&F, T, Name);
       return;
     }
@@ -4631,11 +4737,23 @@ bool MSILWriter::runOnModule(Module &M) {
 
   collectTypes();
 
+  // The assembly table has to be written before any body, so a Math binding
+  // has to be discovered here rather than when its forwarder is emitted
+  // below. Lowering has already created every libm declaration by this point.
+  if (MathBind)
+    for (Function &F : M) {
+      ManagedType Probe;
+      if (F.isDeclaration() && !F.isIntrinsic() &&
+          getManagedTarget(&F, Probe) && Probe.Assembly == "System.Runtime") {
+        UsesMath = true;
+        break;
+      }
+    }
+
   out() << ".assembly extern mscorlib {}\n";
-  // Int128/UInt128 live in System.Runtime, and a framework reference only
-  // resolves with the real identity (see NOTES-platform.md). Only assemblies
-  // that use them need the reference at all.
-  if (NeedsSystemRuntime)
+  // Int128/UInt128 and System.Math/MathF both live in System.Runtime, and a
+  // framework reference only resolves with the real identity.
+  if (NeedsSystemRuntime || UsesMath)
     out() << ".assembly extern System.Runtime { .ver 9:0:0:0\n"
              "  .publickeytoken = (B0 3F 5F 7F 11 D5 0A 3A ) }\n";
   // A user-supplied runtime is a separate assembly, so it needs a reference.

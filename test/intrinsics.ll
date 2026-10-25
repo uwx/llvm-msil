@@ -5,23 +5,35 @@
 ; classification intrinsics. Each has to become a call or an expansion rather
 ; than the fatal "Code generator does not support intrinsic function".
 
+; The externals are all emitted before any body, so every check that names one
+; has to come before the first check that names a function body.
+; ldexp is x * 2^n, which is exactly Math.ScaleB.
+; CHECK-DAG: System.Math::ScaleB(float64, int32)
+; rint and both Round spellings: C rounds half to even, except round() which
+; rounds half away from zero and so needs the MidpointRounding argument.
+; CHECK-DAG: System.Math::Round(float64)
+; CHECK-DAG: System.Math::Round(float64, valuetype [System.Runtime]System.MidpointRounding)
+; CHECK-DAG: System.MathF::Round(float32, valuetype [System.Runtime]System.MidpointRounding)
+
 declare double @llvm.rint.f64(double)
 declare float @llvm.rint.f32(float)
+declare double @llvm.round.f64(double)
+declare float @llvm.round.f32(float)
 declare double @llvm.sinh.f64(double)
 declare double @llvm.tanh.f64(double)
 declare double @llvm.atan.f64(double)
 declare i64 @llvm.llrint.f64(double)
 declare double @llvm.exp10.f64(double)
 
-; These live in ucrtbase.dll, not msvcrt.dll; the C99 spelling is not exported
-; from the classic CRT at all.
-; CHECK-DAG: pinvokeimpl("ucrtbase.dll" as "rint" cdecl)
-; CHECK-DAG: pinvokeimpl("ucrtbase.dll" as "rintf" cdecl)
-; CHECK-DAG: pinvokeimpl("ucrtbase.dll" as "sinh" cdecl)
-; CHECK-DAG: pinvokeimpl("ucrtbase.dll" as "tanh" cdecl)
-; CHECK-DAG: pinvokeimpl("ucrtbase.dll" as "atan" cdecl)
-; CHECK-DAG: pinvokeimpl("ucrtbase.dll" as "llrint" cdecl)
-; CHECK-DAG: pinvokeimpl("ucrtbase.dll" as "exp10" cdecl)
+; Math/MathF covers these, so none of them reaches the CRT. `exp10` has no
+; managed equivalent and is in neither export table, so it keeps its pinvoke.
+; CHECK-DAG: pinvokeimpl({{.*}} as "exp10" cdecl)
+; CHECK-DAG: System.Math::Sinh(float64)
+; CHECK-DAG: System.Math::Tanh(float64)
+; CHECK-DAG: System.Math::Atan(float64)
+; CHECK-NOT: as "sinh" cdecl
+; CHECK-NOT: as "tanh" cdecl
+; CHECK-NOT: as "atan" cdecl
 define double @libm(double %x) {
   %a = call double @llvm.rint.f64(double %x)
   %b = call double @llvm.sinh.f64(double %a)
@@ -38,6 +50,18 @@ define i64 @libm_i64(double %x) {
 
 define float @libm_f32(float %x) {
   %r = call float @llvm.rint.f32(float %x)
+  ret float %r
+}
+
+; round() is the one that differs: C rounds half away from zero, so the
+; forwarder passes MidpointRounding.AwayFromZero (checked with the other
+; externals at the top of this file).
+define double @libm_round(double %x) {
+  %r = call double @llvm.round.f64(double %x)
+  ret double %r
+}
+define float @libm_roundf(float %x) {
+  %r = call float @llvm.round.f32(float %x)
   ret float %r
 }
 
@@ -81,19 +105,16 @@ declare i32 @llvm.fptosi.sat.i32.f64(double)
 declare i32 @llvm.scmp.i32.i32(i32, i32)
 declare i32 @llvm.ptrmask.p0.i64(ptr, i64)
 
-; powi is square-and-multiply plus a reciprocal for a negative exponent.
+; powi converts the exponent and calls pow, rather than looping: Math.Pow
+; keeps the libm accuracy the intrinsic promises.
 ; CHECK-LABEL: 'powi'
-; CHECK: mul
-; CHECK: div
-; CHECK: select
+; CHECK: conv.r8
+; CHECK: call {{.*}}'pow'
 define double @powi(double %b, i32 %e) {
   %r = call double @llvm.powi.f64.i32(double %b, i32 %e)
   ret double %r
 }
 
-; ldexp is the libm call, which takes an int exponent like the intrinsic.
-; CHECK-LABEL: 'ldexp'
-; CHECK: call {{.*}}'ldexp'
 define double @ldexp(double %x, i32 %e) {
   %r = call double @llvm.ldexp.f64.i32(double %x, i32 %e)
   ret double %r

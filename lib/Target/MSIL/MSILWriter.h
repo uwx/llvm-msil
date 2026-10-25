@@ -215,6 +215,13 @@ private:
   struct ManagedType {
     std::string Assembly;
     std::string Type;
+    /// Overrides the member name for this one function; empty uses the C
+    /// symbol's own name. The libm bindings need it because the C name and
+    /// the `System.Math` name disagree (`llrint` vs a rounding call).
+    std::string Member;
+    /// IL to push an extra argument before the forwarded ones, for members
+    /// whose signature is wider than the C function's.
+    std::string ExtraArg;
   };
 
   /// Read the two options into LibcType/AllocType; reports a malformed one.
@@ -225,6 +232,10 @@ private:
 
   /// `[assembly]Type::Member`, or `Type::Member` for this module.
   std::string getManagedName(const ManagedType &T, StringRef Member) const;
+
+  /// `System.Math`/`System.MathF` binding for a C libm symbol, when the C99
+  /// spelling has a managed equivalent with identical semantics.
+  bool getMathTarget(StringRef Symbol, Type *Ty, ManagedType &Out) const;
 
   /// An IL method with the C symbol's signature and name \p Name, calling the
   /// managed method \p T provides for it.
@@ -304,6 +315,9 @@ private:
   ManagedType AllocType;
   /// Emit the built-in libc's own IL, rather than referring to a user's.
   bool EmitLibc = false;
+
+  /// A Math/MathF forwarder was emitted, so System.Runtime is referenced.
+  bool UsesMath = false;
 
   /// Set once a 128-bit integer reaches the output; decides whether the
   /// System.Runtime reference is emitted.
