@@ -137,6 +137,14 @@ private:
   void printAggregateLaneAddr(const std::string &Base, Type *EltTy,
                               uint64_t Off);
 
+  /// Rewrite intrinsics that IntrinsicLowering does not know into a call to
+  /// the libm function that implements them. Returns true if \p CI was one.
+  bool lowerLibmIntrinsic(CallInst *CI);
+
+  /// Rewrite an intrinsic that has no runtime support into IR that computes
+  /// the same value. Returns true if \p CI was one.
+  bool lowerExpandedIntrinsic(CallInst *CI);
+
   //===------------------------------------------------------------------===//
   // Instructions.
   //===------------------------------------------------------------------===//

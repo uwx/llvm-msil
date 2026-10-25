@@ -549,11 +549,20 @@ void MSILWriter::printConstLoad(const Constant *C) {
   if (const auto *FP = dyn_cast<ConstantFP>(C)) {
     const APFloat &V = FP->getValueAPF();
     SmallString<40> Str;
-    if (V.isNaN())
-      Str = "0.0/0.0";
-    else if (V.isInfinity())
-      Str = V.isNegative() ? "-1.0/0.0" : "1.0/0.0";
-    else {
+    // A NaN or an infinity has no decimal literal ilasm accepts, and its
+    // hex form is silently read as zero; the bit-pattern form is the only one
+    // that round-trips.
+    if (V.isNaN() || V.isInfinity()) {
+      const APInt Bits = V.bitcastToAPInt();
+      Str = "(";
+      for (unsigned I = 0; I < Bits.getBitWidth(); I += 8) {
+        if (I)
+          Str.push_back(' ');
+        raw_svector_ostream(Str) << format_hex_no_prefix(
+            Bits.extractBitsAsZExtValue(8, I), 2);
+      }
+      Str.push_back(')');
+    } else {
       V.toString(Str, 0, 0);
       // ilasm needs a '.' or exponent to lex the literal as floating point.
       if (Str.find_first_of(".eE") == StringRef::npos)
@@ -2613,6 +2622,314 @@ void MSILWriter::printFunctions() {
 // Intrinsic lowering
 //===----------------------------------------------------------------------===//
 
+// IntrinsicLowering only knows a handful of libm functions, and the ones it
+// does know are the C89 spellings in msvcrt.dll. Everything else here is a C99
+// name that only ucrtbase.dll exports, which is why the bound library comes
+// from getLibraryFor and not from the intrinsic lowering.
+bool MSILWriter::lowerLibmIntrinsic(CallInst *CI) {
+  // float spelling, double spelling
+  const char *F32 = nullptr, *F64 = nullptr;
+  switch (CI->getCalledFunction()->getIntrinsicID()) {
+  case Intrinsic::rint:      F32 = "rintf";      F64 = "rint";      break;
+  case Intrinsic::nearbyint: F32 = "nearbyintf"; F64 = "nearbyint"; break;
+  case Intrinsic::exp10:     F32 = "exp10f";     F64 = "exp10";     break;
+  case Intrinsic::sinh:      F32 = "sinhf";      F64 = "sinh";      break;
+  case Intrinsic::cosh:      F32 = "coshf";      F64 = "cosh";      break;
+  case Intrinsic::tanh:      F32 = "tanhf";      F64 = "tanh";      break;
+  case Intrinsic::asin:      F32 = "asinf";      F64 = "asin";      break;
+  case Intrinsic::acos:      F32 = "acosf";      F64 = "acos";      break;
+  case Intrinsic::atan:      F32 = "atanf";      F64 = "atan";      break;
+  case Intrinsic::lround:    F32 = "lroundf";    F64 = "lround";    break;
+  case Intrinsic::llround:   F32 = "llroundf";   F64 = "llround";   break;
+  case Intrinsic::lrint:     F32 = "lrintf";     F64 = "lrint";     break;
+  case Intrinsic::llrint:    F32 = "llrintf";    F64 = "llrint";    break;
+  default:
+    return false;
+  }
+  Type *RetTy = CI->getType();
+  Type *ArgTy = CI->getArgOperand(0)->getType();
+  if (!ArgTy->isFloatTy() && !ArgTy->isDoubleTy())
+    return false;
+  const char *Name = ArgTy->isFloatTy() ? F32 : F64;
+  Module *M = CI->getModule();
+  FunctionCallee FC = M->getOrInsertFunction(
+      Name, FunctionType::get(RetTy, ArgTy, false));
+  IRBuilder<> B(CI);
+  Value *New = B.CreateCall(FC, CI->getArgOperand(0));
+  CI->replaceAllUsesWith(New);
+  CI->eraseFromParent();
+  return true;
+}
+
+bool MSILWriter::lowerExpandedIntrinsic(CallInst *CI) {
+  Intrinsic::ID ID = CI->getCalledFunction()->getIntrinsicID();
+  IRBuilder<> B(CI);
+  Type *Ty = CI->getType();
+  switch (ID) {
+  case Intrinsic::minnum:
+  case Intrinsic::maxnum:
+  case Intrinsic::minimum:
+  case Intrinsic::maximum:
+  case Intrinsic::minimumnum:
+  case Intrinsic::maximumnum: {
+    // The IEEE 754 min/max family. fmin/fmax have exactly the semantics of
+    // `num` (return the non-NaN operand, NaN only if both are NaN) and they
+    // already order -0.0 below +0.0, which is what the langref asks for, so
+    // the two num forms are the libm call outright.
+    Value *A = CI->getArgOperand(0), *C = CI->getArgOperand(1);
+    bool IsMin = ID == Intrinsic::minnum || ID == Intrinsic::minimum ||
+                 ID == Intrinsic::minimumnum;
+    if (ID == Intrinsic::minnum || ID == Intrinsic::maxnum) {
+      const char *Name = Ty->isFloatTy() ? (IsMin ? "fminf" : "fmaxf")
+                                         : (IsMin ? "fmin" : "fmax");
+      FunctionCallee FC = CI->getModule()->getOrInsertFunction(
+          Name, FunctionType::get(Ty, {Ty, Ty}, false));
+      CI->replaceAllUsesWith(B.CreateCall(FC, {A, C}));
+      CI->eraseFromParent();
+      return true;
+    }
+    // minimum/maximum propagate a NaN operand and minimumnum/maximumnum
+    // return the non-NaN one; both order -0.0 below +0.0. The ordered
+    // compare selects the right operand except when it is the NaN, and the
+    // unordered test picks the other operand in that case. For the
+    // propagating pair that other operand is still a NaN, so the same code
+    // works for both.
+    Value *Cmp = IsMin ? B.CreateFCmpOLT(A, C) : B.CreateFCmpOGT(A, C);
+    Value *Pick = B.CreateSelect(Cmp, A, C);
+    Value *Other = B.CreateSelect(Cmp, C, A);
+    CI->replaceAllUsesWith(
+        B.CreateSelect(B.CreateFCmpUNO(Pick, Pick), Other, Pick));
+    CI->eraseFromParent();
+    return true;
+  }
+  case Intrinsic::powi: {
+    // An integer exponent, so square-and-multiply. The loop walks the low
+    // Bits-1 bits, which is the magnitude for both signs; the sign bit is
+    // consumed by the reciprocal instead of the loop.
+    Value *Base = CI->getArgOperand(0);
+    Value *Exp = CI->getArgOperand(1);
+    auto *ITy = dyn_cast<IntegerType>(Exp->getType());
+    if (!ITy)
+      return false;
+    unsigned Bits = ITy->getBitWidth();
+    Value *One = ConstantFP::get(Ty, 1.0);
+    Value *Result = One;
+    Value *B2 = Base;
+    for (unsigned I = 0; I + 1 < Bits; ++I) {
+      Value *Bit = B.CreateICmpNE(
+          B.CreateAnd(B.CreateLShr(Exp, I), ConstantInt::get(ITy, 1)),
+          ConstantInt::get(ITy, 0));
+      Result = B.CreateSelect(Bit, B.CreateFMul(Result, B2), Result);
+      B2 = B.CreateFMul(B2, B2);
+    }
+    Value *Neg = B.CreateICmpSLT(Exp, ConstantInt::get(ITy, 0));
+    CI->replaceAllUsesWith(
+        B.CreateSelect(Neg, B.CreateFDiv(One, Result), Result));
+    CI->eraseFromParent();
+    return true;
+  }
+  case Intrinsic::ldexp: {
+    // x * 2^n; the second operand is already the int the ABI wants.
+    Value *X = CI->getArgOperand(0), *E = CI->getArgOperand(1);
+    const char *Name = Ty->isFloatTy() ? "ldexpf" : "ldexp";
+    FunctionCallee FC = CI->getModule()->getOrInsertFunction(
+        Name, FunctionType::get(Ty, {Ty, E->getType()}, false));
+    CI->replaceAllUsesWith(B.CreateCall(FC, {X, E}));
+    CI->eraseFromParent();
+    return true;
+  }
+  case Intrinsic::fptosi_sat:
+  case Intrinsic::fptoui_sat: {
+    // Convert, then clamp to the target's range: the compare has to happen in
+    // floating point, since converting an out-of-range value is poison.
+    Value *X = CI->getArgOperand(0);
+    bool Signed = ID == Intrinsic::fptosi_sat;
+    auto *DstITy = cast<IntegerType>(Ty);
+    unsigned N = DstITy->getBitWidth();
+    APInt Lo = Signed ? APInt::getSignedMinValue(N) : APInt::getMinValue(N);
+    APInt Hi = Signed ? APInt::getSignedMaxValue(N) : APInt::getMaxValue(N);
+    Value *FLo = ConstantFP::get(X->getType(), Signed ? (double)Lo.getSExtValue()
+                                                     : (double)Lo.getZExtValue());
+    Value *FHi = ConstantFP::get(X->getType(), Signed ? (double)Hi.getSExtValue()
+                                                     : (double)Hi.getZExtValue());
+    Value *LoC = ConstantInt::get(Ty, Lo);
+    Value *HiC = ConstantInt::get(Ty, Hi);
+    // The convert is poison below Lo and above Hi, so guard it with the
+    // clamped range: -inf maps to Lo, +inf to Hi.
+    Value *Below = Signed ? B.CreateFCmpOLE(X, FLo) : B.CreateFCmpOLE(X, FLo);
+    Value *Above = B.CreateFCmpOGE(X, FHi);
+    Value *Clamped = B.CreateSelect(
+        Below, FLo, B.CreateSelect(Above, FHi, X));
+    Value *Conv = Signed ? B.CreateFPToSI(Clamped, Ty)
+                         : B.CreateFPToUI(Clamped, Ty);
+    // The end points have to be exact, not the clamped float: Lo is
+    // representable but Hi may round up, so select them directly.
+    CI->replaceAllUsesWith(B.CreateSelect(
+        Below, LoC, B.CreateSelect(Above, HiC, Conv)));
+    CI->eraseFromParent();
+    return true;
+  }
+  case Intrinsic::scmp:
+  case Intrinsic::ucmp: {
+    // Return -1, 0 or 1 as the sign of the comparison result.
+    Value *A = CI->getArgOperand(0), *C = CI->getArgOperand(1);
+    bool Signed = ID == Intrinsic::scmp;
+    Value *Lt = Signed ? B.CreateICmpSLT(A, C) : B.CreateICmpULT(A, C);
+    Value *Gt = Signed ? B.CreateICmpSGT(A, C) : B.CreateICmpUGT(A, C);
+    CI->replaceAllUsesWith(B.CreateSelect(
+        Lt, ConstantInt::get(Ty, -1),
+        B.CreateSelect(Gt, ConstantInt::get(Ty, 1), ConstantInt::get(Ty, 0))));
+    CI->eraseFromParent();
+    return true;
+  }
+  case Intrinsic::smul_fix:
+  case Intrinsic::umul_fix:
+  case Intrinsic::smul_fix_sat:
+  case Intrinsic::umul_fix_sat: {
+    // Fixed-point multiply: the product is scaled back down by 2^Scale, which
+    // is a right shift of the wide result. The saturating forms clamp; the
+    // plain forms truncate the same way a native multiply would.
+    Value *A = CI->getArgOperand(0), *C = CI->getArgOperand(1);
+    auto *Scale = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+    if (!Scale)
+      return false;
+    unsigned N = cast<IntegerType>(Ty)->getBitWidth();
+    bool Signed = ID == Intrinsic::smul_fix || ID == Intrinsic::smul_fix_sat;
+    bool Saturating = ID == Intrinsic::smul_fix_sat ||
+                      ID == Intrinsic::umul_fix_sat;
+    Type *Wide = B.getIntNTy(N * 2);
+    Value *WA = Signed ? B.CreateSExt(A, Wide) : B.CreateZExt(A, Wide);
+    Value *WC = Signed ? B.CreateSExt(C, Wide) : B.CreateZExt(C, Wide);
+    Value *W = B.CreateMul(WA, WC);
+    Value *Shifted = Signed
+                         ? B.CreateAShr(W, Scale->getZExtValue())
+                         : B.CreateLShr(W, Scale->getZExtValue());
+    if (!Saturating) {
+      CI->replaceAllUsesWith(B.CreateTrunc(Shifted, Ty));
+      CI->eraseFromParent();
+      return true;
+    }
+    APInt Lo = Signed ? APInt::getSignedMinValue(N) : APInt::getMinValue(N);
+    APInt Hi = Signed ? APInt::getSignedMaxValue(N) : APInt::getMaxValue(N);
+    Value *WLo = Signed ? B.CreateSExt(ConstantInt::get(Ty, Lo), Wide)
+                        : B.CreateZExt(ConstantInt::get(Ty, Lo), Wide);
+    Value *WHi = Signed ? B.CreateSExt(ConstantInt::get(Ty, Hi), Wide)
+                        : B.CreateZExt(ConstantInt::get(Ty, Hi), Wide);
+    Value *Lt = Signed ? B.CreateICmpSLT(Shifted, WLo)
+                       : B.CreateICmpULT(Shifted, WLo);
+    Value *Gt = Signed ? B.CreateICmpSGT(Shifted, WHi)
+                       : B.CreateICmpUGT(Shifted, WHi);
+    CI->replaceAllUsesWith(B.CreateSelect(
+        Lt, ConstantInt::get(Ty, Lo),
+        B.CreateSelect(Gt, ConstantInt::get(Ty, Hi),
+                       B.CreateTrunc(Shifted, Ty))));
+    CI->eraseFromParent();
+    return true;
+  }
+  case Intrinsic::ptrmask:
+  case Intrinsic::launder_invariant_group:
+  case Intrinsic::strip_invariant_group:
+    // A pointer's bits are its address, and the invariant-group markers only
+    // exist to give the optimiser something to reason about. Masking the
+    // address integer and converting back is the ptrmask definition, and the
+    // markers are the identity.
+    if (ID == Intrinsic::ptrmask) {
+      Value *P = CI->getArgOperand(0);
+      Type *IT = B.getIntPtrTy(Mod->getDataLayout());
+      CI->replaceAllUsesWith(B.CreateIntToPtr(
+          B.CreateAnd(B.CreatePtrToInt(P, IT), CI->getArgOperand(1)),
+          P->getType()));
+    } else {
+      CI->replaceAllUsesWith(CI->getArgOperand(0));
+    }
+    CI->eraseFromParent();
+    return true;
+
+  case Intrinsic::debugtrap:
+  case Intrinsic::donothing:
+  case Intrinsic::sideeffect:
+  case Intrinsic::assume:
+  case Intrinsic::experimental_noalias_scope_decl:
+    // No observable behaviour in managed code: the debugger has no trap
+    // instruction to break on, and the rest are optimiser annotations.
+    CI->eraseFromParent();
+    return true;
+
+  case Intrinsic::objectsize: {
+    // A global's size is fixed at compile time; everything else (heap blocks,
+    // unmanaged memory) has no size query here, and -1 is the "unknown"
+    // answer the intrinsic already defines.
+    Value *P = CI->getArgOperand(0);
+    uint64_t Size = 0;
+    bool Known = false;
+    if (auto *GV = dyn_cast<GlobalVariable>(P->stripPointerCasts()))
+      if (GV->hasInitializer()) {
+        Size = Mod->getDataLayout().getTypeAllocSize(GV->getValueType());
+        Known = true;
+      }
+    CI->replaceAllUsesWith(ConstantInt::get(
+        Ty, Known ? APInt(Ty->getIntegerBitWidth(), Size) : APInt::getAllOnes(
+                                                                 Ty->getIntegerBitWidth())));
+    CI->eraseFromParent();
+    return true;
+  }
+  case Intrinsic::is_fpclass: {
+    // The class bits follow the langref: 0 snan, 1 qnan, 2 ninf, 3 nnormal,
+    // 4 nsubnormal, 5 nzero, 6 pzero, 7 psubnormal, 8 pnormal, 9 pinf.
+    // sNaN cannot be distinguished from qNaN without inspecting the
+    // mantissa, so both NaN bits answer the same test.
+    Value *X = CI->getArgOperand(0);
+    Type *FTy = X->getType();
+    APInt M = cast<ConstantInt>(CI->getArgOperand(1))->getValue();
+    auto Has = [&](unsigned Bit) { return M[Bit]; };
+    Value *False = ConstantInt::getFalse(CI->getContext());
+    Value *True = ConstantInt::getTrue(CI->getContext());
+    Value *R = False;
+    Value *Zero = ConstantFP::get(FTy, 0.0);
+    // A sign test that works for -0.0 too, where a compare would not.
+    Value *SignBit = B.CreateBitCast(
+        X, B.getIntNTy(FTy->getPrimitiveSizeInBits()));
+    Value *Negative =
+        B.CreateICmpSLT(SignBit, ConstantInt::get(SignBit->getType(), 0));
+    auto Add = [&](Value *Cond) { R = B.CreateOr(R, B.CreateAnd(Cond, True)); };
+
+    if (Has(0) || Has(1)) {
+      Add(B.CreateFCmpUNO(X, X));
+    }
+    if (Has(2) || Has(3) || Has(4) || Has(5) || Has(6) || Has(7) || Has(8) ||
+        Has(9)) {
+      // fabs first so that the magnitude tests are sign-blind. Every ordered
+      // compare against a NaN is false, so the NaN case drops out by itself.
+      Value *AbsX = B.CreateUnaryIntrinsic(Intrinsic::fabs, X);
+      Value *IsZero = B.CreateFCmpOEQ(AbsX, Zero);
+      Value *IsInf = B.CreateFCmpOEQ(AbsX, ConstantFP::getInfinity(FTy));
+      // The smallest normal is the boundary between normal and subnormal.
+      double MinNormal = FTy->isFloatTy()
+                             ? (double)std::numeric_limits<float>::min()
+                             : std::numeric_limits<double>::min();
+      Value *MinNorm = ConstantFP::get(FTy, MinNormal);
+      Value *IsSub = B.CreateFCmpOLT(AbsX, MinNorm);
+      Value *IsNormal = B.CreateAnd(B.CreateFCmpOGE(AbsX, MinNorm),
+                                    B.CreateNot(IsInf));
+      Value *NotNeg = B.CreateNot(Negative);
+      if (Has(2)) Add(B.CreateAnd(IsInf, Negative));
+      if (Has(3)) Add(B.CreateAnd(IsNormal, Negative));
+      if (Has(4)) Add(B.CreateAnd(IsSub, Negative));
+      if (Has(5)) Add(B.CreateAnd(IsZero, Negative));
+      if (Has(6)) Add(B.CreateAnd(IsZero, NotNeg));
+      if (Has(7)) Add(B.CreateAnd(IsSub, NotNeg));
+      if (Has(8)) Add(B.CreateAnd(IsNormal, NotNeg));
+      if (Has(9)) Add(B.CreateAnd(IsInf, NotNeg));
+    }
+    CI->replaceAllUsesWith(R);
+    CI->eraseFromParent();
+    return true;
+  }
+  default:
+    return false;
+  }
+}
+
 void MSILWriter::lowerIntrinsics(Function &F) {
   // A vararg function whose body merely forwards to a CRT internal (e.g. the
   // `printf` wrapper clang emits from MSVC's stdio.h) cannot work: it passes a
@@ -2661,6 +2978,12 @@ void MSILWriter::lowerIntrinsics(Function &F) {
       case Intrinsic::log:
       case Intrinsic::log2:
       case Intrinsic::log10:
+      case Intrinsic::sinh:
+      case Intrinsic::cosh:
+      case Intrinsic::tanh:
+      case Intrinsic::asin:
+      case Intrinsic::acos:
+      case Intrinsic::atan:
       case Intrinsic::floor:
       case Intrinsic::ceil:
       case Intrinsic::trunc:
@@ -2669,10 +2992,13 @@ void MSILWriter::lowerIntrinsics(Function &F) {
       case Intrinsic::rint:
       case Intrinsic::nearbyint: {
         // IntrinsicLowering resolves these to one libm call, which cannot
-        // carry a vector; emit one scalar call per lane instead.
+        // carry a vector, and it only knows the C89 spellings in msvcrt;
+        // the C99 ones get their own table. A vector lowers one scalar call
+        // per lane either way.
         auto *VTy = dyn_cast<VectorType>(CI->getType());
         if (!VTy) {
-          IL->LowerIntrinsicCall(CI);
+          if (!lowerLibmIntrinsic(CI))
+            IL->LowerIntrinsicCall(CI);
           break;
         }
         IRBuilder<> B(CI);
@@ -2776,6 +3102,14 @@ void MSILWriter::lowerIntrinsics(Function &F) {
         CI->eraseFromParent();
         break;
       }
+      case Intrinsic::canonicalize: {
+        // Only the all-NaN inputs differ from a plain copy: canonicalise means
+        // "replace any NaN with the canonical quiet NaN". Every other value is
+        // returned unchanged, so the copy is the whole operation.
+        CI->replaceAllUsesWith(CI->getArgOperand(0));
+        CI->eraseFromParent();
+        break;
+      }
       case Intrinsic::threadlocal_address:
         // Thread-locals are ordinary globals here: a .NET assembly built this
         // way has one thread, and globals are already heap-indirected.
@@ -2803,7 +3137,9 @@ void MSILWriter::lowerIntrinsics(Function &F) {
       case Intrinsic::vector_reduce_umax:
       case Intrinsic::vector_reduce_umin:
       case Intrinsic::vector_reduce_fadd:
-      case Intrinsic::vector_reduce_fmul: {
+      case Intrinsic::vector_reduce_fmul:
+      case Intrinsic::vector_reduce_fmax:
+      case Intrinsic::vector_reduce_fmin: {
         IRBuilder<> B(CI);
         auto RID = Callee->getIntrinsicID();
         unsigned ArgNo =
@@ -2851,6 +3187,16 @@ void MSILWriter::lowerIntrinsics(Function &F) {
             Acc = RID == Intrinsic::vector_reduce_fadd ? B.CreateFAdd(Acc, E)
                                                        : B.CreateFMul(Acc, E);
             break;
+          case Intrinsic::vector_reduce_fmax:
+          case Intrinsic::vector_reduce_fmin: {
+            // The langref leaves the NaN and signed-zero order open, so a
+            // plain ordered compare is a faithful implementation.
+            Value *C = RID == Intrinsic::vector_reduce_fmax
+                           ? B.CreateFCmpOGT(E, Acc)
+                           : B.CreateFCmpOLT(E, Acc);
+            Acc = B.CreateSelect(C, E, Acc);
+            break;
+          }
           default:
             Acc = B.CreateAdd(Acc, E);
             break;
@@ -2892,6 +3238,25 @@ void MSILWriter::lowerIntrinsics(Function &F) {
       case Intrinsic::sadd_sat: {
         // Saturating arithmetic: compute wide, clamp to the result range.
         IRBuilder<> B(CI);
+        // A vector result has no single wide type; scalarize into per-lane
+        // calls of the scalar overload, which the fixpoint loop expands.
+        if (auto *VTy = dyn_cast<VectorType>(CI->getType())) {
+          Type *EltTy = VTy->getElementType();
+          Function *Scalar = Intrinsic::getOrInsertDeclaration(
+              Mod, Callee->getIntrinsicID(), EltTy);
+          unsigned NV = VTy->getElementCount().getFixedValue();
+          Value *Acc = PoisonValue::get(VTy);
+          for (unsigned I = 0; I < NV; ++I) {
+            Value *Lane = B.CreateCall(
+                Scalar,
+                {B.CreateExtractElement(CI->getArgOperand(0), (uint64_t)I),
+                 B.CreateExtractElement(CI->getArgOperand(1), (uint64_t)I)});
+            Acc = B.CreateInsertElement(Acc, Lane, (uint64_t)I);
+          }
+          CI->replaceAllUsesWith(Acc);
+          CI->eraseFromParent();
+          break;
+        }
         Value *A = CI->getArgOperand(0), *C = CI->getArgOperand(1);
         unsigned N = A->getType()->getIntegerBitWidth();
         Type *Wide = B.getIntNTy(N * 2);
@@ -3014,7 +3379,10 @@ void MSILWriter::lowerIntrinsics(Function &F) {
         break;
       }
       default:
-        IL->LowerIntrinsicCall(CI);
+        // The families IntrinsicLowering has never heard of are expanded
+        // here; whatever is left it either lowers or reports on.
+        if (!lowerExpandedIntrinsic(CI) && !lowerLibmIntrinsic(CI))
+          IL->LowerIntrinsicCall(CI);
         break;
       }
     }
@@ -3863,11 +4231,20 @@ void MSILWriter::printBuiltinLibc() {
 
 StringRef MSILWriter::getLibraryFor(StringRef Symbol) {
   // The C runtime is split: the classic msvcrt.dll forwards printf & friends,
-  // while the UCRT-internal entry points clang emits (__acrt_*, __stdio_*) are
-  // only exported from ucrtbase.dll.
+  // while the UCRT-internal entry points clang emits (__acrt_*, __stdio_*),
+  // the C99 math functions (rint, sinh, llrint, fmin, ...) and everything
+  // lround-shaped are only exported from ucrtbase.dll.
   // shortcut: name-based split, not an import-library driven map.
+  static const StringSet<> Ucrt = {
+      "rint",    "rintf",    "nearbyint", "nearbyintf", "sinh",   "sinhf",
+      "cosh",    "coshf",    "tanh",      "tanhf",      "asin",   "asinf",
+      "acos",    "acosf",    "atan",      "atanf",      "lround", "lroundf",
+      "llround", "llroundf", "lrint",     "lrintf",     "llrint", "llrintf",
+      "ldexp",   "ldexpf",   "fmin",      "fminf",      "fmax",   "fmaxf",
+      "exp10",   "exp10f",   "roundeven", "roundevenf"};
   if (Symbol.starts_with("__acrt_") || Symbol.starts_with("__stdio_") ||
-      Symbol.starts_with("_except") || Symbol.starts_with("__crt"))
+      Symbol.starts_with("_except") || Symbol.starts_with("__crt") ||
+      Ucrt.count(Symbol))
     return "ucrtbase.dll";
   return "msvcrt.dll";
 }
