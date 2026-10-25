@@ -59,3 +59,13 @@ taking either side.
 * `llvm-lit` resolves `%llvm-msil` by name in the LLVM tool directory, which is
   not necessarily the binary you are testing. Pass `-D llvm-msil=<binary>` (the
   gate does this) or you will test the wrong build.
+* A build directory whose `CMAKE_CXX_FLAGS_RELEASE` is empty has no `/DNDEBUG`,
+  so LLVM's `assert`s are live in *our* code too, even though the LLVM library
+  it links was built with assertions off. `assert` then aborts before the
+  `LLVM ERROR:` line and before any dialog, and a pre-existing latent assert in
+  the writer (a bad `cast<>` on some IR) looks like a regression from whatever
+  you last changed. Check `grep CMAKE_CXX_FLAGS_RELEASE build/CMakeCache.txt`
+  before believing a crash. The stock configure line above produces
+  `/O2 /Ob2 /DNDEBUG`; if the cache was made by some other means and reads
+  empty, delete `build/` and configure again. Prefer that to matching it, so
+  the gate runs the same assertions configuration the release builds use.
