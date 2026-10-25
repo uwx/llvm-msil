@@ -102,8 +102,11 @@ static cl::opt<std::string> ExternClassName(
 
 // A load or store whose address is `getelementptr inbounds %S, ptr %p, 0, N`
 // becomes ldfld/stfld on the struct class, so the member is named rather than
-// reached by adding an offset to a raw pointer.
-StructType *MSILWriter::structFieldOf(const Value *Ptr, unsigned &Field) {
+// reached by adding an offset to a raw pointer. The pointer that goes on the
+// stack is the GEP's *base*: ldfld adds the member offset itself, so handing
+// it the already-offset pointer would add the offset a second time.
+StructType *MSILWriter::structFieldOf(const Value *Ptr, unsigned &Field,
+                                      const Value *&Base) {
   const auto *GEP = dyn_cast<GEPOperator>(Ptr);
   if (!GEP || GEP->getNumOperands() != 3)
     return nullptr;
@@ -118,11 +121,7 @@ StructType *MSILWriter::structFieldOf(const Value *Ptr, unsigned &Field) {
   Field = Second->getZExtValue();
   if (Field >= STy->getNumElements())
     return nullptr;
-  // Only the first member sits at offset 0. Any other offset is added by
-  // printGepInstruction, and ldfld names the field rather than adding to the
-  // pointer, so using it for a later field would read the wrong bytes.
-  if (DL->getStructLayout(STy)->getElementOffset(Field) != 0)
-    return nullptr;
+  Base = GEP->getPointerOperand();
   return STy;
 }
 // Binding external C functions to managed code rather than the CRT. Both are
@@ -752,8 +751,9 @@ void MSILWriter::printConstantExpr(const ConstantExpr *CE) {
 
 void MSILWriter::printIndirectLoad(const Value *Ptr, Type *Ty) {
   unsigned Field = 0;
-  if (StructType *STy = structFieldOf(Ptr, Field)) {
-    printValueLoad(Ptr);
+  const Value *Base = nullptr;
+  if (StructType *STy = structFieldOf(Ptr, Field, Base)) {
+    printValueLoad(Base);
     out() << "\tldfld " << getTypeName(STy->getElementType(Field)) << " '"
           << getAggregateName(STy) << "'::'f" << Field << "'\n";
     return;
@@ -767,9 +767,10 @@ void MSILWriter::printIndirectLoad(const Value *Ptr, Type *Ty) {
 
 void MSILWriter::printIndirectSave(const Value *Ptr, const Value *Val) {
   unsigned Field = 0;
+  const Value *Base = nullptr;
   // stfld wants the address first, same as stind, so the order is unchanged.
-  if (StructType *STy = structFieldOf(Ptr, Field)) {
-    printValueLoad(Ptr);
+  if (StructType *STy = structFieldOf(Ptr, Field, Base)) {
+    printValueLoad(Base);
     printValueLoad(Val);
     out() << "\tstfld " << getTypeName(STy->getElementType(Field)) << " '"
           << getAggregateName(STy) << "'::'f" << Field << "'\n";

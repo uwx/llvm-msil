@@ -17,15 +17,23 @@
 
 @g = global %struct.P zeroinitializer
 
-; Only offset-0 members become ldfld/stfld: ldfld names the field rather than
-; adding to the pointer, so using it for a later member would read the wrong
-; bytes. Everything else keeps the pointer arithmetic.
+; Every member becomes ldfld/stfld, against the GEP's base pointer: the field
+; is named rather than reached by adding an offset to a raw pointer, and ldfld
+; supplies the offset itself.
 define i32 @access(ptr %p) {
 ; CHECK-LABEL: .method static {{.*}} 'access'
 ; CHECK: stfld int32 'struct.P'::'f0'
 ; CHECK: ldfld int32 'struct.P'::'f0'
+; CHECK: stfld float64 'struct.P'::'f1'
+; CHECK: ldfld int8 'struct.P'::'f2'
   %f0 = getelementptr inbounds %struct.P, ptr %p, i32 0, i32 0
   store i32 7, ptr %f0
-  %v = load i32, ptr %f0
-  ret i32 %v
+  %v0 = load i32, ptr %f0
+  %f1 = getelementptr inbounds %struct.P, ptr %p, i32 0, i32 1
+  store double 1.5, ptr %f1
+  %f2 = getelementptr inbounds %struct.P, ptr %p, i32 0, i32 2
+  %v2 = load i8, ptr %f2
+  %e = sext i8 %v2 to i32
+  %s = add i32 %v0, %e
+  ret i32 %s
 }
