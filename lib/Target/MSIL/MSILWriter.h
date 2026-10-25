@@ -97,7 +97,7 @@ private:
                               const Value *Right);
   void printNot();
 
-  StructType *structFieldOf(const Value *Ptr, unsigned &Field,
+  StructType *structFieldOf(const Value *Ptr, Type *AccessTy, unsigned &Field,
                             const Value *&Base);
   void printIndirectLoad(const Value *Ptr, Type *Ty);
   void printIndirectSave(const Value *Ptr, const Value *Val);

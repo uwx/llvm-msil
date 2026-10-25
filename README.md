@@ -109,6 +109,14 @@ python -I cbe_port.py \
     --lli <lli> --levels 0,1,2,3
 ```
 
+`test/programs/*.sh` build a whole third-party program through the backend and
+compare its output against a native build, at all four optimization levels.
+That is what checks the backend on real code rather than on hand-written IR:
+`doom.sh` runs PureDOOM for a fixed number of tics and hashes the framebuffer,
+and `stb.sh` exercises stb_image, stb_truetype, stb_rect_pack and stb_ds. Both
+fetch their sources at a pinned commit into `/tmp/msil-thirdparty` and cache
+them, and `run_tests.sh` runs every script in the directory.
+
 ## Known limitations
 
 * **Varargs.** Calls to external vararg functions (`printf`) work: each call
@@ -116,7 +124,8 @@ python -I cbe_port.py \
   pinvokes.
   Definitions of vararg functions that forward a `va_list` to a CRT internal
   (e.g. the `printf` wrapper MSVC's `stdio.h` produces) are dropped and bound
-  to the real export instead.
+  to the real export instead. The forward may go through another printf-family
+  wrapper first (`snprintf` reaches `vsnprintf`), so those are matched by name.
   A vararg floating-point argument crosses the boundary as its raw `int64`
   bits, because the CRT's `va_arg` reads the general-purpose shadow slot on
   Windows x64.
