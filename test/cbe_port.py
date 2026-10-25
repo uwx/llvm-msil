@@ -24,9 +24,19 @@ TEST_SUCCESS_EXIT_CODE = 6
 TEST_XFAIL_EXIT_CODE = 25
 
 
+# A backend failure can raise a Windows error dialog (report_fatal_error calls
+# abort(), and the default CRT puts up a modal box), which would otherwise
+# block this process forever. Time out instead and report it as a failure.
+RUN_TIMEOUT = int(os.environ.get("MSIL_TEST_TIMEOUT", "120"))
+
+
 def run(cmd, cwd=None):
-    p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT)
+    try:
+        p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=RUN_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return 1, ("timed out after %ds (a failure dialog is probably up; "
+                   "run `taskkill /F /IM llvm-msil.exe`)" % RUN_TIMEOUT)
     return p.returncode, p.stdout.decode("utf-8", "replace")
 
 
