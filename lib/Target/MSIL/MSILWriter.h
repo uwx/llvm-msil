@@ -94,6 +94,7 @@ private:
                               const Value *Right);
   void printNot();
 
+  StructType *structFieldOf(const Value *Ptr, unsigned &Field);
   void printIndirectLoad(const Value *Ptr, Type *Ty);
   void printIndirectSave(const Value *Ptr, const Value *Val);
   void printCastInstruction(unsigned Op, const Value *V, Type *Ty);

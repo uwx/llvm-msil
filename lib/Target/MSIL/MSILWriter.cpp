@@ -99,6 +99,32 @@ static cl::opt<std::string> ExternClassName(
                                 "<Module>, so C# can call them directly"),
     cl::value_desc("namespace.Name"), cl::init(""));
 
+// A load or store whose address is `getelementptr inbounds %S, ptr %p, 0, N`
+// becomes ldfld/stfld on the struct class, so the member is named rather than
+// reached by adding an offset to a raw pointer.
+StructType *MSILWriter::structFieldOf(const Value *Ptr, unsigned &Field) {
+  const auto *GEP = dyn_cast<GEPOperator>(Ptr);
+  if (!GEP || GEP->getNumOperands() != 3)
+    return nullptr;
+  auto *STy = dyn_cast<StructType>(GEP->getSourceElementType());
+  if (!STy || STy->isOpaque())
+    return nullptr;
+  // Indices must be [0, N]: a non-zero leading index would walk an array.
+  auto *First = dyn_cast<ConstantInt>(GEP->getOperand(1));
+  auto *Second = dyn_cast<ConstantInt>(GEP->getOperand(2));
+  if (!First || !First->isZero() || !Second)
+    return nullptr;
+  Field = Second->getZExtValue();
+  if (Field >= STy->getNumElements())
+    return nullptr;
+  // Only the first member sits at offset 0. Any other offset is added by
+  // printGepInstruction, and ldfld names the field rather than adding to the
+  // pointer, so using it for a later field would read the wrong bytes.
+  if (DL->getStructLayout(STy)->getElementOffset(Field) != 0)
+    return nullptr;
+  return STy;
+}
+
 char MSILWriter::ID = 0;
 
 MSILWriter::MSILWriter(raw_pwrite_stream &Sink)
@@ -618,6 +644,13 @@ void MSILWriter::printConstantExpr(const ConstantExpr *CE) {
 //===----------------------------------------------------------------------===//
 
 void MSILWriter::printIndirectLoad(const Value *Ptr, Type *Ty) {
+  unsigned Field = 0;
+  if (StructType *STy = structFieldOf(Ptr, Field)) {
+    printValueLoad(Ptr);
+    out() << "\tldfld " << getTypeName(STy->getElementType(Field)) << " '"
+          << getAggregateName(STy) << "'::'f" << Field << "'\n";
+    return;
+  }
   printValueLoad(Ptr);
   if (movesAsBlob(Ty))
     out() << "\tldobj\t" << getTypeName(Ty) << '\n';
@@ -626,6 +659,15 @@ void MSILWriter::printIndirectLoad(const Value *Ptr, Type *Ty) {
 }
 
 void MSILWriter::printIndirectSave(const Value *Ptr, const Value *Val) {
+  unsigned Field = 0;
+  // stfld wants the address first, same as stind, so the order is unchanged.
+  if (StructType *STy = structFieldOf(Ptr, Field)) {
+    printValueLoad(Ptr);
+    printValueLoad(Val);
+    out() << "\tstfld " << getTypeName(STy->getElementType(Field)) << " '"
+          << getAggregateName(STy) << "'::'f" << Field << "'\n";
+    return;
+  }
   printValueLoad(Ptr);
   printValueLoad(Val);
   if (movesAsBlob(Val->getType()))
@@ -2602,6 +2644,24 @@ void MSILWriter::printAggregateDeclarations() {
     if (auto *VTy = dyn_cast<VectorType>(Ty))
       S = VTy->getElementCount().getFixedValue() *
           DL->getTypeAllocSize(VTy->getElementType()).getFixedValue();
+
+    // A struct's members are declared at the offsets the LLVM data layout
+    // chose, so a field can be reached with ldfld/stfld instead of pointer
+    // arithmetic. Naming them keeps the layout in one place: the same numbers
+    // drive both the declaration and the access.
+    if (auto *STy = dyn_cast<StructType>(Ty)) {
+      if (!STy->isOpaque()) {
+        const StructLayout *SL = DL->getStructLayout(STy);
+        out() << ".class value explicit ansi sealed '" << N << "'\n{\n"
+              << "\t.pack 1\n\t.size " << S << "\n";
+        for (unsigned F = 0; F < STy->getNumElements(); ++F)
+          out() << "\t.field [" << SL->getElementOffset(F).getFixedValue()
+                << "] public " << getTypeName(STy->getElementType(F)) << " 'f"
+                << F << "'\n";
+        out() << "}\n";
+        continue;
+      }
+    }
     out() << ".class value explicit ansi sealed '" << N << "' { .pack 1 .size "
         << S << " }\n";
   }
