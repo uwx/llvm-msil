@@ -1,0 +1,69 @@
+diff --git a/include/SDL3/SDL_atomic.h b/include/SDL3/SDL_atomic.h
+index 5ef1f10..4224f2d 100644
+--- a/include/SDL3/SDL_atomic.h
++++ b/include/SDL3/SDL_atomic.h
+@@ -355,6 +355,8 @@ typedef void (*SDL_KernelMemoryBarrierFunc)();
+  */
+ #define SDL_CPUPauseInstruction() DoACPUPauseInACompilerAndArchitectureSpecificWay
+ 
++#elif defined(SDL_PLATFORM_MSIL)
++    #define SDL_CPUPauseInstruction()  /* no inline asm in CIL; a no-op is the documented fallback. */
+ #elif (defined(__GNUC__) || defined(__clang__)) && (defined(__i386__) || defined(__x86_64__)) && !defined(__arm64ec__)
+     #define SDL_CPUPauseInstruction() __asm__ __volatile__("pause\n")  /* Some assemblers can't do REP NOP, so go with PAUSE. */
+ #elif (defined(__arm__) && defined(__ARM_ARCH) && __ARM_ARCH >= 7) || defined(__aarch64__)
+diff --git a/src/cpuinfo/SDL_cpuinfo.c b/src/cpuinfo/SDL_cpuinfo.c
+index 99818d2..a6580f9 100644
+--- a/src/cpuinfo/SDL_cpuinfo.c
++++ b/src/cpuinfo/SDL_cpuinfo.c
+@@ -140,7 +140,13 @@ static int CPU_haveCPUID(void)
+ 
+ /* *INDENT-OFF* */ // clang-format off
+ #ifndef SDL_PLATFORM_EMSCRIPTEN
+-#if (defined(__GNUC__) || defined(__llvm__)) && defined(__i386__)
++#if defined(SDL_PLATFORM_MSIL)
++    /* CIL has no inline asm, so report no CPUID. CPU_calcCPUIDFeatures then
++       takes the "no features" path, which is exactly what the empty cpuid()
++       fallback below means and what a target without these instructions
++       should claim. */
++    has_CPUID = 0;
++#elif (defined(__GNUC__) || defined(__llvm__)) && defined(__i386__)
+     __asm__ (
+ "        pushfl                      # Get original EFLAGS             \n"
+ "        popl    %%eax                                                 \n"
+@@ -231,7 +237,15 @@ done:
+     return has_CPUID;
+ }
+ 
+-#if (defined(__GNUC__) || defined(__llvm__)) && defined(__i386__)
++#if defined(SDL_PLATFORM_MSIL)
++/* No inline asm in CIL. CPU_haveCPUID already answers no, so this arm is
++   unreachable; it exists only to keep the __x86_64__ asm below from being
++   selected, which would be an unsupported constant at emission time. */
++#define cpuid(func, a, b, c, d) \
++    do {                        \
++        a = b = c = d = 0;      \
++    } while (0)
++#elif (defined(__GNUC__) || defined(__llvm__)) && defined(__i386__)
+ #define cpuid(func, a, b, c, d)              \
+     __asm__ __volatile__(                    \
+         "        pushl %%ebx        \n"      \
+diff --git a/src/dynapi/SDL_dynapi.h b/src/dynapi/SDL_dynapi.h
+index 04c310c..79c3014 100644
+--- a/src/dynapi/SDL_dynapi.h
++++ b/src/dynapi/SDL_dynapi.h
+@@ -39,6 +39,15 @@
+ #error Nope, you have to edit this file to force this off.
+ #endif
+ 
++// The MSIL port is statically linked by construction: the CLR loads the whole
++// assembly and binds it before any code runs, so there is no dlopen to swap an
++// SDL underneath a program. The jump table also defeats the point here, since
++// it renames every public entry point to <name>_REAL and hands the real ones
++// out as function pointers that only exist at run time.
++#ifdef SDL_PLATFORM_MSIL
++#define SDL_DYNAMIC_API 0
++#endif
++
+ #ifdef SDL_PLATFORM_APPLE
+ #include "TargetConditionals.h"
+ #endif

@@ -3944,6 +3944,9 @@ std::string MSILWriter::getImportName(const Function *F) const {
       {"strnicmp", "_strnicmp"},   {"strndup", "_strndup"},
       {"snprintf", "_snprintf"},   {"vsnprintf", "_vsnprintf"},
       {"scprintf", "_scprintf"},   {"snscanf", "_snscanf"},
+      {"itoa", "_itoa"},           {"ltoa", "_ltoa"},
+      {"ultoa", "_ultoa"},         {"i64toa", "_i64toa"},
+      {"ui64toa", "_ui64toa"},
   };
   for (auto &R : PosixRenames)
     if (Name == R[0])
@@ -3976,17 +3979,40 @@ void MSILWriter::resolveLibExports() {
   for (const std::string &Spec : LibSpec) {
     std::string Path = Spec;
     if (!sys::fs::exists(Path)) {
-      // shortcut: the system directory only, not the full loader search order
-      // (application directory, then PATH). Widen if a program needs it.
-      ErrorOr<std::string> Found =
-          sys::findProgramByName(Spec, {sys::path::get_separator().str() +
-                                        "Windows" +
-                                        sys::path::get_separator().str() +
-                                        "System32"});
+      // A bare name is looked for the way the loader would: the application
+      // directory, then the system one. findProgramByName is for executables
+      // on Windows -- it appends `.exe` -- so a `.dll` never matches.
+      SmallString<256> ExeDir(sys::fs::getMainExecutable(nullptr, nullptr));
+      sys::path::remove_filename(ExeDir);
+      SmallString<256> SysDir;
+      if (sys::path::has_root_name(ExeDir))
+        SysDir.append(sys::path::root_name(ExeDir));
+      SysDir.append(sys::path::get_separator());
+      SysDir.append("Windows");
+      SysDir.append(sys::path::get_separator());
+      SysDir.append("System32");
+      bool Found = false;
+      for (const SmallString<256> &Dir : {ExeDir, SysDir}) {
+        SmallString<256> Candidate(Dir);
+        sys::path::append(Candidate, Spec);
+        if (sys::fs::exists(Candidate)) {
+          Path = Candidate.str().str();
+          Found = true;
+          break;
+        }
+      }
+      // A name with no directory is also worth trying on PATH, which is where
+      // a development SDK usually puts its DLLs.
+      if (!Found) {
+        ErrorOr<std::string> OnPath = sys::findProgramByName(Spec);
+        if (OnPath) {
+          Path = *OnPath;
+          Found = true;
+        }
+      }
       if (!Found)
         report_fatal_error(Twine("MSIL: -msil-lib could not find '") + Spec +
                            "'");
-      Path = *Found;
     }
     Expected<object::OwningBinary<object::Binary>> BinOrErr =
         object::createBinary(Path);
