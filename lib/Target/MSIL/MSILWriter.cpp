@@ -2607,12 +2607,16 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     std::string Tmp = newTempLocal(IV->getAggregateOperand()->getType());
     printValueLoad(IV->getAggregateOperand());
     out() << "\tstloc\t'" << Tmp << "'\n";
-    printAggregateLaneAddr(Tmp, Ty, Off);
+    // The address is the field's, but what is stored is the inserted value,
+    // whose type is the element's, not the aggregate's: `insertvalue {i64,i1}
+    // ..., i64 %x, 0` stores an i64 through the address of field 0.
+    Type *EltTy = IV->getInsertedValueOperand()->getType();
+    printAggregateLaneAddr(Tmp, EltTy, Off);
     printValueLoad(IV->getInsertedValueOperand());
-    if (movesAsBlob(Ty))
-      out() << "\tstobj\t" << getTypeName(Ty) << '\n';
+    if (movesAsBlob(EltTy))
+      out() << "\tstobj\t" << getTypeName(EltTy) << '\n';
     else
-      out() << "\tstind." << getMemSuffix(Ty) << '\n';
+      out() << "\tstind." << getMemSuffix(EltTy) << '\n';
     out() << "\tldloc\t'" << Tmp << "'\n";
     return;
   }

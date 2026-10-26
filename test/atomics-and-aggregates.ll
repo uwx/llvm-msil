@@ -154,6 +154,19 @@ define { i8, i1 } @const_pair() {
   ret { i8, i1 } { i8 42, i1 false }
 }
 
+; insertvalue stores the *inserted value*, so the store takes the element's
+; type and not the aggregate's. Emitting stobj of the struct there put an i64
+; behind a value-type store, which the JIT rejects at run time even though
+; ilasm accepts it.
+define { i64, i1 } @insert_scalar(i64 %x, i1 %c) {
+; CHECK-LABEL: .method static {{.*}} 'insert_scalar'
+; CHECK: stind.i8
+; CHECK-NOT: stobj valuetype
+  %a = insertvalue { i64, i1 } undef, i64 %x, 0
+  %b = insertvalue { i64, i1 } %a, i1 %c, 1
+  ret { i64, i1 } %b
+}
+
 ; A zero-sized global still needs a unique address, so it gets an
 ; allocation even though there is nothing to copy into it.
 @empty = internal global [0 x i64] zeroinitializer
