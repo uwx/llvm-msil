@@ -15,9 +15,8 @@
 # excluded parts.
 #
 # Configuration:
-#   SDL3_DIR    a checked-out SDL3 source tree (skipped when unset)
-#   SDL3_PATCH  the -DSDL_PLATFORM_MSIL arms, applied by the caller or here
-#               with `git apply`; see sdl3-msil.patch
+#   SDL3_DIR  a checked-out SDL3 source tree, configured once (skipped when
+#             unset). sdl3-msil.patch is applied here if the tree is clean.
 set -eu
 
 MSIL=${1:?usage: sdl3_port.sh <llvm-msil>}

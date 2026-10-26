@@ -328,6 +328,14 @@ development files: set `SDL2_DIR` to a directory with `include/SDL2` and
 `lib/SDL2.lib`, and `SDL2_BIN` to `SDL2.dll` if it is not in `lib/`. Without
 them the test reports `sdl: skipped` and the gate still passes.
 
+`sdl3_port.sh` is the other half of that: rather than calling SDL, it compiles
+SDL3's own C (210 translation units) to CIL and runs it, so it tests the
+backend against a large real codebase rather than against a demo. Set `SDL3_DIR`
+to a checked-out SDL3 tree that has been configured once — the script applies
+`sdl3-msil.patch` itself if the tree is clean — and it reports `sdl3-port:
+skipped` when unset. It takes a few minutes, so it is the slowest thing in the
+gate.
+
 `libc.sh` is the compatibility test for the portable C library: it runs
 `test/programs/libc.c` on the CLR at four optimization levels and diffs the
 output against a native build of the same file. A port is only as good as its
