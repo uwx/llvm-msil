@@ -296,6 +296,14 @@ const char *MSILWriter::HelperVis() const {
   return ExternClassName.empty() ? "private" : "assembly";
 }
 
+// One accessor per thread-local global, named after it. The accessor is
+// emitted inside the same class as the field it touches, so it is qualified
+// the same way a function is.
+std::string MSILWriter::getThreadLocalRef(const GlobalVariable *GV) const {
+  std::string Name = "'" + GV->getName().str() + "$tls'()";
+  return ExternClassName.empty() ? Name : "'" + ExternClassName + "'::" + Name;
+}
+
 // A function moved into the emitted class is no longer a global member, so a
 // reference to it from outside that class has to name the class.
 std::string MSILWriter::getFunctionRef(const Function *F) const {
@@ -572,8 +580,13 @@ std::string MSILWriter::getCallSignature(FunctionType *FTy, const CallBase *CB,
 void MSILWriter::printValueLoad(const Value *V) {
   if (const auto *GV = dyn_cast<GlobalVariable>(V)) {
     // Both external and internal globals are fields holding a pointer to the
-    // variable's storage.
-    out() << "\tldsfld\tvoid* '" << GV->getName() << "'\n";
+    // variable's storage. A thread-local global's storage is per thread, so
+    // its address comes from an accessor that also initializes this thread's
+    // copy on first use.
+    if (GV->isThreadLocal() && !GV->isDeclaration())
+      out() << "\tcall\tvoid* " << getThreadLocalRef(GV) << "\n";
+    else
+      out() << "\tldsfld\tvoid* '" << GV->getName() << "'\n";
     return;
   }
   if (const auto *F = dyn_cast<Function>(V)) {
@@ -3439,10 +3452,9 @@ void MSILWriter::lowerIntrinsics(Function &F) {
         break;
       }
       case Intrinsic::threadlocal_address:
-        // Thread-locals are ordinary globals here: a .NET assembly built this
-        // way has one thread, and globals are already heap-indirected.
-        // shortcut: no real [ThreadStatic]/TLS storage; upgrade if a program
-        // is ever run multithreaded.
+        // A thread-local global is already per-thread storage in the emitted
+        // code, so the reference itself is the address; printValueLoad turns
+        // it into the accessor call.
         CI->replaceAllUsesWith(CI->getArgOperand(0));
         CI->eraseFromParent();
         break;
@@ -5006,6 +5018,13 @@ void MSILWriter::printExternals() {
   for (GlobalVariable &G : Mod->globals()) {
     if (!G.isDeclaration())
       continue;
+    // A declared thread-local has no storage this module can name: there is
+    // no initializer to copy and no way to learn which thread's slot the
+    // definition means. Emitting the ordinary pointer static would silently
+    // alias all threads onto one address, so say so instead.
+    if (G.isThreadLocal())
+      report_fatal_error("MSIL: external thread-local '" + G.getName() +
+                         "' is not supported; define it in this module");
     out() << ".field static private void* '" << G.getName() << "'\n";
     AnyExternVar = true;
   }
@@ -5148,11 +5167,86 @@ void MSILWriter::printGlobals() {
     }
     out() << ".field static "
         << (G.hasLocalLinkage() ? std::string(HelperVis()) + " " : "public ")
-        << "void* '" << Name << "'\n\n";
+        << "void* '" << Name << "'\n";
+    // A thread-local's pointer slot is per thread, so $MSIL_Init cannot fill
+    // it once for the whole program: each thread's first access does instead
+    // (printThreadLocalAccessor). A module-level field takes the attribute;
+    // this was verified against the runtime, which gives each thread its own
+    // slot and its own default value.
+    if (G.isThreadLocal())
+      out() << ".custom instance void [mscorlib]System.ThreadStaticAttribute"
+               "::.ctor() = ( 01 00 00 00 )\n";
+    out() << '\n';
     // Zero-sized globals still get an entry so $MSIL_Init gives each its own
     // address; there is just no template to copy from.
-    Templates.push_back({&G, Empty ? "" : Name + "$tpl", Writable});
+    Templates.push_back({&G, Empty ? "" : Name + "$tpl", Writable,
+                         G.isThreadLocal()});
   }
+}
+
+void MSILWriter::printThreadLocalAccessor(const GlobalImage &Image) {
+  const GlobalVariable &G = *Image.GV;
+  uint64_t Size = DL->getTypeAllocSize(G.getValueType()).getFixedValue();
+  std::string Name = G.getName().str();
+  std::string Tpl = "valuetype '" + getAggregateName(G.getValueType()) + "' '" +
+                    Image.Template + "'";
+  // The declaration cannot name the class it is inside; call sites do.
+  out() << "\n.method static " << HelperVis() << " void* '" << Name
+        << "$tls'() cil managed\n{\n";
+  out() << "\t.maxstack\t8\n";
+  // The constant case pins the slot at the shared image and needs no scratch.
+  if (Image.Writable || !Size)
+    out() << "\t.locals init (void* 'p')\n";
+  // A [ThreadStatic] slot is only ever read or written by the thread that owns
+  // it, so two threads cannot race on one slot and this thread's first touches
+  // are sequential: no lock is needed.
+  out() << "\tldsfld\tvoid* '" << Name << "'\n";
+  out() << "\tbrfalse\tIL_tls_init\n";
+  out() << "\tldsfld\tvoid* '" << Name << "'\n\tret\n";
+  out() << "IL_tls_init:\n";
+  if (!Image.Writable && Size) {
+    // A constant global cannot be stored through on any thread, so every
+    // thread's slot points at the one read-only image. Comparing the address
+    // of the same variable across threads then still compares equal.
+    out() << "\tldsflda\t" << Tpl << "\n\tconv.u8\n";
+    out() << "\tstsfld\tvoid* '" << Name << "'\n";
+  } else {
+    // The same bytes $MSIL_Init would have produced, but for this thread.
+    out() << "\tldc.i8\t" << (Size ? Size : 1) << "\n";
+    out() << "\tcall\tvoid* " << ClassPrefix() << "'$MSIL_Alloc'(int64)\n";
+    out() << "\tstloc\t'p'\n\tldloc\t'p'\n";
+    if (Size) {
+      out() << "\tldsflda\t" << Tpl << "\n\tconv.u8\n";
+      out() << "\tldc.i4\t" << Size << "\n\tcpblk\n";
+    }
+    // Pointer-valued initializer fields are patched into each thread's copy
+    // here rather than once at startup, so a thread-local's initializer may
+    // name another thread-local and each thread gets its own address. The slot
+    // is published first: a global whose initializer names itself then finds
+    // its storage already there instead of recurring forever.
+    out() << "\tldloc\t'p'\n\tstsfld\tvoid* '" << Name << "'\n";
+    for (const DynInit &DI : DynInits) {
+      if (DI.GV != &G)
+        continue;
+      out() << "\tldloc\t'p'\n";
+      if (DI.Offset) {
+        printPtrLoad(DI.Offset);
+        out() << "\tconv.i8\n\tadd\n";
+      }
+      out() << "\tconv.u8\n";
+      if (isa<Function>(DI.Value)) {
+        out() << "\tldftn\t"
+            << getCallSignature(cast<Function>(DI.Value)->getFunctionType(),
+                                nullptr,
+                                "'" + getValueName(DI.Value) + "'")
+            << "\n";
+      } else {
+        printValueLoad(DI.Value);
+      }
+      out() << "\tstind.i\n";
+    }
+  }
+  out() << "\tldsfld\tvoid* '" << Name << "'\n\tret\n}\n";
 }
 
 void MSILWriter::printAllocHelper() {
@@ -5172,6 +5266,10 @@ void MSILWriter::printInitializer() {
         << " void '$MSIL_Init'() cil managed\n{\n";
   out() << "\t.maxstack\t8\n";
   for (auto &T : Templates) {
+    // A thread-local's slot belongs to each thread, so its accessor fills it
+    // on first use rather than this one-time startup pass.
+    if (T.ThreadLocal)
+      continue;
     const GlobalVariable &G = *T.GV;
     uint64_t Size = DL->getTypeAllocSize(G.getValueType()).getFixedValue();
     out() << "\t// " << G.getName() << "\n";
@@ -5203,6 +5301,10 @@ void MSILWriter::printInitializer() {
   }
   // Pointer fields the assembly's relocations could not express.
   for (const DynInit &DI : DynInits) {
+    // A thread-local's own pointer fields are patched by its accessor, per
+    // thread; its slot is still null here.
+    if (DI.GV->isThreadLocal())
+      continue;
     out() << "\tldsfld\tvoid* '" << DI.GV->getName() << "'\n";
     if (DI.Offset) {
       printPtrLoad(DI.Offset);
@@ -5221,6 +5323,10 @@ void MSILWriter::printInitializer() {
     out() << "\tstind.i\n";
   }
   out() << "\tret\n}\n";
+
+  for (const GlobalImage &T : Templates)
+    if (T.ThreadLocal)
+      printThreadLocalAccessor(T);
 }
 
 void MSILWriter::printModuleStartup() {

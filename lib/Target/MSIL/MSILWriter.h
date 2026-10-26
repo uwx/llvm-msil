@@ -303,6 +303,10 @@ private:
   std::string ClassPrefix() const;
   const char *HelperVis() const;
 
+  /// The call that yields a thread-local global's address for the calling
+  /// thread, initializing that thread's copy on first use.
+  std::string getThreadLocalRef(const GlobalVariable *GV) const;
+
   std::vector<std::pair<std::string, std::string>> ExtraLocals;
   DenseMap<const Value *, std::string> ArgIterators;
   unsigned NumVA = 0;
@@ -319,8 +323,16 @@ private:
     /// The template field's name; empty for a zero-sized global.
     std::string Template;
     bool Writable;
+    /// The address lives in a [ThreadStatic] slot and is filled in lazily by
+    /// `$tls` rather than once by $MSIL_Init.
+    bool ThreadLocal;
   };
   std::vector<GlobalImage> Templates;
+
+  /// The lazy per-thread initializer for a thread-local global: allocate this
+  /// thread's copy on first use and seed it with the same bytes $MSIL_Init
+  /// gives an ordinary global.
+  void printThreadLocalAccessor(const GlobalImage &Image);
 
   struct DynInit {
     const GlobalVariable *GV;

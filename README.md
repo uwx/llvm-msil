@@ -161,6 +161,23 @@ fault rather than silently corrupt the image, which is the correct behaviour.
 A zero-sized global gets no template but still gets its own allocation, since
 LLVM gives every global a distinct address.
 
+### Thread-locals
+
+A `thread_local` global keeps the template and the `void*` field, but the
+field carries `[ThreadStatic]`, so the pointer itself is per thread. There is
+no one-time initialization: `$MSIL_Init` skips the variable, and each thread's
+first reference goes through a generated `'<name>$tls'()` accessor that
+allocates that thread's copy, copies the template in, patches its pointer
+initializers, stores the slot and returns it. Reads and writes then work as
+for any other global. Nothing is locked: a slot is only ever read or written
+by the thread that owns it, so two threads cannot race on one.
+
+A `constant thread_local` needs no allocation at all: every thread's slot
+points at the one read-only image, and a store through it faults. A
+declaration-only thread-local is a fatal error rather than silently aliasing
+every thread onto one address, since the storage it names is in another
+module and this one has no way to reach a given thread's copy.
+
 ## The portable C library
 
 `-msil-libc=builtin` gives a program a real C library: `printf` and the rest of
@@ -390,7 +407,10 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   closed incrementally: the funclet/personality model has no IL equivalent,
   and typed catch needs image-relative RTTI this backend does not emit. The
   reasoning is in `NOTES-unwinding.md`.
-* **Thread-locals** are ordinary globals, so there is no `[ThreadStatic]`.
+* **Thread-locals** are per-thread and lazily initialized, as described under
+  "Globals". Two limits remain: an external (declaration-only) thread-local is
+  rejected, and a thread's copy is never freed when the thread ends, because
+  there is no thread-exit hook to run.
 * The 64-bit CLR layout is the only one. `argc`/`argv` are built from
   `Environment.GetCommandLineArgs()` and leaked for the program's lifetime.
 

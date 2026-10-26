@@ -123,3 +123,25 @@ work through the typed pointer, and it can be passed along as an argument.
 So the emitter is not what prevents typed signatures — see
 `NOTES-typed-pointers.md` for why the IR cannot supply the type.
 
+## [ThreadStatic] on a <Module> field
+
+It works, so thread-local globals need no helper class. The attribute is
+attached to an ordinary module-level field:
+
+```
+.field static assembly void* 'x'
+.custom instance void [mscorlib]System.ThreadStaticAttribute::.ctor() = ( 01 00 00 00 )
+```
+
+Verified by hand-written IL with two `System.Threading.Thread`s incrementing
+the field 100 times each: every thread saw its own slot start at zero and the
+main thread's value was untouched, including for a `void*` field. `ldsfld`,
+`stsfld` and `brfalse` on the slot behave as for any other static field, and
+accesses from a native thread the CLR did not create (a `CreateThread`
+callback) get a slot of their own too.
+
+The one thing that does *not* work is declaring an accessor method with the
+class-qualified spelling inside a class: `.method ... 'My.App'::'x$tls'()`
+is a syntax error, so the definition uses the bare name and only call sites
+name the class.
+
