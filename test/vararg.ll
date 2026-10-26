@@ -21,18 +21,22 @@ define i32 @main() {
   ret i32 %t
 }
 
-; A vararg function defined in the module that forwards to another printf
-; family entry point cannot work: it passes a va_list that only exists in the
-; native ABI. Its body is dropped so calls bind to the exported function.
+; A vararg definition whose *own name* is a C library entry cannot work when
+; it forwards to another printf family entry point: it passes a va_list that
+; only exists in the native ABI. Its body is dropped so calls bind to the
+; exported function through a pinvoke thunk.
 ; The forward can be two hops and must not depend on the intermediate being a
 ; declaration already: snprintf wraps vsnprintf, which is the definition that
 ; reaches __stdio_common_vsprintf. Matching the callee by name drops the outer
 ; wrapper even though the inner one is still a definition at that point.
-; Both wrappers lose their bodies; only the CRT leaf stays behind, as the
-; pinvoke the dropped calls would have bound to. The CHECK-NOTs reach from the
-; last `main` call to $MSIL_Startup, which is emitted after every user method.
-; CHECK-NOT: .method static {{.*}} 'my_snprintf'(
 ; CHECK-NOT: .method static {{.*}} 'snprintf'(
+;
+; A wrapper with any other name is NOT a C library entry, so dropping it would
+; leave thunks pinvoking a symbol the CRT does not export -- an exception the
+; caller's error path then re-enters. SDL's SDL_sscanf forwards to the same
+; __stdio_common_* leaf and is exactly this case, so it keeps a body and calls
+; resolve locally instead.
+; CHECK: .method static {{.*}} vararg {{.*}} 'my_snprintf'(
 ; CHECK: '$MSIL_Startup'
 define i32 @my_snprintf(ptr %b, i64 %n, ptr %f, ...) {
   %ap = alloca ptr

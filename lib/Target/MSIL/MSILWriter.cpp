@@ -3221,13 +3221,26 @@ void MSILWriter::lowerIntrinsics(Function &F) {
              N == "vsprintf" || N == "snprintf" || N == "vsnprintf" ||
              N == "_snprintf" || N == "_vsnprintf";
     };
+    // Only a function that *is* the C library entry may be dropped. Testing
+    // the callee alone was not enough: SDL's SDL_sscanf forwards to the same
+    // __stdio_common_vsscanf that clang's printf wrapper reaches, but SDL_sscanf
+    // is not a CRT symbol, so there is nothing for a pinvoke thunk to resolve
+    // against. Dropping it left the thunks calling msvcrt!SDL_sscanf, which
+    // throws; SDL's error handler then called it again, forever.
+    //
+    // A non-CRT vararg definition is emitted as a real method instead, with
+    // va_start lowering to System.ArgIterator, so a call to it binds locally.
+    bool IsCRTSymbol = IsCRTEntry(&F) ||
+                       F.getName().starts_with("__stdio_common_") ||
+                       F.getName().starts_with("__acrt_");
     bool ForwardsToCRT = false;
-    for (BasicBlock &BB : F)
-      for (Instruction &I : BB)
-        if (auto *CB = dyn_cast<CallBase>(&I))
-          if (auto *Callee = CB->getCalledFunction())
-            if (IsCRTEntry(Callee))
-              ForwardsToCRT = true;
+    if (IsCRTSymbol)
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *CB = dyn_cast<CallBase>(&I))
+            if (auto *Callee = CB->getCalledFunction())
+              if (IsCRTEntry(Callee))
+                ForwardsToCRT = true;
     if (ForwardsToCRT) {
       F.deleteBody();
       F.setComdat(nullptr);
