@@ -1,15 +1,16 @@
 ; RUN: llvm-msil %s -o - | FileCheck %s --check-prefix=DEFAULT
-; RUN: llvm-msil %s -o - -msil-libc=builtin | FileCheck %s --check-prefix=BUILTIN
-; RUN: llvm-msil %s -o - -msil-libc=builtin -msil-alloc=hooks:My.Hooks \
+; RUN: llvm-msil %s -o - -msil-libc=il | FileCheck %s --check-prefix=BUILTIN
+; RUN: llvm-msil %s -o - -msil-libc=il -msil-alloc=hooks:My.Hooks \
 ; RUN:   | FileCheck %s --check-prefix=HOOK
 ; RUN: llvm-msil %s -o - -msil-libc=user_libc | FileCheck %s --check-prefix=USERDEF
 ; RUN: llvm-msil %s -o - -msil-libc=user_libc:Their.Libc \
 ; RUN:   | FileCheck %s --check-prefix=USER
 
 ; External C functions pinvoke the Windows CRT by default. -msil-libc rebinds
-; them to managed code instead: 'builtin' emits a platform-independent
-; implementation into the module, anything else names an assembly (and
-; optionally a type) the caller supplies.
+; them to managed code instead: 'il' emits the hand-written IL subset, anything
+; else names an assembly (and optionally a type) the caller supplies. The
+; default 'builtin' links the portable C library instead, which has its own
+; test (portable-libc.ll) because it pulls in a lot of code.
 ;
 ; Emission order is: the forwarders that keep each C symbol's name, then the
 ; externals that could not be rebound, then the module body.
@@ -31,7 +32,7 @@ declare i32 @printf(ptr, ...)
 ; BUILTIN: call void $MSIL_Libc::free(void*)
 ; BUILTIN: .method public static hidebysig int64 'strlen'(void*)
 ; BUILTIN: call int64 $MSIL_Libc::strlen(void*)
-; The built-in does not implement printf, so that one still pinvokes.
+; The IL subset does not implement printf, so that one still pinvokes.
 ; BUILTIN: pinvokeimpl("{{[^"]*}}" as "printf" cdecl)
 ; The implementation itself.
 ; BUILTIN: .assembly extern System.Private.CoreLib

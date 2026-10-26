@@ -31,24 +31,35 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/AsmParser/Parser.h"
+#include "llvm/Object/Binary.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Object/ObjectFile.h"
-#include "llvm/Object/Binary.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/Program.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Program.h"
 #include "llvm/CodeGen/IntrinsicLowering.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/CodeGen/Passes.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Linker/Linker.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils.h"
+
+// The portable C library, compiled to IR and embedded as a string literal by
+// the build. lib/Target/MSIL/libc/*.c is the source of truth.
+#include "LibcIR.inc"
 
 using namespace llvm;
 
@@ -100,6 +111,42 @@ bool isWideBinaryOpcode(unsigned Op) {
 }
 } // namespace
 
+namespace {
+/// The stdio names the portable library defines. A front end that saw only a
+/// prototype emits a wrapper definition for these; the wrapper is meant for
+/// the CRT and has to be dropped when the portable implementation is linked.
+bool isPortableStdioName(StringRef N) {
+  static const char *const Names[] = {
+      "printf",  "vprintf",  "sprintf",  "snprintf",
+      "vsprintf", "vsnprintf", "puts",   "putchar",
+  };
+  return is_contained(Names, N);
+}
+
+/// The symbols the portable C library (libc/*.c) defines. A declaration with
+/// one of these names is satisfied by the link instead of a pinvoke.
+bool isPortableLibcSymbol(StringRef N) {
+  static const char *const Names[] = {
+      // ctype.h
+      "isalnum", "isalpha", "isascii", "isblank", "iscntrl", "isdigit",
+      "isgraph", "islower", "isprint", "ispunct", "isspace", "isupper",
+      "isxdigit", "toascii", "tolower", "toupper",
+      // string.h additions
+      "strnlen", "strncat", "strspn", "strcspn", "strpbrk", "strtok",
+      "strtok_r", "strcasecmp", "strncasecmp", "memchr", "memrchr",
+      "strcoll", "strxfrm",
+      // stdlib.h
+      "atoi", "atol", "atoll", "strtol", "strtoul", "strtoll", "strtoull",
+      "abs", "labs", "llabs", "div", "ldiv", "lldiv", "qsort", "bsearch",
+      "rand", "srand",
+      // stdio.h
+      "printf", "vprintf", "sprintf", "snprintf", "vsprintf", "vsnprintf",
+      "puts", "putchar",
+  };
+  return is_contained(Names, N);
+}
+} // namespace
+
 // Naming the emitted class lets C# call into the module without reflection:
 // `MSIL.Program.Main()`. Without it everything is a free-standing member of
 // `<Module>`, which is legitimate IL but awkward to reference from C#.
@@ -145,10 +192,11 @@ StructType *MSILWriter::structFieldOf(const Value *Ptr, Type *AccessTy,
 static cl::opt<std::string> LibcSpec(
     "msil-libc",
     cl::desc("Bind external C functions to managed code instead of the Windows "
-             "CRT. 'builtin' emits the platform-independent implementation into "
-             "this module; '<assembly>[:<type>]' calls a type you supply "
-             "(type defaults to MSIL.Libc). Functions the built-in does not "
-             "implement, and all vararg functions, still pinvoke the CRT."),
+             "CRT. 'builtin' links the portable C library (string, ctype, "
+             "stdlib, printf) into this module; 'il' emits the smaller "
+             "hand-written IL subset instead; '<assembly>[:<type>]' calls a "
+             "type you supply (type defaults to MSIL.Libc). Functions neither "
+             "implements still pinvoke the CRT."),
     cl::value_desc("builtin|assembly[:type]"), cl::init(""));
 
 static cl::opt<std::string> AllocSpec(
@@ -466,8 +514,26 @@ std::string MSILWriter::getVarArgTypeName(Type *Ty) {
   return Ty->isFloatingPointTy() ? "int64" : getTypeName(Ty);
 }
 
+// Calls into the portable library normalize every vararg so the callee can
+// read it back through System.ArgIterator, which matches on the exact CLR
+// type. It has to be the same normalization everywhere: whether a call reaches
+// the library directly or through a declaration the link resolves, the IL
+// signature the call site names must agree with the callee's.
+std::string MSILWriter::getPortableVarArgTypeName(Type *Ty) {
+  if (Ty->isPointerTy())
+    return "void*";
+  if (Ty->isIntegerTy() || Ty->isFloatingPointTy())
+    return "int64";
+  return getTypeName(Ty);
+}
+
+bool MSILWriter::callsPortableLibc(const Function *Callee) const {
+  return EmitPortable && Callee && !Callee->isIntrinsic() &&
+         isPortableLibcSymbol(getCName(Callee));
+}
+
 std::string MSILWriter::getCallSignature(FunctionType *FTy, const CallBase *CB,
-                                         StringRef Name) {
+                                         StringRef Name, bool PortableVarArgs) {
   std::string Sig;
   if (FTy->isVarArg())
     Sig += "vararg ";
@@ -489,7 +555,9 @@ std::string MSILWriter::getCallSignature(FunctionType *FTy, const CallBase *CB,
       for (unsigned I = Fixed, E = CB->arg_size(); I != E; ++I) {
         if (I != Fixed)
           Sig += ", ";
-        Sig += getVarArgTypeName(CB->getArgOperand(I)->getType());
+        Sig += PortableVarArgs
+                   ? getPortableVarArgTypeName(CB->getArgOperand(I)->getType())
+                   : getVarArgTypeName(CB->getArgOperand(I)->getType());
       }
     }
   }
@@ -549,6 +617,14 @@ void MSILWriter::printValueLoadAsInt(const Value *V, bool Signed) {
   // canonical form to restore and no conv applies.
   if (N == 32 || N == 64 || N == 128)
     return;
+  if (N == 1) {
+    // i1 is held as 0 or 1, so conv.i1 would leave 1 as 1. A signed i1 is 0 or
+    // -1 (IR `sext i1 %x` is exactly negation); an unsigned one is already
+    // canonical.
+    if (Signed)
+      out() << "\tneg\n";
+    return;
+  }
   if (N == 16)
     out() << (Signed ? "\tconv.i2\n" : "\tconv.u2\n");
   else
@@ -1453,9 +1529,19 @@ void MSILWriter::printIntrinsicCall(const IntrinsicInst *II) {
     out() << "\tstloc\t'" << Dst << "'\n";
     return;
   }
-  default:
-    report_fatal_error("MSIL: intrinsic survived lowering: " +
-                       II->getCalledFunction()->getName());
+  default: {
+    // The call and callee types are included because the interesting failures
+    // are overload mismatches: the intrinsic exists, but with a signature the
+    // lowering did not recognise, so the name alone does not explain it.
+    std::string Msg;
+    raw_string_ostream OS(Msg);
+    OS << "MSIL: intrinsic survived lowering: ";
+    if (Function *G = dyn_cast<Function>(II->getCalledOperand()))
+      OS << G->getName() << " as " << *II->getFunctionType();
+    else
+      OS << "an indirect call";
+    report_fatal_error(Twine(Msg));
+  }
   }
 }
 
@@ -1463,19 +1549,47 @@ void MSILWriter::printFunctionCall(const Value *FnVal, const CallBase *CB) {
   FunctionType *FTy = CB->getFunctionType();
   const Function *Callee = dyn_cast<Function>(FnVal);
 
-  // Arguments must reach the pinvoke as the thunk declares them: a vararg
-  // float travels as its int64 bit pattern (see getVarArgTypeName).
+  // Arguments must reach the callee as its signature declares them. For a
+  // vararg call the trailing ones need two kinds of fixing:
+  //
+  //  - a float crosses as its int64 bit pattern (see getVarArgTypeName), for
+  //    the CRT's shadow-slot convention;
+  //  - a call into the portable library widens every integer to int64 too,
+  //    because there the arg is read back through System.ArgIterator, which
+  //    matches on the exact CLR type and cannot know whether the C default
+  //    promotions made this one an int or a long.
   unsigned Fixed = FTy->getNumParams();
+  // Decided from the call site, not the callee: after a front-end wrapper is
+  // dropped the operand is a declaration, and the name is what says which
+  // library the call belongs to.
+  bool Portable = EmitPortable && Callee && !Callee->isIntrinsic() &&
+                  isPortableLibcSymbol(getCName(Callee));
   for (unsigned I = 0, E = CB->arg_size(); I != E; ++I) {
     const Value *Arg = CB->getArgOperand(I);
+    Type *Ty = Arg->getType();
     printValueLoad(Arg);
-    if (FTy->isVarArg() && I >= Fixed && Arg->getType()->isFloatingPointTy()) {
+    if (!FTy->isVarArg() || I < Fixed)
+      continue;
+    if (Ty->isFloatingPointTy()) {
       // Reinterpret, do not convert. Storing an r8 into an int64 local through
       // stloc *converts* it, so go through memory instead: the bits of the
       // local are what the callee's va_arg reads.
-      std::string Tmp = newTempLocal(Arg->getType());
+      std::string Tmp = newTempLocal(Ty);
       out() << "\tstloc\t'" << Tmp << "'\n\tldloca\t'" << Tmp
             << "'\n\tconv.u8\n\tldind.i8\n";
+    } else if (Portable && Ty->isIntegerTy()) {
+      // Normalize to the declared width first so the sign is right, then
+      // widen. A narrow vararg arrives zero-extended, and conv.i8 alone would
+      // take that as the value.
+      unsigned Bits = Ty->getIntegerBitWidth();
+      out() << '\t' << widthConv(Ty) << '\n';
+      if (Bits < 32) {
+        // Sign-extend from the declared width: a narrow vararg arrives
+        // zero-extended, and conv.i8 alone would take that at face value.
+        out() << "\tconv.i" << Bits << "\n";
+      }
+      if (Bits <= 32)
+        out() << "\tconv.i8\n";
     }
   }
 
@@ -1489,7 +1603,7 @@ void MSILWriter::printFunctionCall(const Value *FnVal, const CallBase *CB) {
   if (Callee->isDeclaration()) {
     // Calls to external vararg functions bind to a concrete pinvoke thunk
     // whose signature lists the actual trailing argument types.
-    auto It = PInvokeNames.find({Callee, getCallSignature(FTy, CB, "")});
+    auto It = PInvokeNames.find({Callee, getCallSignature(FTy, CB, "", Portable)});
     if (It != PInvokeNames.end()) {
       std::string Sig = getTypeName(FTy->getReturnType()) + " '" + It->second +
                         "'(";
@@ -1497,8 +1611,10 @@ void MSILWriter::printFunctionCall(const Value *FnVal, const CallBase *CB) {
         if (I)
           Sig += ", ";
         Type *Ty = CB->getArgOperand(I)->getType();
-        Sig += (FTy->isVarArg() && I >= Fixed) ? getVarArgTypeName(Ty)
-                                              : getTypeName(Ty);
+        Sig += (FTy->isVarArg() && I >= Fixed)
+                   ? (Portable ? getPortableVarArgTypeName(Ty)
+                               : getVarArgTypeName(Ty))
+                   : getTypeName(Ty);
       }
       Sig += ")";
       out() << "\tcall\t" << Sig << '\n';
@@ -1507,7 +1623,7 @@ void MSILWriter::printFunctionCall(const Value *FnVal, const CallBase *CB) {
   }
 
   out() << "\tcall\t"
-      << getCallSignature(FTy, CB, getFunctionRef(Callee)) << '\n';
+      << getCallSignature(FTy, CB, getFunctionRef(Callee), Portable) << '\n';
 }
 
 void MSILWriter::printCallInstruction(const CallBase *CB) {
@@ -2600,16 +2716,26 @@ void MSILWriter::printFunction(const Function &F) {
   // deep recursion then overflows the thread stack.
   out() << "\t.maxstack\t" << MaxOperands << '\n';
 
+  // One `.locals init` per local is valid IL but repeats the header thousands
+  // of times in a large function (the portable libc's printf has over two
+  // thousand locals). IL allows several declarations separated by commas, so
+  // emit one directive.
+  std::string Locals;
+  auto AddLocal = [&](StringRef Type, StringRef Name) {
+    if (!Locals.empty())
+      Locals += ", ";
+    Locals += Type.str() + " '" + Name.str() + "'";
+  };
   for (const Argument &A : F.args())
-    out() << "\t.locals init (" << getLocalType(A.getType()) << " '"
-        << getValueName(&A) << "')\n";
+    AddLocal(getLocalType(A.getType()), getValueName(&A));
   for (const BasicBlock &BB : F)
     for (const Instruction &I : BB)
       if (!I.getType()->isVoidTy())
-        out() << "\t.locals init (" << getLocalType(I.getType()) << " '"
-            << getValueName(&I) << "')\n";
+        AddLocal(getLocalType(I.getType()), getValueName(&I));
   for (auto &Extra : ExtraLocals)
-    out() << "\t.locals init (" << Extra.first << " '" << Extra.second << "')\n";
+    AddLocal(Extra.first, Extra.second);
+  if (!Locals.empty())
+    out() << "\t.locals init (" << Locals << ")\n";
 
   out() << BodyStr;
   out() << "}\n";
@@ -2989,6 +3115,79 @@ bool MSILWriter::lowerExpandedIntrinsic(CallInst *CI) {
   }
 }
 
+// A front end that saw only a prototype for printf emits a wrapper definition
+// that reaches the CRT. The portable library supplies the real implementation,
+// so the wrapper has to step aside -- and its callers have to be re-pointed at
+// a declaration of the same name, or the linker drops the linked definition as
+// unreachable and the call binds to nothing.
+//
+// This runs before collectPInvokes, which would otherwise mint a pinvoke thunk
+// for the vararg call sites while they still refer to the wrapper.
+void MSILWriter::dropStdioWrappers() {
+  SmallVector<Function *, 8> Wrappers;
+  for (Function &F : *Mod)
+    if (!F.isDeclaration() && F.isVarArg() && isPortableStdioName(F.getName()))
+      Wrappers.push_back(&F);
+  for (Function *F : Wrappers) {
+    FunctionType *FTy = F->getFunctionType();
+    std::string Name = F->getName().str();
+    // A declaration of the same name may already exist; if so it is the one
+    // to point at, since creating another would be renamed `printf.1`.
+    Function *Impl = nullptr;
+    for (Function &G : Mod->functions())
+      if (&G != F && G.isDeclaration() && G.getName() == Name) {
+        Impl = &G;
+        break;
+      }
+    if (!Impl) {
+      // `printf.1` etc. are illegal IL identifiers, so the new declaration
+      // must keep the exact name. The old one still owns it until it goes.
+      F->setName(Name + "$wrapper");
+      Impl = Function::Create(FTy, GlobalValue::ExternalLinkage, Name, Mod);
+    }
+    Impl->setAttributes(F->getAttributes());
+    // The wrapper's own body also names it, so the uses have to be redirected
+    // by hand after the definition is gone; replaceAllUsesWith would leave
+    // the recursive reference behind.
+    SmallVector<Use *, 8> Uses;
+    for (Use &U : F->uses())
+      Uses.push_back(&U);
+    for (Use *U : Uses)
+      U->set(Impl);
+    F->deleteBody();
+    F->eraseFromParent();
+  }
+}
+
+namespace {
+/// Intrinsics the emitter discards: a debugger or allocator cannot use them
+/// here, and they carry no value.
+bool isDiscardableIntrinsic(Intrinsic::ID ID) {
+  return ID == Intrinsic::lifetime_start || ID == Intrinsic::lifetime_end ||
+         ID == Intrinsic::dbg_declare || ID == Intrinsic::dbg_value ||
+         ID == Intrinsic::dbg_label;
+}
+} // namespace
+
+// The prep passes in MSILTargetMachine run before this pass, so anything the
+// portable library link added still has the constructs IL cannot express.
+// Running the same subset again is idempotent for code that already went
+// through it.
+void MSILWriter::lowerLinkedFunctions() {
+  if (!EmitPortable)
+    return;
+  legacy::FunctionPassManager FPM(Mod);
+  FPM.add(createUnreachableBlockEliminationPass());
+  FPM.add(createLowerSwitchPass());
+  FPM.add(createCFGSimplificationPass());
+  FPM.add(createPromoteMemoryToRegisterPass());
+  FPM.doInitialization();
+  for (Function &F : *Mod)
+    if (!F.isDeclaration())
+      FPM.run(F);
+  FPM.doFinalization();
+}
+
 void MSILWriter::lowerIntrinsics(Function &F) {
   // A vararg function whose body merely forwards to a CRT internal (e.g. the
   // `printf` wrapper clang emits from MSVC's stdio.h) cannot work: it passes a
@@ -3001,6 +3200,15 @@ void MSILWriter::lowerIntrinsics(Function &F) {
   // callee is matched by name, not linkage: the intermediate wrapper is still
   // a definition when the outer one is examined.
   if (F.isVarArg() && !F.isDeclaration()) {
+    // The portable library defines these itself, so a front-end wrapper with
+    // the same name must step aside or the link keeps the wrapper and the
+    // real implementation is dead code. The wrapper only exists to reach the
+    // CRT in a way va_arg cannot on this backend.
+    // printf and friends are linkonce_odr wrappers, so the name is the only
+    // reliable test: a user definition of one of these would be their own
+    // implementation of the C library, which is what is being replaced.
+    // The portable library defines these; see dropStdioWrappers, which runs
+    // before this and has already re-pointed the calls.
     auto IsCRTEntry = [](const Function *Callee) {
       StringRef N = Callee->getName();
       if (N.starts_with("__stdio_common_") || N.starts_with("__acrt_"))
@@ -3034,14 +3242,38 @@ void MSILWriter::lowerIntrinsics(Function &F) {
         auto *CI = dyn_cast<CallInst>(I);
         if (!CI)
           continue;
+        // getCalledFunction returns null when the call's function type differs
+        // from the callee's, which is what a vararg intrinsic call site or a
+        // mismatched attribute group produces. The intrinsic is still named,
+        // so fall back to the name for the ones the CLR cannot express.
         Function *Callee = CI->getCalledFunction();
-        if (!Callee || !Callee->isIntrinsic())
+        if (!Callee) {
+          if (Function *F = dyn_cast<Function>(CI->getCalledOperand()))
+            if (F->isIntrinsic() && isDiscardableIntrinsic(F->getIntrinsicID())) {
+              CI->eraseFromParent();
+              continue;
+            }
+          continue;
+        }
+        if (!Callee->isIntrinsic())
           continue;
         switch (Callee->getIntrinsicID()) {
         case Intrinsic::vastart:
         case Intrinsic::vaend:
         case Intrinsic::vacopy:
           break; // Emitted directly.
+        case Intrinsic::lifetime_start:
+        case Intrinsic::lifetime_end:
+        case Intrinsic::dbg_declare:
+        case Intrinsic::dbg_value:
+        case Intrinsic::dbg_label:
+          // Bookkeeping for a debugger and an allocator; the CLR has no
+          // lifetime markers, and locals already live for the whole method.
+          // A call-site attribute group (`#6` in the IR) makes the call carry
+          // a different function type, so `getCalledFunction` no longer sees
+          // the intrinsic; matching the name covers both spellings.
+          CI->eraseFromParent();
+          break;
         case Intrinsic::sqrt:
       case Intrinsic::sin:
       case Intrinsic::cos:
@@ -3458,6 +3690,14 @@ void MSILWriter::lowerIntrinsics(Function &F) {
         break;
       }
       default:
+        // IntrinsicLowering does not know the memory-use markers, and what it
+        // does with an unknown lifetime intrinsic is rewrite it into the
+        // declaration form -- which is still a lifetime intrinsic. Drop them
+        // before it gets the chance.
+        if (isDiscardableIntrinsic(Callee->getIntrinsicID())) {
+          CI->eraseFromParent();
+          break;
+        }
         // The families IntrinsicLowering has never heard of are expanded
         // here; whatever is left it either lowers or reports on.
         if (!lowerExpandedIntrinsic(CI) && !lowerLibmIntrinsic(CI))
@@ -3481,6 +3721,11 @@ void MSILWriter::lowerIntrinsics(Function &F) {
               case Intrinsic::vastart:
               case Intrinsic::vaend:
               case Intrinsic::vacopy:
+              case Intrinsic::lifetime_start:
+              case Intrinsic::lifetime_end:
+              case Intrinsic::dbg_declare:
+              case Intrinsic::dbg_value:
+              case Intrinsic::dbg_label:
                 break;
               }
     if (!Remaining)
@@ -3690,6 +3935,7 @@ std::string MSILWriter::getImportName(const Function *F) const {
 }
 
 namespace {
+
 /// The set the built-in libc implements; a symbol outside it keeps its pinvoke.
 bool isBuiltinSymbol(StringRef N) {
   static const char *const Names[] = {
@@ -3697,7 +3943,12 @@ bool isBuiltinSymbol(StringRef N) {
       "memset",  "memcmp",  "strlen",  "strcmp",  "strncmp", "strcpy",
       "strncpy", "strcat",  "strchr",  "strrchr", "strstr", "strdup",
   };
-  return is_contained(Names, N);
+  if (is_contained(Names, N))
+    return true;
+  // The portable C library covers the string, character, conversion and stdio
+  // surface too. Anything it defines is bound to the linked copy; the check is
+  // a name list because a symbol has to be classified before the link happens.
+  return isPortableLibcSymbol(N);
 }
 } // namespace
 
@@ -3776,6 +4027,16 @@ void MSILWriter::resolveLibcOptions() {
   if (LibcSpec.empty())
     return;
   if (LibcSpec == "builtin") {
+    // 'builtin' is the portable C library: a wide, tested surface. 'il' keeps
+    // the smaller hand-written subset, for a module that must link no C in.
+    EmitPortable = true;
+    // Nothing needs rebinding: the linked definitions carry the C names, so
+    // an empty type leaves every declaration to the link. A user-supplied
+    // type still takes precedence and is handled by the spec above.
+    LibcType = {"", ""};
+    return;
+  }
+  if (LibcSpec == "il") {
     EmitLibc = true;
     LibcType = {"", "$MSIL_Libc"};
     return;
@@ -3804,9 +4065,10 @@ bool MSILWriter::getManagedTarget(const Function *F, ManagedType &Out) const {
   }
   if (LibcType.Type.empty())
     return false;
-  // The built-in libc implements a fixed set; anything else keeps its pinvoke,
-  // so a program can use both.
-  if (EmitLibc && !isBuiltinSymbol(Name))
+  // The hand-written IL subset implements a fixed set; anything else keeps
+  // its pinvoke, so a program can use both. The portable library is linked
+  // selectively, so a name it does not define simply stays a declaration.
+  if (EmitLibc && !EmitPortable && !isBuiltinSymbol(Name))
     return false;
   Out = LibcType;
   return true;
@@ -4341,6 +4603,138 @@ void MSILWriter::printLibcMethod(StringRef Name, StringRef Ret,
       << Body << "\n}\n\n";
 }
 
+//===----------------------------------------------------------------------===//
+// The portable C library
+//===----------------------------------------------------------------------===//
+
+void MSILWriter::linkPortableLibc() {
+  LLVMContext &Ctx = Mod->getContext();
+  SMDiagnostic Err;
+  std::unique_ptr<MemoryBuffer> Buf =
+      MemoryBuffer::getMemBuffer(PortableLibcIR, "portable-libc", false);
+  std::unique_ptr<Module> Libc =
+      parseAssembly(*Buf, Err, Ctx, /*UpgradeDebugInfo=*/false);
+  if (!Libc)
+    report_fatal_error("MSIL: the embedded portable libc does not parse: " +
+                       Err.getMessage());
+
+  // The embedded module was compiled for the same pointer size, so the layouts
+  // agree; adopt this module's so the link does not warn about a mismatch.
+  Libc->setDataLayout(Mod->getDataLayout());
+  Libc->setTargetTriple(Mod->getTargetTriple());
+
+  // Only what the module actually reaches is merged: LinkOnlyNeeded follows
+  // references from the module being linked into, and skips the rest, so a
+  // program that never calls printf does not carry it.
+  if (Linker::linkModules(*Mod, std::move(Libc), Linker::LinkOnlyNeeded))
+    report_fatal_error("MSIL: linking the portable libc failed");
+  // Every seam function the linked code refers to now needs its IL.
+  bool AnySeam = false;
+  for (Function &F : *Mod)
+    if (F.isDeclaration() && F.getName().starts_with("__msil_"))
+      AnySeam = true;
+  UsesLibcSeam = AnySeam;
+}
+
+// A pointer argument. Reading it through object is the only form the CLR
+// accepts for every call site: the typed GetNextArg matches on the exact
+// CLR type, and a void* argument has none (IntPtr is a different type).
+// A void* boxes as System.UIntPtr (an unsigned native int), so that is what
+// the unbox has to name; its value is the address.
+std::string MSILWriter::untaggedVaBody() {
+  std::string B;
+  raw_string_ostream OS(B);
+  OS << "\n\t.locals init (valuetype [mscorlib]System.ArgIterator 'it', object 'o', native int 'p')"
+        "\n\tldarg.0"
+        "\n\tldind.i"
+        "\n\tldobj\tvaluetype [mscorlib]System.ArgIterator"
+        "\n\tstloc\t'it'"
+        "\n\tldloca\t'it'"
+        "\n\tldtoken\t[mscorlib]System.Object"
+        "\n\tcall\tinstance typedref [mscorlib]System.ArgIterator::GetNextArg(valuetype [mscorlib]System.RuntimeTypeHandle)"
+        "\n\tcall\tobject [mscorlib]System.TypedReference::ToObject(typedref)"
+        "\n\tstloc\t'o'"
+        "\n\tldloc\t'o'"
+        "\n\tunbox\t[mscorlib]System.UIntPtr"
+        "\n\tldind.i"
+        "\n\tstloc\t'p'"
+        "\n\tldarg.0"
+        "\n\tldind.i"
+        "\n\tldloc\t'it'"
+        "\n\tstobj\tvaluetype [mscorlib]System.ArgIterator"
+        "\n\tldloc\t'p'"
+        "\n\tconv.u\n\tret";
+  return B;
+}
+std::string MSILWriter::vaAccessorBody(StringRef CLRType, StringRef LoadInst,
+                                      bool AsPointer) {
+  // The va_list is a pointer to an ArgIterator. A byref local cannot hold an
+  // unmanaged pointer (the JIT rejects it), so the iterator is copied in,
+  // advanced, then copied back: the caller sees the advanced cursor.
+  std::string B;
+  raw_string_ostream OS(B);
+  // The argument is the address of the caller's va_list slot, and the slot
+  // holds a pointer to the ArgIterator: the C code passes &ap so that the
+  // iterator it advances is the one va_start built, not a copy.
+  OS << "\n\t.locals init (valuetype [mscorlib]System.ArgIterator 'it')"
+        "\n\tldarg.0"
+        "\n\tldind.i"
+        "\n\tldobj\tvaluetype [mscorlib]System.ArgIterator"
+        "\n\tstloc\t'it'"
+        "\n\tldloca\t'it'"
+        "\n\tldtoken\t"
+     << CLRType << "\n"
+     << "\tcall\tinstance typedref [mscorlib]System.ArgIterator::"
+        "GetNextArg(valuetype [mscorlib]System.RuntimeTypeHandle)"
+        "\n\trefanyval\t"
+     << CLRType << "\n"
+     << LoadInst << "\n"
+     // Only the pointer accessor needs this; the rest already produce the
+     // declared return type.
+     << (AsPointer ? "\tconv.u\n" : "") << "\tldarg.0"
+     << "\n\tldind.i"
+     << "\n\tldloc\t'it'"
+     << "\n\tstobj\tvaluetype [mscorlib]System.ArgIterator\n\tret";
+  return B;
+}
+
+void MSILWriter::printLibcSeam() {
+  // Only the accessors the linked code actually calls are emitted.
+  llvm::StringSet<> Wanted;
+  for (Function &F : *Mod)
+    if (F.isDeclaration() && F.getName().starts_with("__msil_"))
+      Wanted.insert(F.getName());
+
+  // Module-level, because the linked C calls these by their global names; a
+  // class member would need the class prefix at every call site.
+  //
+  // A vararg argument crosses into the linked C as one of four CLR types,
+  // matching what printFunctionCall pushes at the call site.
+  if (Wanted.count("__msil_va_i32"))
+    printLibcMethod("__msil_va_i32", "int32", "void*",
+                    vaAccessorBody("[mscorlib]System.Int32",
+                                    "\tldind.i4", false));
+  if (Wanted.count("__msil_va_i64"))
+    printLibcMethod("__msil_va_i64", "int64", "void*",
+                    vaAccessorBody("[mscorlib]System.Int64",
+                                    "\tldind.i8", false));
+  if (Wanted.count("__msil_va_f64"))
+    printLibcMethod("__msil_va_f64", "float64", "void*",
+                    vaAccessorBody("[mscorlib]System.Int64", "\tldind.i8",
+                                   false));
+  if (Wanted.count("__msil_va_ptr"))
+    printLibcMethod("__msil_va_ptr", "void*", "void*",
+                    untaggedVaBody());
+
+  if (Wanted.count("__msil_write"))
+    printLibcMethod(
+        "__msil_write", "void", "void*, int64",
+        "\tldarg.0\n\tconv.i\n\tldarg.1\n\tconv.i4\n"
+        "\tcall\tstring [mscorlib]System.Runtime.InteropServices.Marshal::"
+        "PtrToStringAnsi(native int, int32)\n"
+        "\tcall\tvoid [mscorlib]System.Console::Write(string)\n\tret");
+}
+
 void MSILWriter::printBuiltinLibc() {
   // Emit only what the module can reach, so the libc costs nothing a program
   // does not use. strdup calls malloc and memcpy, so it pulls both in.
@@ -4501,7 +4895,10 @@ void MSILWriter::collectPInvokes() {
       auto *CB = dyn_cast<CallBase>(U);
       if (!CB)
         continue;
-      std::string Key = getCallSignature(FTy, CB, "");
+      // The same normalization the call site will use, or the key would not
+      // match and the call would name a thunk that was never emitted.
+      bool Portable = EmitPortable && isPortableLibcSymbol(getCName(&F));
+      std::string Key = getCallSignature(FTy, CB, "", Portable);
       if (PInvokeNames.count({&F, Key}))
         continue;
       std::string Name = F.getName().str() + "$" +
@@ -4517,7 +4914,10 @@ void MSILWriter::collectPInvokes() {
         if (I)
           Sig += ", ";
         Type *Ty = CB->getArgOperand(I)->getType();
-        Sig += I >= Fixed ? getVarArgTypeName(Ty) : getTypeName(Ty);
+        Sig += I >= Fixed
+                   ? (Portable ? getPortableVarArgTypeName(Ty)
+                               : getVarArgTypeName(Ty))
+                   : getTypeName(Ty);
       }
       Sig += ")";
       PInvokeNames[{&F, Key}] = Name;
@@ -4546,6 +4946,10 @@ void MSILWriter::printExternals() {
 
   for (Function &F : *Mod) {
     if (!F.isDeclaration() || F.isIntrinsic() || F.getFunctionType()->isVarArg())
+      continue;
+    // The seam methods are emitted as IL by printLibcSeam; a pinvoke of the
+    // same name would be the one the JIT resolved.
+    if (F.getName().starts_with("__msil_"))
       continue;
     EmitExternal(F, getValueName(&F));
   }
@@ -4862,10 +5266,30 @@ bool MSILWriter::runOnModule(Module &M) {
   IL = std::make_unique<IntrinsicLowering>(*DL);
   resolveLibcOptions();
 
+  // The portable library is linked first so the functions it brings in go
+  // through the same lowering and emission as user code. Linking before
+  // collectTypes also means the types it introduces get their classes.
+  //
+  // The front-end wrappers go first: while `printf` is still a definition in
+  // this module, LinkOnlyNeeded sees no reference to resolve and skips the
+  // library's copy, so the program would keep the CRT wrapper.
+  if (EmitPortable) {
+    dropStdioWrappers();
+    linkPortableLibc();
+  }
+
   // An alias is just another name for its target; resolve it away so an alias
   // of a function is not mistaken for a variable.
   for (GlobalAlias &A : M.aliases())
     A.replaceAllUsesWith(A.getAliasee());
+
+  // The link added functions after the target machine's prep passes ran, so
+  // the constructs that need lowering for IL are still there: switches,
+  // allocas, and unwinds. Run that subset again over the definitions the link
+  // brought in. User code has already been through it, so re-running would
+  // only cost time -- but the bookkeeping of which is which is not worth it
+  // for a module-sized pass on a handful of functions.
+  lowerLinkedFunctions();
 
   for (Function &F : M)
     if (!F.isDeclaration())
@@ -4911,8 +5335,10 @@ bool MSILWriter::runOnModule(Module &M) {
   printAggregateDeclarations();
   collectPInvokes();
   printExternals();
-  if (EmitLibc)
+  if (EmitLibc && !EmitPortable)
     printBuiltinLibc();
+  if (UsesLibcSeam)
+    printLibcSeam();
   printGlobals();
 
   // Everything the C# side should be able to call or read goes inside this

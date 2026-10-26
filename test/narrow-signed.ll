@@ -40,6 +40,16 @@ define i32 @signed_uses() {
   ret i32 %c
 }
 
+; An i1 is held as 0 or 1, not as its sign pattern, so conv.i1 would leave a
+; true value as 1 instead of -1. `sext i1 %x` is IR for negation, and that is
+; what has to be emitted.
+define i32 @sext_i1(i1 %c) {
+; CHECK-LABEL: .method static {{.*}} 'sext_i1'
+; CHECK: neg
+  %v = sext i1 %c to i32
+  ret i32 %v
+}
+
 ; A bitcast between integer and float is a reinterpretation. Storing into a
 ; local of the *destination* type would convert instead, so the bits go
 ; through memory of the source type.

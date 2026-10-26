@@ -62,7 +62,8 @@ size any aggregate type.
 | Option | Effect |
 |---|---|
 | `-msil-class-name=Ns.Type` | Emit module members inside this class instead of `<Module>`, so C# can call them without reflection. |
-| `-msil-libc=builtin` | Emit a platform-independent C library into the module: `malloc`, `free`, `calloc`, `realloc`, `memcpy`, `memmove`, `memset`, `memcmp`, the `str*` family. Backed by `NativeMemory`, so there is no pinvoke. |
+| `-msil-libc=builtin` | Link the portable C library into the module: `printf`/`snprintf`/`sprintf`/`puts`/`putchar`, `atoi`/`strtol`/`strtoul` and the rest of the conversion family, `abs`/`div`/`qsort`/`bsearch`/`rand`, the `str*` and `mem*` family, and `<ctype.h>`. Written in C (ported from musl), compiled to IR at build time, and linked selectively, so only what the program reaches is emitted. `malloc` and friends still come from the IL subset, which is backed by `NativeMemory`. |
+| `-msil-libc=il` | Emit the smaller hand-written IL subset instead: `malloc`/`free`/`calloc`/`realloc` over `NativeMemory`, plus `memcpy`/`memset`/`memcmp` and the `str*` family, but no `printf`. For a module that must link no C in. |
 | `-msil-libc=<asm>[:<type>]` | Bind the same calls to a managed assembly you supply (type defaults to `MSIL.Libc`). |
 | `-msil-alloc=<asm>:<type>` | Route `malloc`/`free`/`calloc`/`realloc` to methods of that name on your type, so unmanaged allocations can be instrumented. |
 | `-msil-math=0` | Do not bind libm to `System.Math`/`System.MathF`; pinvoke the CRT instead. |
@@ -160,6 +161,97 @@ fault rather than silently corrupt the image, which is the correct behaviour.
 A zero-sized global gets no template but still gets its own allocation, since
 LLVM gives every global a distinct address.
 
+## The portable C library
+
+`-msil-libc=builtin` gives a program a real C library: `printf` and the rest of
+stdio, the conversion family (`atoi`, `strtol`, `strtoul`, ...), `qsort` and
+`bsearch`, the string and character functions. It is written in plain C in
+`lib/Target/MSIL/libc/`, mostly ported from
+[musl](https://github.com/kraj/musl) so that its behaviour is a known quantity
+rather than something invented here.
+
+Nothing that needs a syscall, a file, a locale or an OS interface is in it: a
+`fopen` or a `time()` still pinvokes the CRT. What remains is the part of libc
+that can be expressed in pure C, which is the part a portable program leans on.
+
+### How it gets into the module
+
+The C is compiled to IR at build time (by a clang that can target the Windows
+ABI, since that decides `sizeof(long)`) and the IR is embedded in the backend
+as a string literal. At translate time it is linked in with
+`LinkOnlyNeeded`, which follows references from the program and skips
+everything else: a program that never calls `qsort` does not carry it. The
+linked functions then go through the same lowering and emission as user code.
+
+That ordering is why `lib/Target/MSIL/libc/*.c` is the source of truth. The
+build compiles it whenever it can find a clang that targets Windows; an
+in-tree LLVM build may not have one, so `lib/Target/MSIL/libc.ll` is checked in
+as the fallback and `scripts/update-libc-ir.sh` regenerates it. Change the C,
+run the script, and the two stay in step.
+
+### The vararg seam
+
+The one thing C cannot express is reading a vararg argument, because the CLR's
+`va_list` is a `System.ArgIterator` and not a C pointer. So `libc.h` declares
+three accessors -- `__msil_va_i64`, `__msil_va_f64`, `__msil_va_ptr` -- plus
+`__msil_write` for output, and the backend emits them as IL. `printf` is
+ordinary C above that seam.
+
+Three details make it work, and each is a place where the obvious thing fails:
+
+* The accessor takes the **address** of the caller's `va_list`, not its value.
+  Reading an argument advances the cursor, and the cursor lives in the
+  caller's slot: `va_start` stored the address of the `ArgIterator` there.
+* The iterator is copied out of that address, read, and copied back, because
+  an unmanaged pointer cannot be held in a `byref` local -- the JIT rejects
+  the method.
+* Each argument crosses as its CLR type, not its C type: `int64` for any
+  integer, `float64` for a `double`'s raw bits, `void*` for a pointer. The
+  typed `GetNextArg(RuntimeTypeHandle)` overload matches on the exact type, so
+  there is one accessor per CLR type; a pointer has no type token at all, so it
+  is read through `object` and unboxed as `UIntPtr`, which is how a `void*`
+  boxes.
+
+There is no `int32` accessor because the call site narrows to one CLR type per
+slot. A vararg `int` is widened to `int64` on the way in (rather than left as
+`int32`), because the typed read has to know which of the two shapes to expect
+and `printf` cannot know which the caller chose. `%f` reads the `float64` bits
+through the `int64` overload for the same reason: the backend already sends a
+vararg `double` as an `int64` (the CRT's `va_arg` reads the general-purpose
+shadow slot on Windows x64), so the C side reinterprets the bits.
+
+### Where it deliberately differs
+
+* Output goes to `System.Console`, so a `printf` program is portable off
+  Windows. Nothing is buffered: `printf` writes as it formats, which differs
+  from a line-buffered C library only in how output interleaves with stderr
+  and with a crash.
+* There is no locale, so character classes are fixed ASCII and `%ls`/`%lc`
+  treat their argument as narrow -- which passes a UTF-8 string's bytes
+  through unchanged anyway.
+* `errno` does not exist. `strtol` saturates silently on overflow instead of
+  setting `ERANGE`; `%m`, `%n$` positional arguments and `%n` are not
+  implemented.
+* `qsort` is an insertion sort. It is stable and obviously correct, which
+  matters more here than the asymptotic advantage; musl's smoothsort is
+  available if a program ever sorts enough to notice.
+* `%a`/`%A` follow musl exactly, and the C libraries do not agree with each
+  other here. Verified against glibc 2.39 and musl 1.2.4 for the same inputs:
+
+  | value             | musl (and this port)      | glibc 2.39                | MSVC CRT                  |
+  |-------------------|---------------------------|---------------------------|---------------------------|
+  | `1.0`             | `0x1p+0`                  | `0x1p+0`                  | `0x1.0000000000000p+0`    |
+  | `DBL_TRUE_MIN`    | `0x1p-1074`               | `0x0.0000000000001p-1022` | `0x0.0000000000001p-1022` |
+
+  Two separate disagreements. MSVC is alone in padding to 13 fraction digits on
+  every value. On a subnormal, glibc and MSVC agree with each other and musl is
+  alone: musl normalises the value (`frexp` does that on the way in) while the
+  other two keep the raw encoding's exponent. The port keeps musl's behaviour
+  because musl is what it is ported from, and `test/programs/libc.sh` compares
+  the `%a` lines against musl's output as a literal rather than against the
+  native build, which would be comparing against MSVC. `libc/tests/compare.sh`
+  leaves `%a` out for the same reason.
+
 ## Math
 
 libm calls bind to `System.Math`/`System.MathF` rather than pinvoking the CRT,
@@ -235,6 +327,14 @@ level. `int128.sh` and `sdl.sh` are self-contained. `sdl.sh` needs SDL2
 development files: set `SDL2_DIR` to a directory with `include/SDL2` and
 `lib/SDL2.lib`, and `SDL2_BIN` to `SDL2.dll` if it is not in `lib/`. Without
 them the test reports `sdl: skipped` and the gate still passes.
+
+`libc.sh` is the compatibility test for the portable C library: it runs
+`test/programs/libc.c` on the CLR at four optimization levels and diffs the
+output against a native build of the same file. A port is only as good as its
+agreement with the real thing, so the native build is the reference. During
+development the same source also runs natively against the ported `.c` files
+rather than the CRT, which separates a portability bug from a translation bug
+before the MSIL side is involved.
 
 `doom.sh` runs PureDOOM for a fixed number of tics on a virtual clock and
 hashes the framebuffer; `stb.sh` exercises stb_image (including a PNG
