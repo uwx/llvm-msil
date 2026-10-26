@@ -76,8 +76,12 @@ private:
   std::string getMemSuffix(Type *Ty);
 
   std::string getCallSignature(FunctionType *FTy, const CallBase *CB,
-                               StringRef Name);
+                               StringRef Name, bool PortableVarArgs = false);
   std::string getVarArgTypeName(Type *Ty);
+  /// The same for a call into the portable library, where every integer
+  /// vararg is widened to int64 so the ArgIterator read is predictable.
+  std::string getPortableVarArgTypeName(Type *Ty);
+  bool callsPortableLibc(const Function *Callee) const;
 
   //===------------------------------------------------------------------===//
   // Values.
@@ -249,6 +253,29 @@ private:
   /// signature's parameter list in the same spelling getTypeName produces.
   void printLibcMethod(StringRef Name, StringRef Ret, StringRef Params,
                        StringRef Body);
+
+  /// Link the portable C library (libc/libc.ll, embedded at build time) into
+  /// the module, keeping only what the module reaches. Runs before lowering so
+  /// the added functions go through the same passes as user code.
+  void linkPortableLibc();
+
+  /// Turn a front-end printf wrapper into the declaration the portable
+  /// library's implementation will satisfy.
+  void dropStdioWrappers();
+
+  /// Run the target machine's prep passes over the functions the portable
+  /// library link added, which happened after those passes had run.
+  void lowerLinkedFunctions();
+
+  /// The IL seam the linked C library calls: __msil_va_* and __msil_write.
+  void printLibcSeam();
+  /// The body of one seam accessor: read the next vararg as \p CLRType and
+  /// leave it on the stack. \p LoadInst loads that CLR type from the typedref.
+  std::string vaAccessorBody(StringRef CLRType, StringRef LoadInst,
+                             bool AsPointer);
+  /// The same for a pointer argument, which has no System.Type token and so
+  /// has to be read through object.
+  std::string untaggedVaBody();
   void printGlobals();
   void printStaticConstant(const Constant *C, uint64_t &Offset,
                            std::string &Buffer);
@@ -319,6 +346,14 @@ private:
   ManagedType AllocType;
   /// Emit the built-in libc's own IL, rather than referring to a user's.
   bool EmitLibc = false;
+
+  /// Link libc/libc.ll (the portable C library) into the module. It is the
+  /// default 'builtin' implementation; the IL-only subset above stays for a
+  /// module that wants no C code linked in.
+  bool EmitPortable = false;
+
+  /// Set when the linked library left seam declarations to satisfy.
+  bool UsesLibcSeam = false;
 
   /// A Math/MathF forwarder was emitted, so System.Runtime is referenced.
   bool UsesMath = false;

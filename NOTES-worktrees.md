@@ -69,3 +69,21 @@ taking either side.
   `/O2 /Ob2 /DNDEBUG`; if the cache was made by some other means and reads
   empty, delete `build/` and configure again. Prefer that to matching it, so
   the gate runs the same assertions configuration the release builds use.
+
+## Building the portable C library
+
+`lib/Target/MSIL/libc/*.c` is compiled to IR at configure/build time and
+embedded in the backend. That needs a clang that can target the Windows ABI,
+because `sizeof(long)` and the vararg accessors depend on it. A standalone
+build usually finds one; if it cannot, it says so at configure time and you
+pass `-DMSIL_LIBC_CLANG=<path>`.
+
+An in-tree build (LLVM built with this project in `llvm/projects/`) has no
+clang in the export set, so it falls back to the checked-in
+`lib/Target/MSIL/libc.ll`. After changing the C, run
+`lib/Target/MSIL/scripts/update-libc-ir.sh <clang> <llvm-link>` and commit the
+result, or the fallback build will keep the old code.
+
+The libc is only linked into a module with `-msil-libc=builtin` (the default
+for a program that calls `printf`). `-msil-libc=il` is the older hand-written
+IL subset, which has no stdio.

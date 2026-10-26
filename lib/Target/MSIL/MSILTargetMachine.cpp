@@ -41,6 +41,11 @@ bool MSILTargetMachine::addPassesToEmitFile(
 
   // Prepare the IR for the constructs IL can express: no invoke/switch/EH,
   // canonical CFG, atomics lowered to libcalls, and SSA locals.
+  //
+  // The writer links the portable C library, and that happens after these
+  // passes have run, so the library's own switches and allocas would reach it
+  // unlowered. The writer therefore re-runs this subset on everything the
+  // link added; the summary is in MSILWriter::lowerLinkedFunctions.
   PM.add(createLowerInvokePass());
   PM.add(createUnreachableBlockEliminationPass());
   PM.add(createLowerSwitchPass());
