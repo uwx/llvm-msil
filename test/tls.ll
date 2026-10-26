@@ -10,6 +10,7 @@
 @tp = thread_local global ptr @s
 @s = global [4 x i8] c"abc\00"
 @tc = thread_local constant i32 9
+@te = thread_local global [0 x i8] zeroinitializer
 
 ; The pointer field carries the attribute; the template does not.
 ; DEFAULT: .data 't$tpl$data' = { int32 (7) }
@@ -97,6 +98,15 @@ define i32 @main() {
 ; DEFAULT: conv.u8
 ; DEFAULT-NOT: call void* '$MSIL_Alloc'(int64)
 ; DEFAULT: stsfld void* 'tc'
+
+; A zero-sized thread-local still gets its own allocation, but there are no
+; bytes to copy: the accessor must not push a cpblk destination and then skip
+; the cpblk, which leaves the stack one item deep and the JIT rejects it.
+; DEFAULT-LABEL: 'te$tls'() cil managed
+; DEFAULT: ldc.i8 1
+; DEFAULT: call void* '$MSIL_Alloc'(int64)
+; DEFAULT-NOT: cpblk
+; DEFAULT: stsfld void* 'te'
 
 ; With -msil-class-name the accessor moves into the class with every other
 ; helper, so call sites have to name it. The slot itself stays a module-level

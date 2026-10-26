@@ -5214,8 +5214,11 @@ void MSILWriter::printThreadLocalAccessor(const GlobalImage &Image) {
     // The same bytes $MSIL_Init would have produced, but for this thread.
     out() << "\tldc.i8\t" << (Size ? Size : 1) << "\n";
     out() << "\tcall\tvoid* " << ClassPrefix() << "'$MSIL_Alloc'(int64)\n";
-    out() << "\tstloc\t'p'\n\tldloc\t'p'\n";
+    out() << "\tstloc\t'p'\n";
     if (Size) {
+      // The zero-sized case has no bytes to copy, so the destination push
+      // belongs inside this branch or the stack is left one item deep.
+      out() << "\tldloc\t'p'\n";
       out() << "\tldsflda\t" << Tpl << "\n\tconv.u8\n";
       out() << "\tldc.i4\t" << Size << "\n\tcpblk\n";
     }
