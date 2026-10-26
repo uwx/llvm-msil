@@ -30,7 +30,15 @@
 #include "MSILWriter.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Object/COFF.h"
+#include "llvm/Object/ObjectFile.h"
+#include "llvm/Object/Binary.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Program.h"
+#include "llvm/Support/Path.h"
 #include "llvm/CodeGen/IntrinsicLowering.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/IRBuilder.h"
@@ -166,6 +174,17 @@ static cl::list<std::string> LibMapSpec(
              "'SDL_*=SDL2.dll'. <pattern>=<dll>, '*' matches any suffix; "
              "checked before the C runtime heuristic"),
     cl::value_desc("pattern=dll"));
+
+// The library a program links against. Unlike -msil-lib-map this names no
+// symbol: the exports are read from the library's own export table and a
+// module symbol matching one is bound to it, which is what a linker does.
+// Repeatable, and searched in the order given.
+static cl::list<std::string> LibSpec(
+    "msil-lib",
+    cl::desc("Bind imported symbols to this library if it exports them, e.g. "
+             "'ucrtbase.dll' or a path to one. The exports are read from the "
+             "file, so no symbol list is needed; searched in order"),
+    cl::value_desc("dll"));
 
 char MSILWriter::ID = 0;
 
@@ -3682,7 +3701,56 @@ bool isBuiltinSymbol(StringRef N) {
 }
 } // namespace
 
+// Read the export table of every -msil-lib. A name that is not a path is
+// resolved the way the platform loader would resolve it, so
+// `-msil-lib=user32.dll` finds the system copy without naming a directory.
+void MSILWriter::resolveLibExports() {
+  for (const std::string &Spec : LibSpec) {
+    std::string Path = Spec;
+    if (!sys::fs::exists(Path)) {
+      // shortcut: the system directory only, not the full loader search order
+      // (application directory, then PATH). Widen if a program needs it.
+      ErrorOr<std::string> Found =
+          sys::findProgramByName(Spec, {sys::path::get_separator().str() +
+                                        "Windows" +
+                                        sys::path::get_separator().str() +
+                                        "System32"});
+      if (!Found)
+        report_fatal_error(Twine("MSIL: -msil-lib could not find '") + Spec +
+                           "'");
+      Path = *Found;
+    }
+    Expected<object::OwningBinary<object::Binary>> BinOrErr =
+        object::createBinary(Path);
+    if (!BinOrErr)
+      report_fatal_error(Twine("MSIL: -msil-lib cannot read '") + Spec + "': " +
+                         toString(BinOrErr.takeError()));
+    object::Binary *Bin = BinOrErr->getBinary();
+    const object::ObjectFile *Obj = dyn_cast<object::ObjectFile>(Bin);
+    if (!Obj)
+      report_fatal_error(Twine("MSIL: -msil-lib '") + Spec +
+                         "' is not an object file with an export table");
+    const object::COFFObjectFile *Coff =
+        dyn_cast<object::COFFObjectFile>(Obj);
+    if (!Coff)
+      report_fatal_error(Twine("MSIL: -msil-lib '") + Spec +
+                         "' is not a COFF library (the CIL target imports from "
+                         "Windows DLLs)");
+    std::string Dll = sys::path::filename(Path).str();
+    // First library to export a symbol wins, so an earlier -msil-lib can
+    // shadow a later one exactly as an earlier -l would.
+    for (const object::ExportDirectoryEntryRef &E :
+         Coff->export_directories()) {
+      StringRef Name;
+      if (E.getSymbolName(Name) || Name.empty())
+        continue;
+      LibExports.try_emplace(Name.str(), Dll);
+    }
+  }
+}
+
 void MSILWriter::resolveLibcOptions() {
+  resolveLibExports();
   // `assembly:type`, or just `assembly` when a default type is given.
   auto Parse = [](StringRef Spec, StringRef DefaultType, StringRef Option) {
     ManagedType T;
@@ -4373,8 +4441,8 @@ void MSILWriter::printBuiltinLibc() {
 }
 
 StringRef MSILWriter::getLibraryFor(StringRef Symbol) {
-  // An explicit map wins over everything: it exists to name a DLL the CRT
-  // heuristic below has no way to know about.
+  // An explicit map wins over everything: it exists to name a DLL that neither
+  // the Win32 table nor the CRT heuristic has any way to know about.
   for (const auto &Pat : LibMap) {
     StringRef P = Pat.first;
     if (P.ends_with("*")) {
@@ -4384,7 +4452,20 @@ StringRef MSILWriter::getLibraryFor(StringRef Symbol) {
       return Pat.second;
     }
   }
+  if (!LibExports.empty()) {
+    StringRef Dll = getLibraryForExports(Symbol);
+    if (!Dll.empty())
+      return Dll;
+  }
   return getLibraryForCRT(Symbol);
+}
+
+// The exports of every library named with -msil-lib, bound to the module's
+// symbol by name. This is the linker's rule: a library that exports the symbol
+// takes it, in the order the libraries were given.
+StringRef MSILWriter::getLibraryForExports(StringRef Symbol) {
+  auto It = LibExports.find(Symbol);
+  return It == LibExports.end() ? StringRef() : It->second;
 }
 
 StringRef MSILWriter::getLibraryForCRT(StringRef Symbol) {

@@ -198,6 +198,8 @@ private:
   std::string getImportName(const Function *F) const;
   StringRef getLibraryFor(StringRef Symbol);
   StringRef getLibraryForCRT(StringRef Symbol);
+  StringRef getLibraryForExports(StringRef Symbol);
+  void resolveLibExports();
   void collectPInvokes();
   /// True when any type in \p M needs the Vector<T> assembly reference.
   bool vectorNeeded(Module &M);
@@ -313,6 +315,8 @@ private:
   std::map<std::pair<const Function *, std::string>, std::string> PInvokeNames;
   /// -msil-lib-map entries as (pattern, dll), parsed once per module.
   std::vector<std::pair<std::string, std::string>> LibMap;
+  /// Symbol -> library, read from each -msil-lib's export table.
+  StringMap<std::string> LibExports;
 
   /// Set by resolveLibcOptions; an empty Type means "use the CRT".
   ManagedType LibcType;
