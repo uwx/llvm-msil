@@ -150,8 +150,11 @@ jobs:
           chmod +x "$dest/ilasm$ext"
           # Fail here rather than at the first test if the binary cannot start.
           # With no arguments it prints its usage and exits nonzero, so the exit
-          # status is not the thing to test.
-          "$dest/ilasm$ext" 2>&1 | grep -q Usage
+          # status is not the thing to test. Capture to a file rather than
+          # piping: `grep -q` exits on its first match, and under the runner's
+          # `-o pipefail` the resulting SIGPIPE on ilasm fails the step.
+          "$dest/ilasm$ext" > "$RUNNER_TEMP/ilasm.out" 2>&1 || true
+          grep -q Usage "$RUNNER_TEMP/ilasm.out"
           echo "ILASM=$dest/ilasm$ext" >> "$GITHUB_ENV"
 
       - name: Configure
