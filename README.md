@@ -482,7 +482,9 @@ picks `.exe` output and the ilasm option spelling, writes the runtimeconfig and
 starts assemblies through `dotnet` on both hosts, and on Linux compiles the IR
 for glibc and non-PIC (an ELF clang's default PIC turns switch tables into
 `llvm.load.relative`, which IL has no equivalent of). Tests that need Windows —
-an SDL2.dll pinvoke, MSVC's CRT split — print `skipped` and exit 0 there.
+an SDL2.dll pinvoke, SDL3's win32 platform adapters — print `skipped` and exit
+0 there, and `fp80.sh` does the reverse, since its subject is a type only the
+ELF target has.
 
 `cbe_port.py` can be driven directly:
 
