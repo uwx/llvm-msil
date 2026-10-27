@@ -11,17 +11,30 @@ set -eu
 
 MSIL=${1:?usage: libc.sh <llvm-msil>}
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/../platform.sh"
 CLANG=${CLANG:-I:/Downloads/llvm-project-18.1.7/bin/clang.exe}
 ILASM=${ILASM:-/tmp/tools/ilasm-core.exe}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
+# printf and snprintf are C code in the portable library, so they are managed
+# vararg methods. CoreCLR on Linux rejects the vararg calling convention
+# outright (InvalidProgramException), so the library cannot run there at all.
+# Every integer-only printf still works on Windows.
+if [ "$MSIL_HOST" != windows ]; then
+  echo "libc: skipped (the portable printf is a managed vararg method)"
+  exit 0
+fi
+
 cp "$HERE/libc.c" "$TMP/libc.c"
 
 # Native build: the reference result. -fno-builtin so the compiler cannot turn
 # a test of printf into something else.
-"$CLANG" -O1 -w -fno-builtin -DMSIL_LIBC_NATIVE -o "$TMP/native.exe" "$TMP/libc.c"
-"$TMP/native.exe" | tr -d '\r' > "$TMP/want.txt"
+# The portable library is compiled for the Windows ABI, where long is 32 bits,
+# but the reference build uses the host's long. The two cases that compare
+# against LONG_MAX ask "did it saturate", not "to what", so both sides agree.
+"$CLANG" -O1 -w -fno-builtin -DMSIL_LIBC_NATIVE -o "$TMP/native$EXE" "$TMP/libc.c"
+"$TMP/native$EXE" | tr -d '\r' > "$TMP/want.txt"
 
 # %a/%A is the one conversion the C libraries do not agree on: MSVC pads to 13
 # fraction digits, musl (and so the port) prints the shortest exact form. That
@@ -39,13 +52,12 @@ grep -v '^hex floats\|^hex subnormal' "$TMP/want.txt" > "$TMP/want_nochex.txt"
 # enough.
 fail=0
 for O in 0 1 2 3; do
-  "$CLANG" -S -emit-llvm -O$O -w -fno-builtin -o "$TMP/libc$O.ll" "$TMP/libc.c"
-  "$MSIL" "$TMP/libc$O.ll" -o "$TMP/libc$O.il" -msil-libc=builtin
-  "$ILASM" -exe -quiet -output:"$TMP/libc$O.exe" "$TMP/libc$O.il"
-  # dotnet looks for a runtimeconfig named after the exe it is given.
-  printf '%s\n' '{"runtimeOptions":{"tfm":"net9.0","framework":{"name":"Microsoft.NETCore.App","version":"9.0.0"}}}' \
-    > "$TMP/libc$O.runtimeconfig.json"
-  if ! (cd "$TMP" && dotnet "libc$O.exe") 2>"$TMP/err$O.txt" | tr -d '\r' \
+  "$CLANG" $MSIL_CFLAGS -S -emit-llvm -O$O -w -fno-builtin \
+    -o "$TMP/libc$O.ll" "$TMP/libc.c"
+  "$MSIL" "$TMP/libc$O.ll" -o "$TMP/libc$O.il" -msil-libc=builtin $MSIL_CRT_ARGS
+  "$ILASM" $MSIL_ILASM_OPTS -output:"$TMP/libc$O$EXE" "$TMP/libc$O.il"
+  write_runtimeconfig "$TMP/libc$O"
+  if ! (cd "$TMP" && run_msil "libc$O$EXE") 2>"$TMP/err$O.txt" | tr -d '\r' \
        > "$TMP/got$O.txt"; then
     echo "libc: -O$O crashed" >&2
     head -20 "$TMP/err$O.txt" >&2

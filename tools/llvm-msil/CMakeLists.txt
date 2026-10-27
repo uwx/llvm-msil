@@ -1,6 +1,7 @@
 if (USE_SYSTEM_LLVM)
   add_executable(${MSIL_TOOL_TARGET} llvm-msil.cpp)
   set_target_properties(${MSIL_TOOL_TARGET} PROPERTIES OUTPUT_NAME llvm-msil)
+  llvm_update_compile_flags(${MSIL_TOOL_TARGET})
   target_link_libraries(${MSIL_TOOL_TARGET} PRIVATE
     ${MSIL_CODEGEN_TARGET} ${MSIL_INFO_TARGET}
     LLVMAnalysis LLVMAsmParser LLVMBitReader LLVMCodeGen LLVMCore

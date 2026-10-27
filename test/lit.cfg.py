@@ -33,6 +33,8 @@ if not getattr(config, "llvm_tools_dir", None):
         "llvm_tools_dir",
         os.environ.get("LLVM_TOOLS_DIR",
                        "/w/projects/llvm-cbe/llvm-project/llvm/build/build64/bin"))
+    # Non-Windows tools are never written with a drive letter, so the MSYS
+    # path rewrite below applies only there.
     if os.name == "nt" and re.match(r"^/[a-zA-Z]/", tools):
         tools = tools[1].upper() + ":\\" + tools[3:].replace("/", "\\")
     config.llvm_tools_dir = tools
