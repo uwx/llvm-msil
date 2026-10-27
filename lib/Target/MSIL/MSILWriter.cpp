@@ -74,6 +74,10 @@
 
 using namespace llvm;
 
+/// Whether -msil-fp80 asked for the lossy binary64 mapping. Defined with the
+/// other options below, but the type helpers here need it.
+bool fp80MappedToDouble();
+
 namespace {
 /// Render an IR type or constant for a diagnostic.
 template <typename T> std::string str(const T *V) {
@@ -97,6 +101,35 @@ bool isWideInt(Type *Ty) { return Ty->isIntegerTy(128); }
 /// Types that move with ldobj/stobj rather than ldind/stind.
 bool movesAsBlob(Type *Ty) {
   return Ty->isAggregateType() || Ty->isVectorTy() || isWideInt(Ty);
+}
+
+/// The value a floating-point constant is emitted as. With -msil-fp80 an
+/// x86_fp80 becomes binary64, so the rounding has to happen here, once: `ldc.r8`
+/// would otherwise read the 80-bit decimal and round it again, and the NaN and
+/// infinity bit-pattern path would write ten bytes where eight are expected.
+APFloat emittedFloat(const APFloat &V) {
+  // Semantics are compared by address everywhere in LLVM, since fltSemantics
+  // has no equality operator.
+  if (&V.getSemantics() != &APFloat::x87DoubleExtended() ||
+      !fp80MappedToDouble())
+    return V;
+  APFloat D = V;
+  bool LosesInfo;
+  D.convert(APFloat::IEEEdouble(), APFloat::rmNearestTiesToEven, &LosesInfo);
+  return D;
+}
+
+/// An intrinsic that inspects a float's bits works on a double when the type
+/// is a mapped x86_fp80: bitcasting the IR i80 would name an integer width IL
+/// has no type for. These two convert in and out, and cost nothing in the
+/// emitted IL because both slots are float64.
+Value *narrowF80(Value *X, IRBuilder<> &B) {
+  return X->getType()->isX86_FP80Ty() && fp80MappedToDouble()
+             ? B.CreateFPTrunc(X, B.getDoubleTy())
+             : X;
+}
+Value *widenF80(Value *V, Type *FTy, IRBuilder<> &B) {
+  return FTy->isX86_FP80Ty() && fp80MappedToDouble() ? B.CreateFPExt(V, FTy) : V;
 }
 
 /// Operators that are an IL opcode for scalars but a method call for i128.
@@ -245,6 +278,27 @@ static cl::list<std::string> LibSpec(
              "file, so no symbol list is needed; searched in order"),
     cl::value_desc("dll"));
 
+// `long double` on an x86 ELF target is x86_fp80, and the CLR has no 80-bit
+// float. Mapping it to binary64 is lossy in both directions: 53 mantissa bits
+// instead of 64, so a value round-trips changed, and 11 exponent bits instead
+// of 15, so a large one overflows to infinity. That is why it is opt-in.
+//
+// Only the value representation changes. An x86_fp80 stays 16 bytes in the
+// module's data layout, so struct member offsets, `sizeof` and pointer strides
+// keep saying what the native ABI says; each 16-byte slot holds an 8-byte
+// float64 and the rest is padding. Rewriting the type itself would instead
+// shrink those strides while C-level `sizeof` constants (already folded into
+// the IR) stayed 16, silently breaking array indexing.
+static cl::opt<std::string> Fp80Spec(
+    "msil-fp80",
+    cl::desc("Map x86_fp80 (long double on the x86 ELF target) to binary64 "
+             "instead of rejecting it. Lossy: 53 mantissa bits and 11 "
+             "exponent bits instead of 64 and 15"),
+    cl::value_desc("double"), cl::init(""));
+
+/// Whether -msil-fp80 asked for the lossy binary64 mapping.
+bool fp80MappedToDouble() { return Fp80Spec == "double"; }
+
 char MSILWriter::ID = 0;
 
 MSILWriter::MSILWriter(raw_pwrite_stream &Sink)
@@ -355,6 +409,13 @@ std::string MSILWriter::getAggregateName(Type *Ty) {
 }
 
 std::string MSILWriter::getTypeName(Type *Ty) {
+  // x86_fp80 has no IL type of its own; with -msil-fp80 it is a binary64
+  // value, and the enclosing 16-byte slot stays 16 bytes either way.
+  if (Ty->isX86_FP80Ty()) {
+    if (!fp80MappedToDouble())
+      report_fatal_error("MSIL: unsupported type " + Twine(str(Ty)));
+    return "float64";
+  }
   switch (Ty->getTypeID()) {
   case Type::VoidTyID:
     return "void";
@@ -500,6 +561,10 @@ StringRef memSuffixOf(Type *Ty) {
     return "r4";
   case Type::DoubleTyID:
     return "r8";
+  case Type::X86_FP80TyID:
+    if (fp80MappedToDouble())
+      return "r8";
+    break;
   default:
     break;
   }
@@ -757,7 +822,7 @@ void MSILWriter::printConstLoad(const Constant *C) {
   }
 
   if (const auto *FP = dyn_cast<ConstantFP>(C)) {
-    const APFloat &V = FP->getValueAPF();
+    const APFloat V = emittedFloat(FP->getValueAPF());
     SmallString<40> Str;
     // A NaN or an infinity has no decimal literal ilasm accepts, and its
     // hex form is silently read as zero; the bit-pattern form is the only one
@@ -1185,6 +1250,11 @@ void MSILWriter::printCastInstruction(unsigned Op, const Value *V, Type *Ty) {
     return;
   case Instruction::FPTrunc:
     printValueLoad(V);
+    // With -msil-fp80 an f80->f64 truncation is between two float64 slots and
+    // converts nothing; only a genuinely narrower destination needs conv.r4.
+    if (V->getType()->isX86_FP80Ty() && fp80MappedToDouble() &&
+        !Ty->isFloatTy())
+      return;
     out() << "\tconv.r4\n";
     return;
   default:
@@ -2189,6 +2259,11 @@ StringRef MSILWriter::interlockedTypeName(Type *Ty) {
     return "float32";
   case Type::DoubleTyID:
     return "float64";
+  // A mapped x86_fp80 is a binary64 value, so it uses the same overload. It
+  // would otherwise fall into the lock path, which is written for narrow
+  // integers.
+  case Type::X86_FP80TyID:
+    return fp80MappedToDouble() ? "float64" : StringRef();
   default:
     return "";
   }
@@ -3022,7 +3097,12 @@ bool MSILWriter::lowerLibmIntrinsic(CallInst *CI) {
   }
   Type *RetTy = CI->getType();
   Type *ArgTy = CI->getArgOperand(0)->getType();
-  if (!ArgTy->isFloatTy() && !ArgTy->isDoubleTy())
+  // Under -msil-fp80 an x86_fp80 is a binary64 value, so it must take the
+  // double spelling. IntrinsicLowering would otherwise pick the `l` one
+  // (`sqrtl`), whose SysV ABI passes an 80-bit x87 value the CLR cannot
+  // produce.
+  bool IsF80 = ArgTy->isX86_FP80Ty() && fp80MappedToDouble();
+  if (!ArgTy->isFloatTy() && !ArgTy->isDoubleTy() && !IsF80)
     return false;
   const char *Name = ArgTy->isFloatTy() ? F32 : F64;
   // The C symbol takes the intrinsic's own operands, which is one argument
@@ -3248,7 +3328,7 @@ bool MSILWriter::lowerExpandedIntrinsic(CallInst *CI) {
     // 4 nsubnormal, 5 nzero, 6 pzero, 7 psubnormal, 8 pnormal, 9 pinf.
     // sNaN cannot be distinguished from qNaN without inspecting the
     // mantissa, so both NaN bits answer the same test.
-    Value *X = CI->getArgOperand(0);
+    Value *X = narrowF80(CI->getArgOperand(0), B);
     Type *FTy = X->getType();
     APInt M = cast<ConstantInt>(CI->getArgOperand(1))->getValue();
     auto Has = [&](unsigned Bit) { return M[Bit]; };
@@ -3291,7 +3371,7 @@ bool MSILWriter::lowerExpandedIntrinsic(CallInst *CI) {
       if (Has(8)) Add(B.CreateAnd(IsNormal, NotNeg));
       if (Has(9)) Add(B.CreateAnd(IsInf, NotNeg));
     }
-    CI->replaceAllUsesWith(R);
+    CI->replaceAllUsesWith(widenF80(R, CI->getType(), B));
     CI->eraseFromParent();
     return true;
   }
@@ -3629,13 +3709,15 @@ void MSILWriter::lowerIntrinsics(Function &F) {
       case Intrinsic::fabs: {
         // Clear the sign bit; a compare-and-negate would be wrong for NaN.
         IRBuilder<> B(CI);
-        Value *X = CI->getArgOperand(0);
+        Value *Orig = CI->getArgOperand(0);
+        Value *X = narrowF80(Orig, B);
         Type *IT = B.getIntNTy(X->getType()->getPrimitiveSizeInBits());
         Value *Bits = B.CreateBitCast(X, IT);
         Value *Mask = ConstantInt::get(
             IT, APInt::getSignedMaxValue(IT->getIntegerBitWidth()));
-        CI->replaceAllUsesWith(B.CreateBitCast(
-            B.CreateAnd(Bits, Mask), X->getType()));
+        CI->replaceAllUsesWith(widenF80(
+            B.CreateBitCast(B.CreateAnd(Bits, Mask), X->getType()),
+            Orig->getType(), B));
         CI->eraseFromParent();
         break;
       }
@@ -4269,6 +4351,10 @@ void MSILWriter::resolveLibExports() {
 }
 
 void MSILWriter::resolveLibcOptions() {
+  // Only one mapping exists, so a typo must not silently leave the default.
+  if (!Fp80Spec.empty() && Fp80Spec != "double")
+    report_fatal_error("MSIL: -msil-fp80 only knows 'double', got '" +
+                       Twine(Fp80Spec) + "'");
   resolveLibExports();
   // `assembly:type`, or just `assembly` when a default type is given.
   auto Parse = [](StringRef Spec, StringRef DefaultType, StringRef Option) {
@@ -4349,7 +4435,10 @@ bool MSILWriter::getManagedTarget(const Function *F, ManagedType &Out) const {
 bool MSILWriter::getMathTarget(StringRef Symbol, Type *Ty,
                                ManagedType &Out) const {
   bool IsF32 = Ty->isFloatTy();
-  if (!IsF32 && !Ty->isDoubleTy())
+  // A linked `floorl` returns x86_fp80 under -msil-fp80, which is a binary64
+  // value in the emitted IL, so it takes the double member like any other.
+  bool IsF80 = Ty->isX86_FP80Ty() && fp80MappedToDouble();
+  if (!IsF32 && !Ty->isDoubleTy() && !IsF80)
     return false;
 
   // C name -> Math/MathF member. Where the C name is already the managed one,
@@ -4369,9 +4458,13 @@ bool MSILWriter::getMathTarget(StringRef Symbol, Type *Ty,
       // which is exact and cheaper than a call.)
       {"rint", "Round"}, {"nearbyint", "Round"}, {"roundeven", "Round"},
   };
-  // The C names carry an `f` suffix on the float spelling.
+  // The C names carry an `f` suffix on the float spelling, and an `l` one on
+  // the long double spelling the ELF front end emits (`floorl`). Under
+  // -msil-fp80 that value is a binary64, so the double member is the match.
   StringRef Base = Symbol;
   if (IsF32 && Base.ends_with("f") && Base != "fabs" && !Members.count(Base))
+    Base = Base.drop_back();
+  if (IsF80 && Base.ends_with("l") && !Members.count(Base))
     Base = Base.drop_back();
 
   auto It = Members.find(Base);
@@ -5160,6 +5253,27 @@ StringRef MSILWriter::getLibraryForCRT(StringRef Symbol) {
   return "msvcrt.dll";
 }
 
+/// True when \p Ty is or contains an x86_fp80.
+static bool mentionsF80(Type *Ty) {
+  if (Ty->isX86_FP80Ty())
+    return true;
+  if (auto *FTy = dyn_cast<FunctionType>(Ty)) {
+    if (mentionsF80(FTy->getReturnType()))
+      return true;
+    for (Type *P : FTy->params())
+      if (mentionsF80(P))
+        return true;
+    return false;
+  }
+  if (auto *STy = dyn_cast<StructType>(Ty))
+    for (Type *E : STy->elements())
+      if (mentionsF80(E))
+        return true;
+  if (auto *ATy = dyn_cast<ArrayType>(Ty))
+    return mentionsF80(ATy->getElementType());
+  return false;
+}
+
 void MSILWriter::collectPInvokes() {
   for (Function &F : *Mod) {
     if (!F.isDeclaration() || F.isIntrinsic())
@@ -5171,6 +5285,23 @@ void MSILWriter::collectPInvokes() {
       auto *CB = dyn_cast<CallBase>(U);
       if (!CB)
         continue;
+      // A vararg external is always a pinvoke (getManagedTarget refuses a
+      // vararg signature), and SysV passes a long double on the stack where
+      // the narrowed float64 would go in an SSE register: the callee reads
+      // the wrong bytes. printf("%Lf") is the common way to hit this.
+      if (fp80MappedToDouble()) {
+        bool F80 = mentionsF80(FTy->getReturnType());
+        for (Type *P : FTy->params())
+          F80 |= mentionsF80(P);
+        for (const Value *A : CB->args())
+          F80 |= mentionsF80(A->getType());
+        if (F80)
+          report_fatal_error(
+              "MSIL: external '" + F.getName() +
+              "' is called with an x86_fp80 argument or result, which "
+              "-msil-fp80=double cannot narrow across a pinvoke boundary; "
+              "convert to double at the call site");
+      }
       // The same normalization the call site will use, or the key would not
       // match and the call would name a thunk that was never emitted.
       bool Portable = EmitPortable && isPortableLibcSymbol(getCName(&F));
@@ -5213,6 +5344,18 @@ void MSILWriter::printExternals() {
       printManagedForwarder(&F, T, Name);
       return;
     }
+    // With -msil-fp80 the type is narrowed to binary64, but the symbol is a
+    // real long-double function: an 80-bit x87 argument and return cannot be
+    // satisfied by an 8-byte SSE signature, so the pinvoke would return wrong
+    // numbers rather than fail. Only a System.Math binding is safe, since that
+    // is a managed method with the narrowed signature. Anything else is a
+    // diagnostic, which is the point of the flag being opt-in and honest.
+    if (fp80MappedToDouble() &&
+        mentionsF80(F.getFunctionType()))
+      report_fatal_error(
+          "MSIL: external '" + F.getName() +
+          "' takes or returns x86_fp80 and has no System.Math binding, so "
+          "-msil-fp80=double cannot narrow its pinvoke safely");
     out() << ".method public static hidebysig pinvokeimpl(\""
         << getLibraryFor(F.getName()) << "\" as \"" << getImportName(&F)
         << "\" cdecl) "
@@ -5309,11 +5452,17 @@ void MSILWriter::printStaticConstant(const Constant *C, uint64_t &Offset,
     return Add("int64 (" + Val + ")", 8);
   }
   if (const auto *FP = dyn_cast<ConstantFP>(C)) {
-    uint64_t Bits = FP->getValueAPF().bitcastToAPInt().getZExtValue();
-    return Add(Ty->isFloatTy()
-                   ? "int32 (" + std::to_string((uint32_t)Bits) + ")"
-                   : "int64 (" + std::to_string(Bits) + ")",
-               Ty->isFloatTy() ? 4 : 8);
+    // -msil-fp80 stores the narrowed binary64 bits in the low half of the
+    // member's 16-byte slot, then pads: the template has to be as long as the
+    // class ilasm sizes it against, or the field and the blob disagree.
+    uint64_t Start = Offset;
+    uint64_t Bits = emittedFloat(FP->getValueAPF()).bitcastToAPInt().getZExtValue();
+    Add(Ty->isFloatTy()
+            ? "int32 (" + std::to_string((uint32_t)Bits) + ")"
+            : "int64 (" + std::to_string(Bits) + ")",
+        Ty->isFloatTy() ? 4 : 8);
+    PadTo(Start + DL->getTypeAllocSize(Ty).getFixedValue());
+    return;
   }
   if (isa<ConstantPointerNull>(C))
     return Add("int64 (0)", 8);

@@ -128,6 +128,7 @@ built for the other, which is why the libc is built twice (see below).
 | `-msil-alloc=<asm>:<type>` | Route `malloc`/`free`/`calloc`/`realloc` to methods of that name on your type, so unmanaged allocations can be instrumented. |
 | `-msil-math=0` | Do not bind libm to `System.Math`/`System.MathF`; pinvoke the CRT instead. |
 | `-msil-lib-map='SDL_*=SDL2.dll'` | Bind matching imports to a native library. `*` matches any suffix, and the option repeats. |
+| `-msil-fp80=double` | Map `x86_fp80` (`long double` on the x86 ELF target) to binary64 instead of rejecting it. Lossy: 53 mantissa bits and an 11-bit exponent instead of 64 and 15, so a value round-trips changed or overflows to infinity. The 16-byte slot, the field offsets and `sizeof` are unchanged; only the value stored in the slot is a `float64`. A long-double libm call with no `System.Math` binding, or a `long double` passed through a vararg, is rejected by name rather than pinvoked with a mismatched signature. |
 
 ## How types map
 
@@ -138,6 +139,7 @@ built for the other, which is why the libc is built twice (see below).
 | `i33` ... `i64` | `int64` |
 | `i128` | `System.Int128` from `System.Runtime` |
 | `float`, `double` | `float32`, `float64` |
+| `x86_fp80` | rejected, unless `-msil-fp80=double`: then a `float64` value in the same 16-byte slot |
 | pointers | unmanaged `void*` |
 | structs, arrays | explicit-layout value classes (`valuetype`, byte-exact `.size`) |
 | a vector one SIMD register wide | `System.Numerics.Vector<T>` |
@@ -520,14 +522,29 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   passes only the fixed arguments, and some runtimes reject `calli vararg`
   outright. The instruction is emitted as a plain `calli`, which is the same
   call.
-* **Two constructs only an ELF clang emits are unsupported.** `long double` is
-  `x86_fp80` there (MSVC's is `double`), which the writer rejects as an
-  unsupported memory type; and an ELF C++ vtable holds `ptrtoint` function
-  addresses as constant expressions, which the constant writer does not fold.
-  `cbe_port.py` reports the tests that need either as skipped rather than
-  failed, matching on the backend's own error message so it cannot hide a
-  different failure. `llvm.global_ctors` (`__attribute__((constructor))`) is
-  supported: those run from `$MSIL_Startup` before `main`.
+* **`long double` needs a flag on the ELF target, and is then lossy.** It is
+  `x86_fp80` there (MSVC's is `double`), and the CLR has no 80-bit float, so
+  the writer rejects it by default. `-msil-fp80=double` maps the value to
+  binary64, which preserves the program's structure but not its precision:
+  53 mantissa bits instead of 64, so a result can round, and an 11-bit exponent
+  instead of 15, so a value that fits a `long double` can overflow to infinity.
+  The layout does not change — an `x86_fp80` keeps its 16-byte slot, so struct
+  offsets, `sizeof` and array strides still match the native ABI; the upper 8
+  bytes of the slot are padding. Library calls the front end spells `sqrtl`,
+  `floorl` and so on bind through the double spelling for the same reason.
+  Anything that stays an external call is refused instead: a long-double libm
+  function with no `System.Math` equivalent (`frexpl`, `modfl`, `nextafterl`,
+  ...) and a `long double` passed through a vararg (`printf("%Lf", x)`) would
+  become a pinvoke whose narrowed signature no longer matches the real x87
+  one, which returns a wrong number rather than failing. Convert to `double`
+  at the call site; the writer names the symbol in the error.
+* **One ELF-only construct is still unsupported.** An ELF C++ vtable holds
+  `ptrtoint` function addresses as constant expressions, which the constant
+  writer does not fold. `cbe_port.py` reports the tests that need it as skipped
+  rather than failed, matching on the backend's own error message so it cannot
+  hide a different failure. `llvm.global_ctors`
+  (`__attribute__((constructor))`) is supported: those run from `$MSIL_Startup`
+  before `main`.
 * **`<N x i128>` vectors are broken.** The aggregate class has no valid IL type
   name, so the output does not assemble. There is a `report_fatal_error` on
   element extract/insert, but a vector-typed parameter or return reaches the
