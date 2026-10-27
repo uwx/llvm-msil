@@ -50,7 +50,10 @@ static ullong scan(const char *s, char **endp, int base, ullong lim,
     if ((c | 32) == 'x') {
       p++;
       c = (unsigned char)*p;
-      if (digitval(c) >= 16) {
+      /* musl's table spells a non-digit 255, so its `>= 16` catches both an
+       * over-base digit and no digit at all; this port's digitval returns -1
+       * for that, and -1 >= 16 is false. Both halves are needed. */
+      if (digitval(c) < 0 || digitval(c) >= 16) {
         /* "0x" with no digits is just the leading 0: consume one, not two. */
         p--;
         if (endp)

@@ -523,6 +523,45 @@ std::string MSILWriter::getMemSuffix(Type *Ty) {
   return memSuffixOf(Ty).str();
 }
 
+// A vararg definition is emitted as an ordinary method with a fixed
+// parameter list: the declared parameters, then one `void*` for a buffer of
+// trailing arguments. CoreCLR on Linux refuses a `vararg` method outright, and
+// refuses any method that merely *refers* to one -- a `call` or even an
+// `ldftn` makes the JIT reject the referring method with
+// `InvalidProgramException: Vararg calling convention not supported` -- so no
+// `vararg` method is emitted at all and the call sites build the buffer.
+//
+// The buffer holds one 8-byte slot per trailing argument: an integer widened
+// to int64, a float as its int64 bit pattern, a pointer as its address. Each
+// slot is read back as int64, which is the normalization the portable
+// library's accessors already assume, so its C does not change.
+bool MSILWriter::isEmittedVarArgDef(const Function *F) {
+  return F && F->isVarArg() && !F->isDeclaration();
+}
+
+// Windows' va_list *is* the cursor. On ELF the front end declares a
+// __va_list_tag whose fields are gp_offset, fp_offset, overflow_arg_area and
+// reg_save_area; va_start below forces every argument down the overflow path,
+// so both triples advance the same 8-byte slots.
+bool MSILWriter::vaIsTag() const {
+  return Triple(Mod->getTargetTriple()).isOSBinFormatELF();
+}
+
+uint64_t MSILWriter::vaSlotSize() const { return vaIsTag() ? 24 : 8; }
+
+// Leave the va_list's cursor (the address of the next slot) on the stack.
+// \p Ptr is a pointer to the va_list. On Windows that pointer is the cursor's
+// own address, so one load reads it. On ELF it points at the __va_list_tag
+// itself (va_start wrote the tag there, not a pointer to it), and the cursor
+// is the tag's overflow_arg_area at offset 8.
+void MSILWriter::printVaCursor(const Value *Ptr) {
+  printValueLoad(Ptr);
+  if (vaIsTag()) {
+    out() << "\tldc.i8\t8\n\tadd\n";
+  }
+  out() << "\tldind.i\n";
+}
+
 // The Windows x64 calling convention passes a vararg floating-point value in
 // both its SSE slot and a general-purpose slot, and the CRT's va_arg reads the
 // general-purpose one. The CLR does not duplicate, so such arguments cross the
@@ -537,10 +576,10 @@ std::string MSILWriter::getVarArgTypeName(Type *Ty) {
                                                : getTypeName(Ty);
 }
 
-// Calls into the portable library normalize every vararg so the callee can
-// read it back through System.ArgIterator, which matches on the exact CLR
-// type. It has to be the same normalization everywhere: whether a call reaches
-// the library directly or through a declaration the link resolves, the IL
+// Calls into the portable library normalize every vararg into the slot types
+// its seam accessors read back: one int64 per slot, an address for a pointer.
+// It has to be the same normalization everywhere: whether a call reaches the
+// library directly or through a declaration the link resolves, the IL
 // signature the call site names must agree with the callee's.
 std::string MSILWriter::getPortableVarArgTypeName(Type *Ty) {
   if (Ty->isPointerTy())
@@ -555,24 +594,32 @@ bool MSILWriter::callsPortableLibc(const Function *Callee) const {
          isPortableLibcSymbol(getCName(Callee));
 }
 
+// \p VarArgDef says the name denotes a vararg definition this module emits in
+// buffer form (see isEmittedVarArgDef): its signature is then the fixed
+// parameters plus one `void*` for the buffer, and no `vararg` marker.
 std::string MSILWriter::getCallSignature(FunctionType *FTy, const CallBase *CB,
-                                         StringRef Name, bool PortableVarArgs) {
+                                         StringRef Name, bool PortableVarArgs,
+                                         bool VarArgDef) {
   std::string Sig;
-  if (FTy->isVarArg())
+  if (FTy->isVarArg() && !VarArgDef)
     Sig += "vararg ";
   Sig += getTypeName(FTy->getReturnType());
   Sig += " ";
   Sig += Name.str();
   Sig += "(";
-  for (unsigned I = 0, E = FTy->getNumParams(); I != E; ++I) {
+  unsigned Fixed = FTy->getNumParams();
+  for (unsigned I = 0; I != Fixed; ++I) {
     if (I)
       Sig += ", ";
     Sig += getTypeName(FTy->getParamType(I));
   }
-  // A vararg call site must name the trailing argument types: the CLR needs
-  // them to know how many bytes the callee pops.
-  if (FTy->isVarArg() && CB) {
-    unsigned Fixed = FTy->getNumParams();
+  if (VarArgDef) {
+    if (Fixed)
+      Sig += ", ";
+    Sig += "void*";
+  } else if (FTy->isVarArg() && CB) {
+    // A vararg call site must name the trailing argument types: the CLR needs
+    // them to know how many bytes the callee pops.
     if (CB->arg_size() > Fixed) {
       Sig += ", ..., ";
       for (unsigned I = Fixed, E = CB->arg_size(); I != E; ++I) {
@@ -604,10 +651,18 @@ void MSILWriter::printValueLoad(const Value *V) {
       out() << "\tldsfld\tvoid* '" << GV->getName() << "'\n";
     return;
   }
-  if (const auto *F = dyn_cast<Function>(V)) {
+  if (const auto *Fn = dyn_cast<Function>(V)) {
+    // The buffer-form signature describes how *this* module calls the
+    // definition; a `calli` through the pointer would name its own signature
+    // and get the arguments wrong. Nothing that reaches here can pass the
+    // buffer, so say so rather than emit a method that faults.
+    if (isEmittedVarArgDef(Fn))
+      report_fatal_error("MSIL: cannot take the address of vararg function '" +
+                         Fn->getName() +
+                         "'; call it directly instead");
     out() << "\tldftn\t"
-        << getCallSignature(F->getFunctionType(), nullptr,
-                            "'" + getValueName(F) + "'")
+        << getCallSignature(Fn->getFunctionType(), nullptr,
+                            "'" + getValueName(Fn) + "'")
         << "\n";
     return;
   }
@@ -1530,31 +1585,59 @@ void MSILWriter::printWideICmp(unsigned Pred, const Value *L, const Value *R) {
 //===----------------------------------------------------------------------===//
 
 void MSILWriter::printIntrinsicCall(const IntrinsicInst *II) {
-  // printFunctions assigned a slot for every va_list before emission.
-  auto ArgIter = [&](const Value *V) { return ArgIterators.lookup(V); };
-
   switch (II->getIntrinsicID()) {
   case Intrinsic::vastart: {
-    // va_start is void: initialize the ArgIterator and store its address
-    // back into the va_list the front end allocated.
-    std::string Name = ArgIter(II->getArgOperand(0));
-    out() << "\tldloca\t'" << Name << "'\n";
-    out() << "\targlist\n";
-    out() << "\tcall\tinstance void "
-           "[mscorlib]System.ArgIterator::.ctor("
-           "valuetype [mscorlib]System.RuntimeArgumentHandle)\n";
-    printValueLoad(II->getArgOperand(0));
-    out() << "\tldloca\t'" << Name << "'\n\tconv.u8\n\tstind.i\n";
+    // va_start fills the va_list slot the front end allocated so the C that
+    // follows reads the trailing arguments the same way on both ABIs.
+    //
+    // The trailing arguments arrive as the last parameter, a pointer to a
+    // buffer of 8-byte slots (see isEmittedVarArgDef). On Windows the slot is
+    // the cursor, so it gets that pointer. On ELF the slot is a
+    // __va_list_tag and every argument is forced down the overflow path --
+    // gp_offset past its limit, fp_offset past its limit, so the front end's
+    // own va_arg takes overflow_arg_area every time -- and that field gets
+    // the pointer. Both then advance 8 bytes for every read.
+    if (!F->isVarArg())
+      report_fatal_error("MSIL: va_start in a non-vararg function");
+    // The buffer is the method's last parameter, appended to the declared
+    // ones; IR arguments do not include it.
+    auto Field = [&](uint64_t Offset) {
+      printValueLoad(II->getArgOperand(0));
+      if (Offset)
+        out() << "\tldc.i8\t" << Offset << "\n\tadd\n";
+    };
+    auto Buffer = [&] { out() << "\tldarg\t'$va_args'\n\tconv.u\n"; };
+    if (vaIsTag()) {
+      // overflow_arg_area is field 2, at offset 8: the buffer of slots.
+      Field(8);
+      Buffer();
+      out() << "\tstind.i\n";
+      // gp_offset (field 0) and fp_offset (field 1) past their limits, which
+      // is what makes the front end's own va_arg take the stack path every
+      // time, so both triples advance the same 8-byte slots.
+      Field(0);
+      out() << "\tldc.i4\t48\n\tstind.i4\n";
+      Field(4);
+      out() << "\tldc.i4\t304\n\tstind.i4\n";
+    } else {
+      // The slot *is* the cursor.
+      Field(0);
+      Buffer();
+      out() << "\tstind.i\n";
+    }
     return;
   }
   case Intrinsic::vaend:
     return;
   case Intrinsic::vacopy: {
-    std::string Dst = ArgIter(II->getArgOperand(0));
-    // The source is a va_list pointer; copy the struct it points at.
+    // The destination is the va_list the front end allocated; the source is a
+    // pointer to one. A va_list here is plain memory (a cursor on Windows, a
+    // __va_list_tag on ELF), so the copy is byte for byte. Copying the tag
+    // rather than sharing it is what makes `va_list a = b` independent, which
+    // is the C rule.
+    printValueLoad(II->getArgOperand(0));
     printValueLoad(II->getArgOperand(1));
-    out() << "\tldobj\tvaluetype [mscorlib]System.ArgIterator\n";
-    out() << "\tstloc\t'" << Dst << "'\n";
+    out() << "\tldc.i4\t" << vaSlotSize() << "\n\tcpblk\n";
     return;
   }
   default: {
@@ -1573,53 +1656,94 @@ void MSILWriter::printIntrinsicCall(const IntrinsicInst *II) {
   }
 }
 
+// How a trailing vararg crosses: the one CLR type both the callee's read and
+// the pinvoke thunk agree on. See getPortableVarArgTypeName and
+// getVarArgTypeName; a definition this module emits reads every slot back as
+// int64, so its own calls normalize the same way.
+void MSILWriter::printVarArgValue(const Value *Arg, bool Portable,
+                                  bool AsSlot) {
+  Type *Ty = Arg->getType();
+  printValueLoad(Arg);
+  if (Ty->isFloatingPointTy() && (AsSlot || getVarArgTypeName(Ty) == "int64")) {
+    // A slot is 8 bytes, and C's default promotions make a float vararg a
+    // double before it reaches the IR; widen one that somehow did not, so the
+    // read below does not take four bytes of neighbouring memory.
+    if (AsSlot && Ty->isFloatTy())
+      out() << "\tconv.r8\n";
+    Type *ITy = AsSlot ? Type::getDoubleTy(Mod->getContext()) : Ty;
+    // Reinterpret, do not convert. Storing an r8 into an int64 local through
+    // stloc *converts* it, so go through memory instead: the bits of the
+    // local are what the callee reads.
+    std::string Tmp = newTempLocal(ITy);
+    out() << "\tstloc\t'" << Tmp << "'\n\tldloca\t'" << Tmp
+          << "'\n\tconv.u8\n\tldind.i8\n";
+    return;
+  }
+  if ((Portable || AsSlot) && Ty->isIntegerTy()) {
+    // Normalize to the declared width first so the sign is right, then widen.
+    // A narrow vararg arrives zero-extended, and conv.i8 alone would take
+    // that as the value.
+    unsigned Bits = Ty->getIntegerBitWidth();
+    out() << '\t' << widthConv(Ty) << '\n';
+    if (Bits < 32) {
+      // Sign-extend from the declared width: a narrow vararg arrives
+      // zero-extended, and conv.i8 alone would take that at face value.
+      out() << "\tconv.i" << Bits << "\n";
+    }
+    if (Bits <= 32)
+      out() << "\tconv.i8\n";
+  }
+}
+
+// A call to a vararg definition this module emits takes a pointer to a buffer
+// of trailing arguments instead of the arguments themselves (see
+// isEmittedVarArgDef). The buffer lives in a local: a `localloc` would put it
+// in the caller's frame only until the call returns, which is enough, but a
+// local array is simpler and the CLR zero-initializes it. Every slot is one
+// int64, so the buffer is `int64[n]`.
+void MSILWriter::printVarArgBuffer(const CallBase *CB) {
+  unsigned Fixed = CB->getFunctionType()->getNumParams();
+  unsigned N = varArgSlots(CB);
+  Type *I64 = Type::getInt64Ty(Mod->getContext());
+  std::string Buf = newTempLocal(ArrayType::get(I64, N));
+
+  for (unsigned I = Fixed, E = CB->arg_size(); I != E; ++I) {
+    out() << "\tldloca\t'" << Buf << "'\n\tconv.u8\n";
+    if (I - Fixed)
+      out() << "\tldc.i8\t" << (I - Fixed) * 8 << "\n\tadd\n";
+    printVarArgValue(CB->getArgOperand(I), /*Portable=*/false,
+                     /*AsSlot=*/true);
+    out() << "\tstind.i8\n";
+  }
+  out() << "\tldloca\t'" << Buf << "'\n\tconv.u\n";
+}
+
 void MSILWriter::printFunctionCall(const Value *FnVal, const CallBase *CB) {
   FunctionType *FTy = CB->getFunctionType();
-  const Function *Callee = dyn_cast<Function>(FnVal);
+  // A direct call may name the callee through a bitcast; the definition is
+  // what decides whether it takes a buffer.
+  const Function *Callee =
+      dyn_cast<Function>(FnVal->stripPointerCasts());
+  bool EmittedDef = isEmittedVarArgDef(Callee);
 
-  // Arguments must reach the callee as its signature declares them. For a
-  // vararg call the trailing ones need two kinds of fixing:
-  //
-  //  - a float crosses as its int64 bit pattern (see getVarArgTypeName), for
-  //    the CRT's shadow-slot convention;
-  //  - a call into the portable library widens every integer to int64 too,
-  //    because there the arg is read back through System.ArgIterator, which
-  //    matches on the exact CLR type and cannot know whether the C default
-  //    promotions made this one an int or a long.
+  // Arguments must reach the callee as its signature declares them. A call to
+  // an emitted vararg definition replaces its trailing arguments with the
+  // buffer, so only the fixed ones are pushed here.
   unsigned Fixed = FTy->getNumParams();
   // Decided from the call site, not the callee: after a front-end wrapper is
   // dropped the operand is a declaration, and the name is what says which
   // library the call belongs to.
   bool Portable = EmitPortable && Callee && !Callee->isIntrinsic() &&
                   isPortableLibcSymbol(getCName(Callee));
-  for (unsigned I = 0, E = CB->arg_size(); I != E; ++I) {
-    const Value *Arg = CB->getArgOperand(I);
-    Type *Ty = Arg->getType();
-    printValueLoad(Arg);
-    if (!FTy->isVarArg() || I < Fixed)
-      continue;
-    if (Ty->isFloatingPointTy() && getVarArgTypeName(Ty) == "int64") {
-      // Reinterpret, do not convert. Storing an r8 into an int64 local through
-      // stloc *converts* it, so go through memory instead: the bits of the
-      // local are what the callee's va_arg reads.
-      std::string Tmp = newTempLocal(Ty);
-      out() << "\tstloc\t'" << Tmp << "'\n\tldloca\t'" << Tmp
-            << "'\n\tconv.u8\n\tldind.i8\n";
-    } else if (Portable && Ty->isIntegerTy()) {
-      // Normalize to the declared width first so the sign is right, then
-      // widen. A narrow vararg arrives zero-extended, and conv.i8 alone would
-      // take that as the value.
-      unsigned Bits = Ty->getIntegerBitWidth();
-      out() << '\t' << widthConv(Ty) << '\n';
-      if (Bits < 32) {
-        // Sign-extend from the declared width: a narrow vararg arrives
-        // zero-extended, and conv.i8 alone would take that at face value.
-        out() << "\tconv.i" << Bits << "\n";
-      }
-      if (Bits <= 32)
-        out() << "\tconv.i8\n";
-    }
+  unsigned E = EmittedDef ? Fixed : CB->arg_size();
+  for (unsigned I = 0; I != E; ++I) {
+    if (!EmittedDef && FTy->isVarArg() && I >= Fixed)
+      printVarArgValue(CB->getArgOperand(I), Portable, /*AsSlot=*/false);
+    else
+      printValueLoad(CB->getArgOperand(I));
   }
+  if (EmittedDef)
+    printVarArgBuffer(CB);
 
   if (!Callee) {
     // Indirect call: the target sits above the arguments on the stack.
@@ -1667,7 +1791,8 @@ void MSILWriter::printFunctionCall(const Value *FnVal, const CallBase *CB) {
   }
 
   out() << "\tcall\t"
-      << getCallSignature(FTy, CB, getFunctionRef(Callee), Portable) << '\n';
+      << getCallSignature(FTy, CB, getFunctionRef(Callee), Portable,
+                          EmittedDef) << '\n';
 }
 
 void MSILWriter::printCallInstruction(const CallBase *CB) {
@@ -2506,17 +2631,33 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     printCallInstruction(cast<CallBase>(Inst));
     return;
   case Instruction::VAArg: {
-    // The va_list is an unmanaged pointer to the ArgIterator. `call instance`
-    // needs a managed pointer, so route it through a byref local.
-    std::string Ref = "var" + utostr(getUniqID());
-    ExtraLocals.push_back({"valuetype [mscorlib]System.ArgIterator&", Ref});
+    // Front ends expand va_arg into plain IR for the triples this backend
+    // targets (clang does on x86-64), so this is the fallback for any that
+    // leaves the instruction in. The front end's own va_arg then reads the
+    // tag or cursor directly, not this.
+    //
+    // A slot is one 8-byte CLR value whatever the C type, so read int64 and
+    // let the local's type reinterpret it -- the same bits printVarArgBuffer
+    // wrote. The cursor sits inside the caller's va_list, which has to be
+    // advanced in place (the accessors do the same).
+    std::string Tag = newTempLocal(Type::getInt64Ty(Mod->getContext()));
+    std::string Cursor = newTempLocal(Type::getInt64Ty(Mod->getContext()));
     printValueLoad(Op0);
-    out() << "\tstloc\t'" << Ref << "'\n";
-    out() << "\tldloc\t'" << Ref << "'\n";
-    out() << "\tcall\tinstance typedref "
-           "[mscorlib]System.ArgIterator::GetNextArg()\n";
-    out() << "\trefanyval\t" << getTypeName(Ty) << "\n";
-    out() << "\tldind." << getMemSuffix(Ty) << '\n';
+    out() << "\tstloc\t'" << Tag << "'\n";
+    if (vaIsTag()) {
+      out() << "\tldloc\t'" << Tag << "'\n\tldc.i8\t8\n\tadd\n";
+    } else {
+      out() << "\tldloc\t'" << Tag << "'\n";
+    }
+    out() << "\tldind.i\n\tstloc\t'" << Cursor << "'\n";
+    if (vaIsTag())
+      out() << "\tldloc\t'" << Tag << "'\n\tldc.i8\t8\n\tadd\n";
+    else
+      out() << "\tldloc\t'" << Tag << "'\n";
+    out() << "\tldloc\t'" << Cursor << "'\n\tldc.i8\t8\n\tadd\n\tstind.i\n";
+    out() << "\tldloc\t'" << Cursor << "'\n\tldind.i8\n";
+    std::string Val = newTempLocal(Ty);
+    out() << "\tstloc\t'" << Val << "'\n\tldloc\t'" << Val << "'\n";
     return;
   }
   case Instruction::ExtractElement: {
@@ -2708,14 +2849,24 @@ void MSILWriter::printFunction(const Function &F) {
     }
   MaxOperands += 8;
 
+  // A vararg definition is emitted with a fixed signature: its declared
+  // parameters, then the buffer of trailing arguments as a `void*`. Emitting
+  // it as `vararg` would make CoreCLR on Linux reject every method that names
+  // it, including its own callers.
+  bool VarArgDef = isEmittedVarArgDef(&F);
   out() << "\n.method static " << (F.hasLocalLinkage() ? "private " : "public ")
-      << "hidebysig " << (FTy->isVarArg() ? "vararg " : "")
-      << getTypeName(F.getReturnType()) << " '" << getValueName(&F) << "'(";
+      << "hidebysig ";
+  out() << getTypeName(F.getReturnType()) << " '" << getValueName(&F) << "'(";
   for (unsigned I = 0, E = FTy->getNumParams(); I != E; ++I) {
     if (I)
       out() << ", ";
     out() << getTypeName(FTy->getParamType(I)) << " '"
         << getValueName(F.getArg(I)) << "'";
+  }
+  if (VarArgDef) {
+    if (FTy->getNumParams())
+      out() << ", ";
+    out() << "void* '$va_args'";
   }
   out() << ") cil managed\n{\n";
 
@@ -2790,53 +2941,28 @@ void MSILWriter::printFunction(const Function &F) {
 }
 
 void MSILWriter::printFunctions() {
-  for (Function &F : *Mod) {
-    if (F.isDeclaration())
+  for (Function &Fn : *Mod) {
+    if (Fn.isDeclaration())
       continue;
     LocalIDs.clear();
     LabelIDs.clear();
     ExtraLocals.clear();
-    ArgIterators.clear();
+    F = &Fn;
     NextLocalID = 0;
     NextLabelID = 0;
 
-    for (const Argument &A : F.args())
+    for (const Argument &A : Fn.args())
       LocalIDs[&A] = NextLocalID++;
-    for (const BasicBlock &BB : F) {
+    for (const BasicBlock &BB : Fn) {
       LabelIDs[&BB] = NextLabelID++;
       for (const Instruction &I : BB)
         if (!I.getType()->isVoidTy())
           LocalIDs[&I] = NextLocalID++;
     }
 
-    // Anticipate va_list slots so declarations precede their uses.
-    for (const BasicBlock &BB : F)
-      for (const Instruction &I : BB) {
-        const auto *CB = dyn_cast<CallBase>(&I);
-        if (!CB)
-          continue;
-        const auto *II = dyn_cast<IntrinsicInst>(CB);
-        if (!II)
-          continue;
-        switch (II->getIntrinsicID()) {
-        case Intrinsic::vastart:
-        case Intrinsic::vacopy: {
-          const Value *V = II->getArgOperand(0);
-          if (!ArgIterators.count(V)) {
-            std::string Name = "va" + utostr(NumVA++);
-            ArgIterators[V] = Name;
-            ExtraLocals.push_back(
-                {"valuetype [mscorlib]System.ArgIterator", Name});
-          }
-          break;
-        }
-        default:
-          break;
-        }
-      }
-
-    printFunction(F);
+    printFunction(Fn);
   }
+  F = nullptr;
 }
 
 //===----------------------------------------------------------------------===//
@@ -3923,6 +4049,13 @@ void MSILWriter::collectTypes() {
           collectType(GEP->getSourceElementType());
         if (auto *AI = dyn_cast<AllocaInst>(&I))
           collectType(AI->getAllocatedType());
+        // A call to an emitted vararg definition materializes a buffer of
+        // trailing arguments as a local (see printVarArgBuffer), and that
+        // local's type needs a class like any other aggregate.
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (isEmittedVarArgDef(CB->getCalledFunction()))
+            getAggregateName(ArrayType::get(Type::getInt64Ty(Mod->getContext()),
+                                            varArgSlots(CB)));
       }
   }
   for (GlobalVariable &G : Mod->globals()) {
@@ -4775,65 +4908,52 @@ void MSILWriter::linkPortableLibc() {
   UsesLibcSeam = AnySeam;
 }
 
-// A pointer argument. Reading it through object is the only form the CLR
-// accepts for every call site: the typed GetNextArg matches on the exact
-// CLR type, and a void* argument has none (IntPtr is a different type).
-// A void* boxes as System.UIntPtr (an unsigned native int), so that is what
-// the unbox has to name; its value is the address.
-std::string MSILWriter::untaggedVaBody() {
+// The address of the caller's va_list slot. The C passes &ap, so on Windows
+// that is already the address of the cursor, since a va_list there *is* the
+// cursor. On ELF the C passes the address of a variable holding a pointer to
+// the __va_list_tag (that is what a va_list is there); one more load reaches
+// the tag itself. Writing through the returned address is what makes the
+// advance visible to the C.
+std::string MSILWriter::vaListPtr() {
   std::string B;
   raw_string_ostream OS(B);
-  OS << "\n\t.locals init (valuetype [mscorlib]System.ArgIterator 'it', object 'o', native int 'p')"
-        "\n\tldarg.0"
-        "\n\tldind.i"
-        "\n\tldobj\tvaluetype [mscorlib]System.ArgIterator"
-        "\n\tstloc\t'it'"
-        "\n\tldloca\t'it'"
-        "\n\tldtoken\t[mscorlib]System.Object"
-        "\n\tcall\tinstance typedref [mscorlib]System.ArgIterator::GetNextArg(valuetype [mscorlib]System.RuntimeTypeHandle)"
-        "\n\tcall\tobject [mscorlib]System.TypedReference::ToObject(typedref)"
-        "\n\tstloc\t'o'"
-        "\n\tldloc\t'o'"
-        "\n\tunbox\t[mscorlib]System.UIntPtr"
-        "\n\tldind.i"
-        "\n\tstloc\t'p'"
-        "\n\tldarg.0"
-        "\n\tldind.i"
-        "\n\tldloc\t'it'"
-        "\n\tstobj\tvaluetype [mscorlib]System.ArgIterator"
-        "\n\tldloc\t'p'"
-        "\n\tconv.u\n\tret";
+  OS << "\n\tldarg.0";
+  if (vaIsTag())
+    OS << "\n\tldind.i";
   return B;
 }
-std::string MSILWriter::vaAccessorBody(StringRef CLRType, StringRef LoadInst,
-                                      bool AsPointer) {
-  // The va_list is a pointer to an ArgIterator. A byref local cannot hold an
-  // unmanaged pointer (the JIT rejects it), so the iterator is copied in,
-  // advanced, then copied back: the caller sees the advanced cursor.
+
+// The address of the cursor inside the va_list. \p Tag is a local holding the
+// tag on ELF; on Windows the va_list slot is the cursor, so \p Arg is used.
+std::string MSILWriter::vaCursorAddr(StringRef Tag) {
   std::string B;
   raw_string_ostream OS(B);
-  // The argument is the address of the caller's va_list slot, and the slot
-  // holds a pointer to the ArgIterator: the C code passes &ap so that the
-  // iterator it advances is the one va_start built, not a copy.
-  OS << "\n\t.locals init (valuetype [mscorlib]System.ArgIterator 'it')"
-        "\n\tldarg.0"
-        "\n\tldind.i"
-        "\n\tldobj\tvaluetype [mscorlib]System.ArgIterator"
-        "\n\tstloc\t'it'"
-        "\n\tldloca\t'it'"
-        "\n\tldtoken\t"
-     << CLRType << "\n"
-     << "\tcall\tinstance typedref [mscorlib]System.ArgIterator::"
-        "GetNextArg(valuetype [mscorlib]System.RuntimeTypeHandle)"
-        "\n\trefanyval\t"
-     << CLRType << "\n"
-     << LoadInst << "\n"
-     // Only the pointer accessor needs this; the rest already produce the
-     // declared return type.
-     << (AsPointer ? "\tconv.u\n" : "") << "\tldarg.0"
-     << "\n\tldind.i"
-     << "\n\tldloc\t'it'"
-     << "\n\tstobj\tvaluetype [mscorlib]System.ArgIterator\n\tret";
+  if (vaIsTag())
+    OS << "\n\tldloc\t'" << Tag << "'"
+          "\n\tldc.i8\t8\n\tadd";  // &tag->overflow_arg_area
+  else
+    OS << "\n\tldarg.0";           // the va_list slot is the cursor
+  return B;
+}
+
+// Every seam accessor reads one 8-byte slot out of the caller's buffer and
+// advances the cursor.
+//
+// \p Convert turns the loaded int64 into the accessor's return type: nothing
+// for int64, a memory round trip for a double's bits, `conv.u` for an address.
+std::string MSILWriter::vaAccessorBody(StringRef Convert) {
+  std::string B;
+  raw_string_ostream OS(B);
+  // 'tag' holds the va_list pointer on ELF and is unused on Windows.
+  OS << "\n\t.locals init (native int 'tag', native int 'c', int64 'v')"
+     << vaListPtr() << "\n\tstloc\t'tag'"
+     << vaCursorAddr("tag") << "\n\tldind.i\n\tstloc\t'c'";
+  // The value, before the cursor moves.
+  OS << "\n\tldloc\t'c'\n\tldind.i8\n\tstloc\t'v'";
+  // Advance the cursor the caller owns.
+  OS << vaCursorAddr("tag") << "\n\tldloc\t'c'"
+        "\n\tldc.i8\t8\n\tadd\n\tstind.i";
+  OS << Convert << "\tret";
   return B;
 }
 
@@ -4848,22 +4968,23 @@ void MSILWriter::printLibcSeam() {
   // class member would need the class prefix at every call site.
   //
   // A vararg argument crosses into the linked C as one of four CLR types,
-  // matching what printFunctionCall pushes at the call site.
+  // matching what printVarArgBuffer writes at the call site.
   if (Wanted.count("__msil_va_i32"))
     printLibcMethod("__msil_va_i32", "int32", "void*",
-                    vaAccessorBody("[mscorlib]System.Int32",
-                                    "\tldind.i4", false));
+                    vaAccessorBody("\n\tldloc\t'v'\n\tconv.i4\n"));
   if (Wanted.count("__msil_va_i64"))
     printLibcMethod("__msil_va_i64", "int64", "void*",
-                    vaAccessorBody("[mscorlib]System.Int64",
-                                    "\tldind.i8", false));
+                    vaAccessorBody("\n\tldloc\t'v'\n"));
   if (Wanted.count("__msil_va_f64"))
+    // The call site stored the double's raw bits in the slot, so the read
+    // reinterprets them; conv.r8 would turn the integer into a value.
     printLibcMethod("__msil_va_f64", "float64", "void*",
-                    vaAccessorBody("[mscorlib]System.Int64", "\tldind.i8",
-                                   false));
+                    vaAccessorBody("\n\tldloca\t'v'\n\tconv.u8\n\tldind.r8\n"));
   if (Wanted.count("__msil_va_ptr"))
+    // A pointer is stored as its address, so the slot already holds the
+    // native int the return type wants.
     printLibcMethod("__msil_va_ptr", "void*", "void*",
-                    untaggedVaBody());
+                    vaAccessorBody("\n\tldloc\t'v'\n\tconv.u\n"));
 
   if (Wanted.count("__msil_write"))
     printLibcMethod(
@@ -5330,7 +5451,8 @@ void MSILWriter::printThreadLocalAccessor(const GlobalImage &Image) {
         out() << "\tldftn\t"
             << getCallSignature(cast<Function>(DI.Value)->getFunctionType(),
                                 nullptr,
-                                "'" + getValueName(DI.Value) + "'")
+                                "'" + getValueName(DI.Value) + "'", false,
+                                isEmittedVarArgDef(cast<Function>(DI.Value)))
             << "\n";
       } else {
         printValueLoad(DI.Value);
@@ -5407,7 +5529,8 @@ void MSILWriter::printInitializer() {
       out() << "\tldftn\t"
           << getCallSignature(cast<Function>(DI.Value)->getFunctionType(),
                               nullptr,
-                              "'" + getValueName(DI.Value) + "'")
+                              "'" + getValueName(DI.Value) + "'", false,
+                              isEmittedVarArgDef(cast<Function>(DI.Value)))
           << "\n";
     } else {
       printValueLoad(DI.Value);

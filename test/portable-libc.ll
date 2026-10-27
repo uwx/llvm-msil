@@ -33,39 +33,41 @@ define i32 @main() {
 }
 
 ; The library's definitions are ordinary module methods under their C names,
-; and the calls reach them directly instead of through a pinvoke. printf stays
-; vararg: the portable implementation is a real C vararg function.
-; CHECK-DAG: .method static public hidebysig vararg int32 'printf'(void* 'l0')
+; and the calls reach them directly instead of through a pinvoke. printf is a
+; real C vararg function, but it is emitted with a fixed signature -- the
+; declared parameters plus a `void*` buffer of trailing arguments -- because
+; CoreCLR on Linux rejects a `vararg` method and any method that names one.
+; CHECK-DAG: .method static public hidebysig int32 'printf'(void* 'l0', void* '$va_args')
 ; CHECK-DAG: .method static public hidebysig int32 'puts'(void* 'l0')
 ; CHECK-DAG: .method static public hidebysig int32 'atoi'(void* 'l0')
 ; CHECK-DAG: .method static public hidebysig int32 'strtol'(void* 'l0', void* 'l1', int32 'l2')
 ; CHECK-DAG: .method static public hidebysig int32 'toupper'(int32 'l0')
 ; A vararg slot is read by the C side as int64, so every integer argument
-; widens at the call.
-; CHECK-DAG: call vararg int32 'printf'(void*, ..., int64)
+; widens at the call, and the call passes the buffer of slots rather than
+; naming trailing types.
+; CHECK-DAG: call int32 'printf'(void*, void*)
 ; CHECK-DAG: call int32 'puts'(void*)
 ; CHECK-DAG: call int32 'atoi'(void*)
 ; CHECK-DAG: call int32 'strtol'(void*, void*, int32)
 
-; The vararg seam: printf reads its arguments through the CLR's ArgIterator,
-; because the backend passes each one as int64, float64 or void*, never as a C
-; type. The slot holds a pointer to the iterator (va_start stores it), so the
-; accessor dereferences once before copying the iterator in and out.
-; CHECK-DAG: .method public static hidebysig int64 '__msil_va_i64'(void*)
-; CHECK-DAG: .method public static hidebysig float64 '__msil_va_f64'(void*)
-; CHECK-DAG: .method public static hidebysig void* '__msil_va_ptr'(void*)
-; CHECK-DAG: call{{.}}instance typedref [mscorlib]System.ArgIterator::GetNextArg(valuetype [mscorlib]System.RuntimeTypeHandle)
-; CHECK-DAG: stobj{{.}}valuetype [mscorlib]System.ArgIterator
-; A pointer argument is read through object and unboxed as UIntPtr, which is
-; how a void* boxes.
-; CHECK-DAG: TypedReference::ToObject(typedref)
-; CHECK-DAG: unbox{{.}}[mscorlib]System.UIntPtr
+; The vararg seam: printf reads its arguments out of the buffer the call site
+; built, one 8-byte slot each, because the caller stores every one as int64,
+; float64 bits or an address, never as a C type. The accessor takes the
+; address of the va_list so the advance it makes is the caller's.
+; CHECK-DAG: .method public static {{.*}}int64 '__msil_va_i64'(void*)
+; CHECK-DAG: .method public static {{.*}}float64 '__msil_va_f64'(void*)
+; CHECK-DAG: .method public static {{.*}}void* '__msil_va_ptr'(void*)
+; A double's slot holds its raw bits, so the read reinterprets through memory.
+; CHECK-DAG: ldind.r8
 
 ; Output goes through Console rather than pinvoking _write.
 ; CHECK-DAG: .method public static hidebysig void '__msil_write'(void*, int64)
 ; CHECK-DAG: System.Console::Write(string)
 
 ; Nothing the library defines is left as a pinvoke anywhere in the output.
+; No vararg method anywhere: CoreCLR on Linux rejects one, and any method
+; that names one.
+; CHECK-NOT: vararg
 ; CHECK-NOT: pinvokeimpl("{{[^"]*}}" as "printf"
 ; CHECK-NOT: pinvokeimpl("{{[^"]*}}" as "puts"
 ; CHECK-NOT: pinvokeimpl("{{[^"]*}}" as "atoi"
