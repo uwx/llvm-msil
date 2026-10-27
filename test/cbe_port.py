@@ -35,7 +35,10 @@ RUNTIMECONFIG = ('{"runtimeOptions":{"tfm":"net9.0","framework":'
 # regression. The message is matched, so the list cannot hide a crash.
 KNOWN_UNSUPPORTED = (
     "MSIL: unsupported constant: i64 ptrtoint",  # ptrtoint in a vtable
-    "MSIL: unsupported memory type",             # x86_fp80 (long double)
+    # x86_fp80 (long double). -msil-fp80=double handles it, but the gate runs
+    # without the flag so the default stays what it was; the ELF gate has one
+    # such test at -O0 (test_declare_long_double), and it passes with the flag.
+    "MSIL: unsupported memory type",
     "MSIL: unsupported instruction llvm.load.relative",  # ELF PIC switch table
 )
 

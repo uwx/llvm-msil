@@ -17,6 +17,9 @@ config.name = "llvm-msil"
 # Windows tool paths substituted into RUN lines.
 config.test_format = lit.formats.ShTest(False)
 config.suffixes = [".ll"]
+# A test's auxiliary files live in Inputs/ and are named on its RUN line, so
+# they are not tests themselves; lit would otherwise try to run them.
+config.excludes = ["Inputs"]
 
 config.test_source_root = os.path.dirname(__file__)
 config.test_exec_root = getattr(config, "llvm_obj_root", None)
