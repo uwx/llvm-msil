@@ -22,11 +22,12 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
-    # The runner context is only available from job level down. Both paths are
-    # writable by the runner user, which the cache needs in order to restore
-    # into them; on Linux that rules out /opt, which would need root.
+    # `runner` is not available in a job-level env, but `matrix` is, and the
+    # matrix carries the same OS. Both paths are writable by the runner user,
+    # which the cache needs in order to restore into them; on Linux that rules
+    # out /opt, which would need root.
     env:
-      LLVM_ROOT: ${{ runner.os == 'Windows' && 'C:\llvm-msil' || '/home/runner/llvm-msil' }}
+      LLVM_ROOT: ${{ startsWith(matrix.os, 'windows') && 'C:\llvm-msil' || '/home/runner/llvm-msil' }}
     steps:
       - uses: actions/checkout@v4
 
