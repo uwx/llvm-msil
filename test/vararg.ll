@@ -36,7 +36,13 @@ define i32 @main() {
 ; caller's error path then re-enters. SDL's SDL_sscanf forwards to the same
 ; __stdio_common_* leaf and is exactly this case, so it keeps a body and calls
 ; resolve locally instead.
-; CHECK: .method static {{.*}} vararg {{.*}} 'my_snprintf'(
+;
+; The body is a fixed-signature method, not a `vararg` one: CoreCLR on Linux
+; rejects a vararg method, and rejects any method that merely names one, so a
+; definition takes its trailing arguments in a buffer instead. See
+; isEmittedVarArgDef.
+; CHECK: .method static {{.*}} 'my_snprintf'({{.*}} void* '$va_args') cil managed
+; CHECK-NOT: vararg
 ; CHECK: '$MSIL_Startup'
 define i32 @my_snprintf(ptr %b, i64 %n, ptr %f, ...) {
   %ap = alloca ptr

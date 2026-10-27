@@ -115,9 +115,7 @@ a vararg `double` crosses as its raw bits (Windows x64's shadow slot) or as a
 `float64` (SysV's SSE register), and which of the two portable C library builds
 is linked. A Windows triple on Linux and an ELF triple on Windows are both
 consistent; what is not is mixing a program compiled for one ABI with a library
-built for the other, which is why the libc is built twice (see below). Runtime
-support is a separate axis again: a managed vararg method, and therefore the
-portable `printf`, runs only on Windows (see "Known limitations").
+built for the other, which is why the libc is built twice (see below).
 
 ## Options
 
@@ -271,42 +269,67 @@ cannot has no SysV copy, and `lib/Target/MSIL/libc.ll` is checked in as the
 Windows-ABI fallback for it, with `scripts/update-libc-ir.sh` regenerating that
 file. Change the C, run the script, and the checked-in copy stays in step.
 
-Whether the library *runs* is a different question from whether it links: its
-`printf` is a managed vararg method, which CoreCLR supports on Windows and
-rejects on Linux, so `-msil-libc=builtin` is usable only there. A plain program
-that calls the CRT's `printf` through a pinvoke thunk is unaffected on either
-host.
+Whether the library *runs* is a different question from whether it links, and
+it runs on both hosts: its `printf` is a C vararg function, but it is not
+emitted as a `vararg` method (see below), so nothing in the module needs the
+calling convention CoreCLR on Linux refuses.
 
 ### The vararg seam
 
-The one thing C cannot express is reading a vararg argument, because the CLR's
-`va_list` is a `System.ArgIterator` and not a C pointer. So `libc.h` declares
-three accessors -- `__msil_va_i64`, `__msil_va_f64`, `__msil_va_ptr` -- plus
-`__msil_write` for output, and the backend emits them as IL. `printf` is
-ordinary C above that seam.
+A C vararg *definition* cannot be a `vararg` method. CoreCLR on Linux raises
+`InvalidProgramException: Vararg calling convention not supported` for the
+method, and for any method that merely names one -- a `call`, or even an
+`ldftn` -- which makes the convention unusable rather than merely limited. So
+a definition is emitted as an ordinary method and the trailing arguments are
+passed as data:
 
-Three details make it work, and each is a place where the obvious thing fails:
+* The callee's signature is its declared parameters plus one `void*`, the
+  buffer of trailing arguments.
+* Each call site builds that buffer in a local and fills it, one 8-byte slot
+  per trailing argument: an integer widened to `int64`, a `double` as its raw
+  bits, a pointer as its address. It then passes the buffer's address.
+* `va_start` points the callee's `va_list` at the buffer: on Windows, where a
+  `va_list` *is* the cursor, the slot gets the pointer directly; on ELF, where
+  it is a `__va_list_tag`, the pointer goes in `overflow_arg_area` and
+  `gp_offset`/`fp_offset` are set past their limits so every argument takes
+  the stack path. Either way a read advances 8 bytes.
+
+Reading is then just a load, which is why the accessors have no `ArgIterator`
+in them. `libc.h` declares three -- `__msil_va_i64`, `__msil_va_f64`,
+`__msil_va_ptr` -- plus `__msil_write` for output, and the backend emits them
+as IL; `printf` is ordinary C above that seam.
+
+Two details make the accessors work, and each is a place where the obvious
+thing fails:
 
 * The accessor takes the **address** of the caller's `va_list`, not its value.
-  Reading an argument advances the cursor, and the cursor lives in the
-  caller's slot: `va_start` stored the address of the `ArgIterator` there.
-* The iterator is copied out of that address, read, and copied back, because
-  an unmanaged pointer cannot be held in a `byref` local -- the JIT rejects
-  the method.
-* Each argument crosses as its CLR type, not its C type: `int64` for any
-  integer, `float64` for a `double`'s raw bits, `void*` for a pointer. The
-  typed `GetNextArg(RuntimeTypeHandle)` overload matches on the exact type, so
-  there is one accessor per CLR type; a pointer has no type token at all, so it
-  is read through `object` and unboxed as `UIntPtr`, which is how a `void*`
-  boxes.
+  Reading advances the cursor, and the cursor lives in the caller's slot. On
+  ELF that address reaches a variable holding a pointer to the tag -- that is
+  what a `va_list` is there -- so the accessor loads once more.
+* A `double`'s slot holds its `int64` bits, so the read reinterprets through
+  memory. `conv.r8` would turn the integer into a value instead.
 
-There is no `int32` accessor because the call site narrows to one CLR type per
-slot. A vararg `int` is widened to `int64` on the way in (rather than left as
-`int32`), because the typed read has to know which of the two shapes to expect
-and `printf` cannot know which the caller chose. `%f` reads the `float64` bits
-through the `int64` overload for the same reason: the backend already sends a
-vararg `double` as an `int64` (the CRT's `va_arg` reads the general-purpose
-shadow slot on Windows x64), so the C side reinterprets the bits.
+A vararg `int` is widened to `int64` on the way in rather than left as
+`int32`, because the read has to know which of the two shapes to expect and
+`printf` cannot know which the caller chose. `%f` reads the `float64` bits
+through the `int64` accessor for the same reason.
+
+Two limits follow from the design. A definition whose address is taken cannot
+work: the buffer-form signature is how *this module* calls it, and a `calli`
+through the pointer would name its own signature and pass the trailing
+arguments as varargs instead of in the buffer. Materializing the address is
+therefore a diagnostic rather than a miscompile. (Before this change the same
+code compiled and then died at run time with `InvalidProgramException` on
+Linux, so the diagnostic replaces a crash, not working behaviour. It is only
+the materialized address that is rejected: an address the optimizer proves
+unused is gone before this code sees it, so such a program still compiles.)
+And a vararg call to a *declaration* -- the CRT's `printf` -- is
+unchanged: it still gets a concrete pinvoke thunk per call signature, which
+both hosts run.
+
+`va_arg` itself needs no backend work on either target: clang expands it into
+plain loads and arithmetic against the tag, which is why forcing the overflow
+path is enough.
 
 ### Where it deliberately differs
 
@@ -320,6 +343,11 @@ shadow slot on Windows x64), so the C side reinterprets the bits.
 * `errno` does not exist. `strtol` saturates silently on overflow instead of
   setting `ERANGE`; `%m`, `%n$` positional arguments and `%n` are not
   implemented.
+* `strtol("0x", &end, 0)` leaves `end` on the `x`, which is what musl and
+  glibc do and what C99 7.20.1.4 says (the longest initial subsequence that is
+  a prefix of a matching sequence). MSVC steps back over both characters and
+  leaves it on the `0x`, so `libc.sh` compares that line against a literal the
+  same way it does `%a`.
 * `qsort` is an insertion sort. It is stable and obviously correct, which
   matters more here than the asymptotic advantage; musl's smoothsort is
   available if a program ever sorts enough to notice.
@@ -434,8 +462,8 @@ output against a native build of the same file. A port is only as good as its
 agreement with the real thing, so the native build is the reference. During
 development the same source also runs natively against the ported `.c` files
 rather than the CRT, which separates a portability bug from a translation bug
-before the MSIL side is involved. The program's `printf` is the portable one, a
-managed vararg method, so the script skips off Windows.
+before the MSIL side is involved. The program's `printf` is the portable one,
+and it is that path which exercises the vararg buffer on both hosts.
 
 `doom.sh` runs PureDOOM for a fixed number of tics on a virtual clock and
 hashes the framebuffer; `stb.sh` exercises stb_image (including a PNG
@@ -477,15 +505,16 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   bits on a Windows target, because the CRT's `va_arg` reads the
   general-purpose shadow slot on Windows x64; an ELF target passes it in an
   SSE register and the CLR pinvoke stub follows that ABI.
-* **Managed vararg methods do not run on Linux.** A *definition* of a C vararg
-  function is emitted as a `vararg` method with `System.ArgIterator` for
-  `va_start`. CoreCLR on Windows runs it; CoreCLR on Linux raises
-  `InvalidProgramException: Vararg calling convention not supported` for the
-  same assembly (verified with the identical, byte-for-byte IL). That is a
-  runtime limitation, not something the backend can emit around: it is why
-  `-msil-libc=builtin`'s `printf` works on Windows and not on Linux, and why
-  `libc.sh` skips there. A vararg *call* to a pinvoke thunk — what a plain
-  program that calls `printf` gets — works on both.
+* **A vararg definition is not a `vararg` method.** CoreCLR on Linux raises
+  `InvalidProgramException: Vararg calling convention not supported` for a
+  `vararg` method *and* for any method that names one, so a definition is
+  emitted with a fixed signature and its trailing arguments are passed in a
+  buffer the call sites build (see "The vararg seam"). This runs on both
+  hosts, which is why `-msil-libc=builtin`'s `printf` and `libc.sh` are no
+  longer Windows-only. Two consequences: the signature `ilasm` shows for such
+  a method is not the C one, so it cannot be bound from another assembly that
+  expects the C ABI (link a pinvoke instead); and taking its address is an
+  error, since a `calli` through the pointer would not pass the buffer.
 * **`calli vararg` is not emitted.** A C function pointer with no prototype
   (`void (*routine)()`) types as vararg in the IR, but every call through it
   passes only the fixed arguments, and some runtimes reject `calli vararg`

@@ -76,10 +76,24 @@ private:
   std::string getMemSuffix(Type *Ty);
 
   std::string getCallSignature(FunctionType *FTy, const CallBase *CB,
-                               StringRef Name, bool PortableVarArgs = false);
+                               StringRef Name, bool PortableVarArgs = false,
+                               bool VarArgDef = false);
+  /// A vararg definition this module emits in buffer form rather than as a
+  /// `vararg` method, which CoreCLR on Linux rejects on sight.
+  static bool isEmittedVarArgDef(const Function *F);
+  /// The number of 8-byte slots a call's buffer needs: one per trailing
+  /// argument, at least one so the local is never a zero-length array.
+  static unsigned varArgSlots(const CallBase *CB) {
+    return std::max<unsigned>(
+        CB->arg_size() - CB->getFunctionType()->getNumParams(), 1);
+  }
+  /// Whether a va_list is a __va_list_tag (ELF) rather than a bare cursor
+  /// (Windows), and how many bytes one occupies.
+  bool vaIsTag() const;
+  uint64_t vaSlotSize() const;
   std::string getVarArgTypeName(Type *Ty);
   /// The same for a call into the portable library, where every integer
-  /// vararg is widened to int64 so the ArgIterator read is predictable.
+  /// vararg is widened to int64 so the slot read is predictable.
   std::string getPortableVarArgTypeName(Type *Ty);
   bool callsPortableLibc(const Function *Callee) const;
 
@@ -156,6 +170,13 @@ private:
   void printInstruction(const Instruction *Inst);
   void printCallInstruction(const CallBase *CB);
   void printFunctionCall(const Value *FnVal, const CallBase *CB);
+  /// Push a trailing vararg as the CLR type the callee reads it back as.
+  void printVarArgValue(const Value *Arg, bool Portable, bool AsSlot);
+  /// Push a pointer to a buffer of \p CB's trailing arguments, for a call to a
+  /// vararg definition this module emits in buffer form.
+  void printVarArgBuffer(const CallBase *CB);
+  /// Leave the va_list slot's cursor on the stack as a native int.
+  void printVaCursor(const Value *Ptr);
   void printIntrinsicCall(const IntrinsicInst *II);
   void printBranchInstruction(const BranchInst *Inst);
   void printPHICopy(const BasicBlock *From, const BasicBlock *To);
@@ -271,13 +292,16 @@ private:
 
   /// The IL seam the linked C library calls: __msil_va_* and __msil_write.
   void printLibcSeam();
-  /// The body of one seam accessor: read the next vararg as \p CLRType and
-  /// leave it on the stack. \p LoadInst loads that CLR type from the typedref.
-  std::string vaAccessorBody(StringRef CLRType, StringRef LoadInst,
-                             bool AsPointer);
-  /// The same for a pointer argument, which has no System.Type token and so
-  /// has to be read through object.
-  std::string untaggedVaBody();
+  /// The body of one seam accessor: read the next 8-byte slot from the
+  /// caller's buffer, advance the cursor, and convert the int64 to the
+  /// accessor's return type with \p Convert.
+  std::string vaAccessorBody(StringRef Convert);
+  /// Leave the caller's va_list pointer on the stack: the argument itself on
+  /// Windows, one load through it on ELF.
+  std::string vaListPtr();
+  /// Leave the address of the cursor inside the va_list on the stack. \p Tag
+  /// names the local holding the va_list pointer on ELF.
+  std::string vaCursorAddr(StringRef Tag);
   void printGlobals();
   void printStaticConstant(const Constant *C, uint64_t &Offset,
                            std::string &Buffer);
@@ -308,8 +332,8 @@ private:
   std::string getThreadLocalRef(const GlobalVariable *GV) const;
 
   std::vector<std::pair<std::string, std::string>> ExtraLocals;
-  DenseMap<const Value *, std::string> ArgIterators;
-  unsigned NumVA = 0;
+  /// The definition being emitted, so va_start can find the buffer parameter.
+  const Function *F = nullptr;
 
   /// Set once any Vector<T> operation is emitted; the assembly reference has
   /// to follow the type references, so it is written after the functions.

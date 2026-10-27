@@ -985,8 +985,8 @@ entry:
   %cmp.not = icmp ne i32 %base, 0
   %0 = add i32 %base, -37
   %or.cond = icmp ult i32 %0, -35
-  %or.cond166 = and i1 %cmp.not, %or.cond
-  br i1 %or.cond166, label %if.then, label %while.cond
+  %or.cond171 = and i1 %cmp.not, %or.cond
+  br i1 %or.cond171, label %if.then, label %while.cond
 
 if.then:                                          ; preds = %entry
   %tobool.not = icmp eq ptr %endp, null
@@ -1020,10 +1020,10 @@ if.end18:                                         ; preds = %if.then13, %while.e
   %neg.0 = phi i32 [ %conv16, %if.then13 ], [ 0, %while.end ]
   %cmp20 = icmp eq i32 %base, 0
   %cmp23 = icmp eq i32 %base, 16
-  %or.cond108 = or i1 %cmp20, %cmp23
+  %or.cond112 = or i1 %cmp20, %cmp23
   %cmp26 = icmp eq i8 %3, 48
-  %or.cond109 = select i1 %or.cond108, i1 %cmp26, i1 false
-  br i1 %or.cond109, label %if.then28, label %if.else50
+  %or.cond113 = select i1 %or.cond112, i1 %cmp26, i1 false
+  br i1 %or.cond113, label %if.then28, label %if.else54
 
 if.then28:                                        ; preds = %if.end18
   %incdec.ptr29 = getelementptr inbounds i8, ptr %p.1, i64 1
@@ -1039,214 +1039,212 @@ if.then33:                                        ; preds = %if.then28
   %conv35 = zext i8 %6 to i32
   %7 = add nsw i32 %conv35, -48
   %or.cond.i = icmp ult i32 %7, 10
-  br i1 %or.cond.i, label %if.end55, label %if.end.i
+  br i1 %or.cond.i, label %if.end59, label %if.end.i
 
 if.end.i:                                         ; preds = %if.then33
   %8 = add nsw i32 %conv35, -97
   %or.cond15.i = icmp ult i32 %8, 26
-  br i1 %or.cond15.i, label %if.then5.i, label %if.end7.i
-
-if.then5.i:                                       ; preds = %if.end.i
-  %add.i = add nsw i32 %conv35, -87
-  br label %digitval.exit
+  br i1 %or.cond15.i, label %digitval.exit182, label %if.end7.i
 
 if.end7.i:                                        ; preds = %if.end.i
-  %9 = add nsw i32 %conv35, -65
-  %or.cond16.i = icmp ult i32 %9, 26
-  %add13.i = add nsw i32 %conv35, -55
-  br i1 %or.cond16.i, label %digitval.exit, label %if.end55
+  %9 = add nsw i32 %conv35, -91
+  %or.cond16.i = icmp ult i32 %9, -26
+  %cmp37 = icmp ult i8 %6, 55
+  %or.cond309 = or i1 %cmp37, %or.cond16.i
+  br i1 %or.cond309, label %if.then43, label %digitval.exit182
 
-digitval.exit:                                    ; preds = %if.end7.i, %if.then5.i
-  %retval.0.i = phi i32 [ %add.i, %if.then5.i ], [ %add13.i, %if.end7.i ]
-  %cmp37 = icmp sgt i32 %retval.0.i, 15
-  br i1 %cmp37, label %if.then39, label %if.end55
+digitval.exit182:                                 ; preds = %if.end7.i, %if.end.i
+  %.sink = phi i32 [ -87, %if.end.i ], [ -55, %if.end7.i ]
+  %add.i181 = add nsw i32 %.sink, %conv35
+  %cmp41 = icmp ugt i32 %add.i181, 15
+  br i1 %cmp41, label %if.then43, label %if.end59
 
-if.then39:                                        ; preds = %digitval.exit
-  %tobool41.not = icmp eq ptr %endp, null
-  br i1 %tobool41.not, label %cleanup, label %cleanup.sink.split
+if.then43:                                        ; preds = %digitval.exit182, %if.end7.i
+  %tobool45.not = icmp eq ptr %endp, null
+  br i1 %tobool45.not, label %cleanup, label %cleanup.sink.split
 
 if.else:                                          ; preds = %if.then28
   %spec.store.select = select i1 %cmp20, i32 8, i32 %base
-  br label %if.end55
+  br label %if.end59
 
-if.else50:                                        ; preds = %if.end18
+if.else54:                                        ; preds = %if.end18
   %conv19 = zext i8 %3 to i32
-  %spec.store.select110 = select i1 %cmp20, i32 10, i32 %base
-  br label %if.end55
+  %spec.store.select114 = select i1 %cmp20, i32 10, i32 %base
+  br label %if.end59
 
-if.end55:                                         ; preds = %if.else50, %if.else, %digitval.exit, %if.end7.i, %if.then33
-  %base.addr.0 = phi i32 [ %spec.store.select, %if.else ], [ %spec.store.select110, %if.else50 ], [ 16, %digitval.exit ], [ 16, %if.end7.i ], [ 16, %if.then33 ]
-  %p.2 = phi ptr [ %incdec.ptr29, %if.else ], [ %p.1, %if.else50 ], [ %incdec.ptr34, %digitval.exit ], [ %incdec.ptr34, %if.end7.i ], [ %incdec.ptr34, %if.then33 ]
-  %c.0 = phi i32 [ %conv30, %if.else ], [ %conv19, %if.else50 ], [ %conv35, %digitval.exit ], [ %conv35, %if.end7.i ], [ %conv35, %if.then33 ]
+if.end59:                                         ; preds = %if.else54, %if.else, %digitval.exit182, %if.then33
+  %base.addr.0 = phi i32 [ %spec.store.select, %if.else ], [ %spec.store.select114, %if.else54 ], [ 16, %digitval.exit182 ], [ 16, %if.then33 ]
+  %p.2 = phi ptr [ %incdec.ptr29, %if.else ], [ %p.1, %if.else54 ], [ %incdec.ptr34, %digitval.exit182 ], [ %incdec.ptr34, %if.then33 ]
+  %c.0 = phi i32 [ %conv30, %if.else ], [ %conv19, %if.else54 ], [ %conv35, %digitval.exit182 ], [ %conv35, %if.then33 ]
   %10 = add nsw i32 %c.0, -48
-  %or.cond.i167 = icmp ult i32 %10, 10
-  br i1 %or.cond.i167, label %digitval.exit188, label %if.end.i168
+  %or.cond.i183 = icmp ult i32 %10, 10
+  br i1 %or.cond.i183, label %digitval.exit204, label %if.end.i184
 
-if.end.i168:                                      ; preds = %if.end55
+if.end.i184:                                      ; preds = %if.end59
   %11 = add nsw i32 %c.0, -97
-  %or.cond15.i169 = icmp ult i32 %11, 26
-  br i1 %or.cond15.i169, label %if.then5.i186, label %if.end7.i170
+  %or.cond15.i185 = icmp ult i32 %11, 26
+  br i1 %or.cond15.i185, label %if.then5.i202, label %if.end7.i186
 
-if.end7.i170:                                     ; preds = %if.end.i168
+if.end7.i186:                                     ; preds = %if.end.i184
   %12 = add nsw i32 %c.0, -91
-  %or.cond285 = icmp ult i32 %12, -26
-  br i1 %or.cond285, label %if.then63, label %if.end7.i181
+  %or.cond310 = icmp ult i32 %12, -26
+  br i1 %or.cond310, label %if.then67, label %if.end7.i197
 
-if.then5.i186:                                    ; preds = %if.end.i168
-  %add.i187 = add nsw i32 %c.0, -87
-  br label %digitval.exit188
+if.then5.i202:                                    ; preds = %if.end.i184
+  %add.i203 = add nsw i32 %c.0, -87
+  br label %digitval.exit204
 
-if.end7.i181:                                     ; preds = %if.end7.i170
-  %add13.i183 = add nsw i32 %c.0, -55
-  br label %digitval.exit188
+if.end7.i197:                                     ; preds = %if.end7.i186
+  %add13.i199 = add nsw i32 %c.0, -55
+  br label %digitval.exit204
 
-digitval.exit188:                                 ; preds = %if.end7.i181, %if.then5.i186, %if.end55
-  %retval.0.i185 = phi i32 [ %add.i187, %if.then5.i186 ], [ %add13.i183, %if.end7.i181 ], [ %10, %if.end55 ]
-  %cmp61.not = icmp slt i32 %retval.0.i185, %base.addr.0
-  br i1 %cmp61.not, label %for.cond.preheader, label %if.then63
+digitval.exit204:                                 ; preds = %if.end7.i197, %if.then5.i202, %if.end59
+  %retval.0.i201 = phi i32 [ %add.i203, %if.then5.i202 ], [ %add13.i199, %if.end7.i197 ], [ %10, %if.end59 ]
+  %cmp65.not = icmp slt i32 %retval.0.i201, %base.addr.0
+  br i1 %cmp65.not, label %for.cond.preheader, label %if.then67
 
-for.cond.preheader:                               ; preds = %digitval.exit188
-  %conv77 = zext nneg i32 %base.addr.0 to i64
+for.cond.preheader:                               ; preds = %digitval.exit204
+  %conv81 = zext nneg i32 %base.addr.0 to i64
   br label %for.cond
 
-if.then63:                                        ; preds = %digitval.exit188, %if.end7.i170
-  %tobool64.not = icmp eq ptr %endp, null
-  br i1 %tobool64.not, label %cleanup, label %cleanup.sink.split
+if.then67:                                        ; preds = %digitval.exit204, %if.end7.i186
+  %tobool68.not = icmp eq ptr %endp, null
+  br i1 %tobool68.not, label %cleanup, label %cleanup.sink.split
 
-for.cond:                                         ; preds = %digitval.exit254, %for.cond.preheader
-  %p.3 = phi ptr [ %incdec.ptr74276303307, %digitval.exit254 ], [ %p.2, %for.cond.preheader ]
-  %c.1 = phi i32 [ %conv99, %digitval.exit254 ], [ %c.0, %for.cond.preheader ]
-  %y.0 = phi i64 [ %add, %digitval.exit254 ], [ 0, %for.cond.preheader ]
+for.cond:                                         ; preds = %digitval.exit270, %for.cond.preheader
+  %p.3 = phi ptr [ %incdec.ptr78300328332, %digitval.exit270 ], [ %p.2, %for.cond.preheader ]
+  %c.1 = phi i32 [ %conv103, %digitval.exit270 ], [ %c.0, %for.cond.preheader ]
+  %y.0 = phi i64 [ %add, %digitval.exit270 ], [ 0, %for.cond.preheader ]
   %13 = add nsw i32 %c.1, -48
-  %or.cond.i189 = icmp ult i32 %13, 10
-  br i1 %or.cond.i189, label %digitval.exit210.thread, label %if.end.i190
+  %or.cond.i205 = icmp ult i32 %13, 10
+  br i1 %or.cond.i205, label %digitval.exit226.thread, label %if.end.i206
 
-if.end.i190:                                      ; preds = %for.cond
+if.end.i206:                                      ; preds = %for.cond
   %14 = add nsw i32 %c.1, -97
-  %or.cond15.i191 = icmp ult i32 %14, 26
-  br i1 %or.cond15.i191, label %digitval.exit210, label %if.end7.i192
+  %or.cond15.i207 = icmp ult i32 %14, 26
+  br i1 %or.cond15.i207, label %digitval.exit226, label %if.end7.i208
 
-if.end7.i192:                                     ; preds = %if.end.i190
+if.end7.i208:                                     ; preds = %if.end.i206
   %15 = add nsw i32 %c.1, -65
-  %or.cond286 = icmp ult i32 %15, 26
-  %add13.i205 = add nsw i32 %c.1, -55
-  %cmp72296 = icmp slt i32 %add13.i205, %base.addr.0
-  %or.cond312 = select i1 %or.cond286, i1 %cmp72296, i1 false
-  br i1 %or.cond312, label %digitval.exit221, label %for.end
+  %or.cond311 = icmp ult i32 %15, 26
+  %add13.i221 = add nsw i32 %c.1, -55
+  %cmp76321 = icmp slt i32 %add13.i221, %base.addr.0
+  %or.cond337 = select i1 %or.cond311, i1 %cmp76321, i1 false
+  br i1 %or.cond337, label %digitval.exit237, label %for.end
 
-digitval.exit210:                                 ; preds = %if.end.i190
-  %add.i209 = add nsw i32 %c.1, -87
-  %cmp72 = icmp slt i32 %add.i209, %base.addr.0
-  br i1 %cmp72, label %digitval.exit221, label %for.end
+digitval.exit226:                                 ; preds = %if.end.i206
+  %add.i225 = add nsw i32 %c.1, -87
+  %cmp76 = icmp slt i32 %add.i225, %base.addr.0
+  br i1 %cmp76, label %digitval.exit237, label %for.end
 
-digitval.exit210.thread:                          ; preds = %for.cond
-  %cmp72274 = icmp ult i32 %13, %base.addr.0
-  br i1 %cmp72274, label %digitval.exit221.thread, label %for.end
+digitval.exit226.thread:                          ; preds = %for.cond
+  %cmp76298 = icmp ult i32 %13, %base.addr.0
+  br i1 %cmp76298, label %digitval.exit237.thread, label %for.end
 
-digitval.exit221:                                 ; preds = %digitval.exit210, %if.end7.i192
-  %.sink = phi i32 [ -87, %digitval.exit210 ], [ -55, %if.end7.i192 ]
-  %add.i220 = add nsw i32 %c.1, %.sink
-  %incdec.ptr74276 = getelementptr inbounds i8, ptr %p.3, i64 1
-  %conv76 = sext i32 %add.i220 to i64
-  %sub = sub i64 %lim, %conv76
-  %div = udiv i64 %sub, %conv77
-  %cmp78 = icmp ugt i64 %y.0, %div
-  br i1 %cmp78, label %while.cond81.preheader, label %if.end95
+digitval.exit237:                                 ; preds = %digitval.exit226, %if.end7.i208
+  %.sink341 = phi i32 [ -87, %digitval.exit226 ], [ -55, %if.end7.i208 ]
+  %add.i236 = add nsw i32 %c.1, %.sink341
+  %incdec.ptr78300 = getelementptr inbounds i8, ptr %p.3, i64 1
+  %conv80 = sext i32 %add.i236 to i64
+  %sub = sub i64 %lim, %conv80
+  %div = udiv i64 %sub, %conv81
+  %cmp82 = icmp ugt i64 %y.0, %div
+  br i1 %cmp82, label %while.cond85.preheader, label %if.end99
 
-digitval.exit221.thread:                          ; preds = %digitval.exit210.thread
-  %incdec.ptr74276298 = getelementptr inbounds i8, ptr %p.3, i64 1
-  %conv76299 = zext nneg i32 %13 to i64
-  %sub300 = sub i64 %lim, %conv76299
-  %div301 = udiv i64 %sub300, %conv77
-  %cmp78302 = icmp ugt i64 %y.0, %div301
-  br i1 %cmp78302, label %while.cond81.preheader, label %digitval.exit254
+digitval.exit237.thread:                          ; preds = %digitval.exit226.thread
+  %incdec.ptr78300323 = getelementptr inbounds i8, ptr %p.3, i64 1
+  %conv80324 = zext nneg i32 %13 to i64
+  %sub325 = sub i64 %lim, %conv80324
+  %div326 = udiv i64 %sub325, %conv81
+  %cmp82327 = icmp ugt i64 %y.0, %div326
+  br i1 %cmp82327, label %while.cond85.preheader, label %digitval.exit270
 
-while.cond81.preheader:                           ; preds = %digitval.exit221.thread, %digitval.exit221
-  %p.4.ph = phi ptr [ %incdec.ptr74276, %digitval.exit221 ], [ %incdec.ptr74276298, %digitval.exit221.thread ]
-  br label %while.cond81
+while.cond85.preheader:                           ; preds = %digitval.exit237.thread, %digitval.exit237
+  %p.4.ph = phi ptr [ %incdec.ptr78300, %digitval.exit237 ], [ %incdec.ptr78300323, %digitval.exit237.thread ]
+  br label %while.cond85
 
-while.cond81:                                     ; preds = %while.body92, %while.cond81.preheader
-  %p.4 = phi ptr [ %incdec.ptr93, %while.body92 ], [ %p.4.ph, %while.cond81.preheader ]
+while.cond85:                                     ; preds = %while.body96, %while.cond85.preheader
+  %p.4 = phi ptr [ %incdec.ptr97, %while.body96 ], [ %p.4.ph, %while.cond85.preheader ]
   %16 = load i8, ptr %p.4, align 1, !tbaa !4
-  %conv82 = zext i8 %16 to i32
-  %17 = add nsw i32 %conv82, -48
-  %or.cond.i222 = icmp ult i32 %17, 10
-  br i1 %or.cond.i222, label %digitval.exit243, label %if.end.i223
+  %conv86 = zext i8 %16 to i32
+  %17 = add nsw i32 %conv86, -48
+  %or.cond.i238 = icmp ult i32 %17, 10
+  br i1 %or.cond.i238, label %digitval.exit259, label %if.end.i239
 
-if.end.i223:                                      ; preds = %while.cond81
-  %18 = add nsw i32 %conv82, -97
-  %or.cond15.i224 = icmp ult i32 %18, 26
-  br i1 %or.cond15.i224, label %if.then5.i241, label %if.end7.i225
+if.end.i239:                                      ; preds = %while.cond85
+  %18 = add nsw i32 %conv86, -97
+  %or.cond15.i240 = icmp ult i32 %18, 26
+  br i1 %or.cond15.i240, label %if.then5.i257, label %if.end7.i241
 
-if.end7.i225:                                     ; preds = %if.end.i223
-  %19 = add nsw i32 %conv82, -65
-  %or.cond16.i226 = icmp ult i32 %19, 26
-  %cmp84 = icmp ugt i8 %16, 54
-  %or.cond287 = and i1 %cmp84, %or.cond16.i226
-  br i1 %or.cond287, label %if.end7.i236, label %for.end
+if.end7.i241:                                     ; preds = %if.end.i239
+  %19 = add nsw i32 %conv86, -65
+  %or.cond16.i242 = icmp ult i32 %19, 26
+  %cmp88 = icmp ugt i8 %16, 54
+  %or.cond312 = and i1 %cmp88, %or.cond16.i242
+  br i1 %or.cond312, label %if.end7.i252, label %for.end
 
-if.then5.i241:                                    ; preds = %if.end.i223
-  %add.i242 = add nsw i32 %conv82, -87
-  br label %digitval.exit243
+if.then5.i257:                                    ; preds = %if.end.i239
+  %add.i258 = add nsw i32 %conv86, -87
+  br label %digitval.exit259
 
-if.end7.i236:                                     ; preds = %if.end7.i225
-  %add13.i238 = add nsw i32 %conv82, -55
-  br label %digitval.exit243
+if.end7.i252:                                     ; preds = %if.end7.i241
+  %add13.i254 = add nsw i32 %conv86, -55
+  br label %digitval.exit259
 
-digitval.exit243:                                 ; preds = %if.end7.i236, %if.then5.i241, %while.cond81
-  %retval.0.i240 = phi i32 [ %add.i242, %if.then5.i241 ], [ %add13.i238, %if.end7.i236 ], [ %17, %while.cond81 ]
-  %cmp89 = icmp slt i32 %retval.0.i240, %base.addr.0
-  br i1 %cmp89, label %while.body92, label %for.end
+digitval.exit259:                                 ; preds = %if.end7.i252, %if.then5.i257, %while.cond85
+  %retval.0.i256 = phi i32 [ %add.i258, %if.then5.i257 ], [ %add13.i254, %if.end7.i252 ], [ %17, %while.cond85 ]
+  %cmp93 = icmp slt i32 %retval.0.i256, %base.addr.0
+  br i1 %cmp93, label %while.body96, label %for.end
 
-while.body92:                                     ; preds = %digitval.exit243
-  %incdec.ptr93 = getelementptr inbounds i8, ptr %p.4, i64 1
-  br label %while.cond81, !llvm.loop !27
+while.body96:                                     ; preds = %digitval.exit259
+  %incdec.ptr97 = getelementptr inbounds i8, ptr %p.4, i64 1
+  br label %while.cond85, !llvm.loop !27
 
-if.end95:                                         ; preds = %digitval.exit221
-  br i1 %or.cond.i189, label %digitval.exit254, label %if.end.i245
+if.end99:                                         ; preds = %digitval.exit237
+  br i1 %or.cond.i205, label %digitval.exit270, label %if.end.i261
 
-if.end.i245:                                      ; preds = %if.end95
+if.end.i261:                                      ; preds = %if.end99
   %20 = add nsw i32 %c.1, -97
-  %or.cond15.i246 = icmp ult i32 %20, 26
-  br i1 %or.cond15.i246, label %if.then5.i252, label %if.end7.i247
+  %or.cond15.i262 = icmp ult i32 %20, 26
+  br i1 %or.cond15.i262, label %if.then5.i268, label %if.end7.i263
 
-if.then5.i252:                                    ; preds = %if.end.i245
-  %add.i253 = add nsw i32 %c.1, -87
-  br label %digitval.exit254
+if.then5.i268:                                    ; preds = %if.end.i261
+  %add.i269 = add nsw i32 %c.1, -87
+  br label %digitval.exit270
 
-if.end7.i247:                                     ; preds = %if.end.i245
+if.end7.i263:                                     ; preds = %if.end.i261
   %21 = add nsw i32 %c.1, -65
-  %or.cond16.i248 = icmp ult i32 %21, 26
-  %add13.i249 = add nsw i32 %c.1, -55
-  %spec.select.i250 = select i1 %or.cond16.i248, i32 %add13.i249, i32 -1
-  br label %digitval.exit254
+  %or.cond16.i264 = icmp ult i32 %21, 26
+  %add13.i265 = add nsw i32 %c.1, -55
+  %spec.select.i266 = select i1 %or.cond16.i264, i32 %add13.i265, i32 -1
+  br label %digitval.exit270
 
-digitval.exit254:                                 ; preds = %if.end7.i247, %if.then5.i252, %if.end95, %digitval.exit221.thread
-  %incdec.ptr74276303307 = phi ptr [ %incdec.ptr74276, %if.then5.i252 ], [ %incdec.ptr74276, %if.end7.i247 ], [ %incdec.ptr74276, %if.end95 ], [ %incdec.ptr74276298, %digitval.exit221.thread ]
-  %retval.0.i251 = phi i32 [ %add.i253, %if.then5.i252 ], [ %spec.select.i250, %if.end7.i247 ], [ %13, %if.end95 ], [ %13, %digitval.exit221.thread ]
-  %mul308 = mul i64 %y.0, %conv77
-  %conv98 = sext i32 %retval.0.i251 to i64
-  %add = add i64 %mul308, %conv98
-  %22 = load i8, ptr %incdec.ptr74276303307, align 1, !tbaa !4
-  %conv99 = zext i8 %22 to i32
+digitval.exit270:                                 ; preds = %if.end7.i263, %if.then5.i268, %if.end99, %digitval.exit237.thread
+  %incdec.ptr78300328332 = phi ptr [ %incdec.ptr78300, %if.then5.i268 ], [ %incdec.ptr78300, %if.end7.i263 ], [ %incdec.ptr78300, %if.end99 ], [ %incdec.ptr78300323, %digitval.exit237.thread ]
+  %retval.0.i267 = phi i32 [ %add.i269, %if.then5.i268 ], [ %spec.select.i266, %if.end7.i263 ], [ %13, %if.end99 ], [ %13, %digitval.exit237.thread ]
+  %mul333 = mul i64 %y.0, %conv81
+  %conv102 = sext i32 %retval.0.i267 to i64
+  %add = add i64 %mul333, %conv102
+  %22 = load i8, ptr %incdec.ptr78300328332, align 1, !tbaa !4
+  %conv103 = zext i8 %22 to i32
   br label %for.cond, !llvm.loop !28
 
-for.end:                                          ; preds = %digitval.exit243, %if.end7.i225, %digitval.exit210.thread, %digitval.exit210, %if.end7.i192
-  %p.5 = phi ptr [ %p.4, %digitval.exit243 ], [ %p.4, %if.end7.i225 ], [ %p.3, %digitval.exit210 ], [ %p.3, %digitval.exit210.thread ], [ %p.3, %if.end7.i192 ]
-  %y.1 = phi i64 [ %lim, %digitval.exit243 ], [ %lim, %if.end7.i225 ], [ %y.0, %digitval.exit210 ], [ %y.0, %digitval.exit210.thread ], [ %y.0, %if.end7.i192 ]
-  %tobool100.not = icmp eq ptr %endp, null
-  br i1 %tobool100.not, label %cleanup, label %cleanup.sink.split
+for.end:                                          ; preds = %digitval.exit259, %if.end7.i241, %digitval.exit226.thread, %digitval.exit226, %if.end7.i208
+  %p.5 = phi ptr [ %p.4, %digitval.exit259 ], [ %p.4, %if.end7.i241 ], [ %p.3, %digitval.exit226 ], [ %p.3, %digitval.exit226.thread ], [ %p.3, %if.end7.i208 ]
+  %y.1 = phi i64 [ %lim, %digitval.exit259 ], [ %lim, %if.end7.i241 ], [ %y.0, %digitval.exit226 ], [ %y.0, %digitval.exit226.thread ], [ %y.0, %if.end7.i208 ]
+  %tobool104.not = icmp eq ptr %endp, null
+  br i1 %tobool104.not, label %cleanup, label %cleanup.sink.split
 
-cleanup.sink.split:                               ; preds = %for.end, %if.then63, %if.then39, %if.then
-  %p.5.sink = phi ptr [ %s, %if.then ], [ %incdec.ptr29, %if.then39 ], [ %s, %if.then63 ], [ %p.5, %for.end ]
-  %neg.0.sink.ph = phi i32 [ 0, %if.then ], [ 0, %if.then39 ], [ 0, %if.then63 ], [ %neg.0, %for.end ]
-  %retval.0.ph = phi i64 [ 0, %if.then ], [ 0, %if.then39 ], [ 0, %if.then63 ], [ %y.1, %for.end ]
+cleanup.sink.split:                               ; preds = %for.end, %if.then67, %if.then43, %if.then
+  %p.5.sink = phi ptr [ %s, %if.then ], [ %incdec.ptr29, %if.then43 ], [ %s, %if.then67 ], [ %p.5, %for.end ]
+  %neg.0.sink.ph = phi i32 [ 0, %if.then ], [ 0, %if.then43 ], [ 0, %if.then67 ], [ %neg.0, %for.end ]
+  %retval.0.ph = phi i64 [ 0, %if.then ], [ 0, %if.then43 ], [ 0, %if.then67 ], [ %y.1, %for.end ]
   store ptr %p.5.sink, ptr %endp, align 8, !tbaa !18
   br label %cleanup
 
-cleanup:                                          ; preds = %cleanup.sink.split, %for.end, %if.then63, %if.then39, %if.then
-  %neg.0.sink = phi i32 [ 0, %if.then ], [ 0, %if.then39 ], [ 0, %if.then63 ], [ %neg.0, %for.end ], [ %neg.0.sink.ph, %cleanup.sink.split ]
-  %retval.0 = phi i64 [ 0, %if.then ], [ 0, %if.then39 ], [ 0, %if.then63 ], [ %y.1, %for.end ], [ %retval.0.ph, %cleanup.sink.split ]
+cleanup:                                          ; preds = %cleanup.sink.split, %for.end, %if.then67, %if.then43, %if.then
+  %neg.0.sink = phi i32 [ 0, %if.then ], [ 0, %if.then43 ], [ 0, %if.then67 ], [ %neg.0, %for.end ], [ %neg.0.sink.ph, %cleanup.sink.split ]
+  %retval.0 = phi i64 [ 0, %if.then ], [ 0, %if.then43 ], [ 0, %if.then67 ], [ %y.1, %for.end ], [ %retval.0.ph, %cleanup.sink.split ]
   store i32 %neg.0.sink, ptr %negative, align 4, !tbaa !24
   ret i64 %retval.0
 }

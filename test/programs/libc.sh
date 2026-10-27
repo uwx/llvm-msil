@@ -17,15 +17,6 @@ ILASM=${ILASM:-/tmp/tools/ilasm-core.exe}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# printf and snprintf are C code in the portable library, so they are managed
-# vararg methods. CoreCLR on Linux rejects the vararg calling convention
-# outright (InvalidProgramException), so the library cannot run there at all.
-# Every integer-only printf still works on Windows.
-if [ "$MSIL_HOST" != windows ]; then
-  echo "libc: skipped (the portable printf is a managed vararg method)"
-  exit 0
-fi
-
 cp "$HERE/libc.c" "$TMP/libc.c"
 
 # Native build: the reference result. -fno-builtin so the compiler cannot turn
@@ -44,8 +35,17 @@ cat > "$TMP/hex_want.txt" <<'EOF'
 hex floats     [[0x1p+0][0x1p-1][0x0p+0][0X1P+0]]
 hex subnormal  [[0x1p-1074][0x1.000p+0][0x1.p+0]]
 EOF
-# Everything else, from the native build, with the two %a lines taken out.
-grep -v '^hex floats\|^hex subnormal' "$TMP/want.txt" > "$TMP/want_nochex.txt"
+# strtol("0x") is the other place the C libraries disagree: musl and glibc
+# consume the "0" and leave `end` on the "x" (C99 7.20.1.4: the longest
+# initial subsequence that is a prefix of a matching sequence), while MSVC
+# steps back over both characters and leaves it on the "0x". The port follows
+# musl, so this line is a literal too -- it cannot come from an MSVC reference.
+cat > "$TMP/strtol_want.txt" <<'EOF'
+strtol 0x end  [x]
+EOF
+# Everything else, from the native build, with the disagreeing lines taken out.
+grep -v '^hex floats\|^hex subnormal\|^strtol 0x end' "$TMP/want.txt" \
+  > "$TMP/want_nochex.txt"
 
 # Every optimization level: the bugs this catches have been level-specific
 # before (a value read narrower than its type at -O2), so one level is not
@@ -64,10 +64,15 @@ for O in 0 1 2 3; do
     fail=1
     continue
   fi
-  grep -v '^hex floats\|^hex subnormal' "$TMP/got$O.txt" \
+  grep -v '^hex floats\|^hex subnormal\|^strtol 0x end' "$TMP/got$O.txt" \
     > "$TMP/got_nochex$O.txt"
   if ! diff -u "$TMP/want_nochex.txt" "$TMP/got_nochex$O.txt"; then
     echo "libc: -O$O differs from the native build" >&2
+    fail=1
+  fi
+  grep '^strtol 0x end' "$TMP/got$O.txt" > "$TMP/strtol_got$O.txt"
+  if ! diff -u "$TMP/strtol_want.txt" "$TMP/strtol_got$O.txt"; then
+    echo "libc: -O$O disagrees with musl on strtol(\"0x\")" >&2
     fail=1
   fi
   grep '^hex floats\|^hex subnormal' "$TMP/got$O.txt" \

@@ -46,9 +46,10 @@ typedef __UINTMAX_TYPE__ uintmax_t;
 /* Absolute value macros that avoid the signed-overflow UB of `-x`. */
 #define MSIL_ABS(x) ((x) < 0 ? -(x) : (x))
 
-/* The CLR has no C-style va_list. The backend lowers llvm.va_start by
- * storing the address of a System.ArgIterator into the va_list slot, and
- * the accessors below read through that pointer (see printLibcSeam). */
+/* A vararg definition is not a CLR `vararg` method: the backend passes the
+ * trailing arguments in a buffer and lowers llvm.va_start to point the
+ * va_list at it, so the accessors below read 8-byte slots through that
+ * pointer (see printLibcSeam). */
 typedef __builtin_va_list va_list;
 #define va_start(ap, last) __builtin_va_start(ap, last)
 #define va_end(ap) __builtin_va_end(ap)
