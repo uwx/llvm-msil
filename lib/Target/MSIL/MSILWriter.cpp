@@ -12,8 +12,10 @@
 // -----
 //  * Scalars live in locals of a storage type wide enough for the value
 //    (i8/i16/i1 -> int32, i32 -> int32, i64 -> int64, ptr -> void*). Width is
-//    normalized explicitly (conv.i1/i2) whenever a narrow value is stored or
-//    compared, so no bits are lost and unsigned compares see the right bits.
+//    normalized explicitly whenever a narrow value is stored or compared, so
+//    no bits are lost and unsigned compares see the right bits: conv.u1/conv.u2
+//    for i8/i16, and an and-mask for i1, which has no conv that isolates one bit
+//    (conv.u1 would keep the low eight). See widthConv.
 //  * Pointers are unmanaged `void*`; the CLR never moves them, so IR pointer
 //    arithmetic maps directly onto byte addresses.
 //  * Aggregates and vectors are explicit-layout value classes, moved with
@@ -504,10 +506,15 @@ StringRef memSuffixOf(Type *Ty) {
   report_fatal_error("MSIL: unsupported memory type");
 }
 
-/// conv opcode that normalizes an int on the stack to \p Ty's declared width.
+/// Instructions that normalize an int on the stack to \p Ty's declared width.
 const char *widthConv(Type *Ty) {
   unsigned N = Ty->getIntegerBitWidth();
-  if (N == 1 || N == 8)
+  // i1 has no conv that isolates one bit: conv.u1 keeps the low eight, so a
+  // `trunc i64 %j to i1` would leave 2 as 2 and every `j & 1` value would test
+  // true on odd rows. Masking is the only form that produces 0 or 1.
+  if (N == 1)
+    return "ldc.i4.1\n\tand";
+  if (N == 8)
     return "conv.u1";
   if (N == 16)
     return "conv.u2";
@@ -1746,9 +1753,13 @@ void MSILWriter::printVectorBinary(StringRef Op, const Instruction *Inst,
         << "\n";
   std::string Sfx = getMemSuffix(EltTy);
   // ldind.i1/i2 sign-extend; unsigned lane ops need the high bits cleared.
-  const char *Ext = ZeroExtLanes ? (ElemSize == 1 ? "\tconv.u1\n"
-                                                  : "\tconv.u2\n")
-                                 : "";
+  // A 4- or 8-byte lane already occupies its full width on the stack, so
+  // re-extending it would only truncate: conv.u2 there cuts an i32 lane to
+  // 16 bits.
+  const char *Ext = !ZeroExtLanes  ? ""
+                    : ElemSize == 1 ? "\tconv.u1\n"
+                    : ElemSize == 2 ? "\tconv.u2\n"
+                                    : "";
   for (unsigned I = 0; I < N; ++I) {
     // &R[I] = A[I] op B[I]
     printAggregateLaneAddr(R, EltTy, I * ElemSize);

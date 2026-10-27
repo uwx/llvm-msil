@@ -491,14 +491,6 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   passes only the fixed arguments, and some runtimes reject `calli vararg`
   outright. The instruction is emitted as a plain `calli`, which is the same
   call.
-* **stb's PNG round trip is level-skipped where clang emits the bad loop.** A
-  Paeth-filter loop in stb_image comes out mis-translated (rows 0-1 are right,
-  later rows are noise). That is a real backend bug this suite found, not a
-  host difference; which levels hit it depends on the IR, which the target and
-  the clang that produced it both decide: every clang tried on the ELF target,
-  and clang 22 and later on the Windows target, while clang 18 on Windows is
-  correct. `stb.sh` runs `-O0` and skips the affected levels (`STB_SKIP_LEVELS`
-  overrides the choice) until it is fixed.
 * **Two constructs only an ELF clang emits are unsupported.** `long double` is
   `x86_fp80` there (MSVC's is `double`), which the writer rejects as an
   unsupported memory type; and an ELF C++ vtable holds `ptrtoint` function

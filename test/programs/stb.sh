@@ -29,26 +29,6 @@ STB_COMMIT=003501f6d7a8668ce8b6d875e34dd97ad0d5d5b5
 STB_URL=https://raw.githubusercontent.com/nothings/stb/$STB_COMMIT
 CACHE=${MSIL_TEST_CACHE:-/tmp/msil-thirdparty/stb-$STB_COMMIT}
 
-# An optimized clang -O1 and above produce a Paeth-filter loop that the
-# backend translates wrongly: rows 0 and 1 are right and every later row is
-# noise, from IR that the same backend compiles correctly at -O0. That is a
-# backend bug this test found, not a host difference, so the level is skipped
-# until it is fixed rather than failing the gate. -O0 and the rest of the
-# program still run.
-#
-# Which levels are affected depends on the IR, which the target and the clang
-# that compiled it both decide: the ELF target is wrong at every clang tried,
-# the Windows target only from clang 22 on. clang 18 on Windows is correct at
-# every level.
-SKIP_LEVELS=${STB_SKIP_LEVELS:-}
-if [ -z "$SKIP_LEVELS" ]; then
-  clang_ver=$("$CLANG" -dumpversion 2>/dev/null | cut -d. -f1)
-  case "$clang_ver" in ''|*[!0-9]*) clang_ver=0 ;; esac
-  if [ "$MSIL_HOST" != windows ] || [ "$clang_ver" -ge 22 ]; then
-    SKIP_LEVELS="1 2 3"
-  fi
-fi
-
 if [ ! -f "$CACHE/data/map_01.png" ] || [ ! -f "$CACHE/stb_image.h" ]; then
   mkdir -p "$CACHE/data"
   fetch() {
@@ -80,9 +60,6 @@ LIBM=
 # -O0), so checking one level would have missed them.
 fail=0
 for O in 0 1 2 3; do
-  case " $SKIP_LEVELS " in
-    *" $O "*) echo "stb: -O$O skipped (known backend mistranslation)"; continue ;;
-  esac
   "$CLANG" $MSIL_CFLAGS -S -emit-llvm -O$O -w -I"$CACHE" \
     -o "$TMP/stb$O.ll" "$TMP/stb.c"
   "$MSIL" "$TMP/stb$O.ll" -o "$TMP/stb$O.il" $MSIL_CRT_ARGS

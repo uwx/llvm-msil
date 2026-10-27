@@ -50,6 +50,21 @@ define i32 @sext_i1(i1 %c) {
   ret i32 %v
 }
 
+; An i1 is one bit wide, and no conv opcode produces that. `conv.u1` keeps the
+; low eight, so `trunc i64 %j to i1` on row 2 leaves 2, which tests true; the
+; bit has to be masked out. stb_image's PNG decoder hit this in
+; `cur = filter_buf + (j & 1)*width`, where every even row then read the other
+; row's filter buffer and only the first two rows decoded correctly.
+define i1 @trunc_to_i1(i64 %x) {
+; CHECK-LABEL: .method static {{.*}} 'trunc_to_i1'
+; CHECK: conv.u8
+; CHECK-NEXT: ldc.i4.1
+; CHECK-NEXT: and
+; CHECK-NOT: conv.u1
+  %v = trunc i64 %x to i1
+  ret i1 %v
+}
+
 ; A bitcast between integer and float is a reinterpretation. Storing into a
 ; local of the *destination* type would convert instead, so the bits go
 ; through memory of the source type.
