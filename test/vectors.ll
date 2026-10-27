@@ -99,6 +99,20 @@ define <32 x i8> @scalar_i8(<32 x i8> %a, <32 x i8> %b) {
   ret <32 x i8> %r
 }
 
+; An unsigned lane op has to clear the lanes' high bits, because ldind.i4
+; leaves a 32-bit lane alone but the old code re-extended every lane as if it
+; were 16 bits wide, so `urem` on an i32 lane produced `(lane & 0xffff) % rhs`.
+; A 4-byte lane needs no conversion at all; only the 1- and 2-byte ones do.
+define <8 x i32> @scalar_urem(<8 x i32> %a, <8 x i32> %b) {
+; CHECK-LABEL: .method static {{.*}} 'scalar_urem'
+; CHECK-NOT: Vector::Rem
+; CHECK: ldind.i4
+; CHECK-NOT: conv.u2
+; CHECK: rem.un
+  %r = urem <8 x i32> %a, %b
+  ret <8 x i32> %r
+}
+
 ; Vector<T> has no remainder, so it keeps the lane path.
 define <8 x i32> @scalar_srem(<8 x i32> %a, <8 x i32> %b) {
 ; CHECK-LABEL: .method static {{.*}} 'scalar_srem'
