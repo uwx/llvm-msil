@@ -8,11 +8,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <limits.h>
 
-/* The case-insensitive comparisons are POSIX. MSVC spells them with a leading
- * underscore, so the native reference build needs the map while the MSIL build
- * gets the portable library's own definitions. */
-#if defined(_MSC_VER) && !defined(__clang__) || defined(MSIL_LIBC_NATIVE)
+/* The case-insensitive comparisons are POSIX. The Windows CRT only has the
+ * underscore spelling, so the native reference build needs the map there; on
+ * an ELF host the names are the POSIX ones already. The MSIL build gets the
+ * portable library's own definitions either way. */
+#if defined(_WIN32) && (defined(_MSC_VER) && !defined(__clang__) || \
+                        defined(MSIL_LIBC_NATIVE))
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
 int _stricmp(const char *, const char *);
@@ -70,6 +73,9 @@ int main(void) {
   show("strtol none end", end);
   pint("strtol base2", strtol("1011", 0, 2));
   pint("strtol base36", strtol("zz", 0, 36));
+  /* The portable library is compiled for the Windows ABI, where long is 32
+   * bits. The reference build uses the host's long, so a value that saturates
+   * to LONG_MAX has to be printed as "is it the limit", not as the limit. */
   pint("strtol clamp", strtol("99999999999999999999999", 0, 10) == LONG_MAX);
   pint("atoi", atoi(" -77x"));
   pint("atol", atol("+8"));

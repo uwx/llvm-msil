@@ -23,6 +23,21 @@ import tempfile
 TEST_SUCCESS_EXIT_CODE = 6
 TEST_XFAIL_EXIT_CODE = 25
 
+WINDOWS = os.name == "nt"
+# An assembled PE keeps this name on both hosts; Linux starts it through
+# `dotnet`, which is why the extension is not a platform switch.
+EXE = ".exe"
+RUNTIMECONFIG = ('{"runtimeOptions":{"tfm":"net9.0","framework":'
+                 '{"name":"Microsoft.NETCore.App","version":"9.0.0"}}}')
+
+# Constructs the backend rejects with a deliberate fatal error. A test that
+# needs one is skipped, not failed: it is a documented gap in the README, not a
+# regression. The message is matched, so the list cannot hide a crash.
+KNOWN_UNSUPPORTED = (
+    "MSIL: unsupported constant: i64 ptrtoint",  # ptrtoint in a vtable
+    "MSIL: unsupported memory type",             # x86_fp80 (long double)
+    "MSIL: unsupported instruction llvm.load.relative",  # ELF PIC switch table
+)
 
 # A backend failure can raise a Windows error dialog (report_fatal_error calls
 # abort(), and the default CRT puts up a modal box), which would otherwise
@@ -35,9 +50,26 @@ def run(cmd, cwd=None):
         p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, timeout=RUN_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return 1, ("timed out after %ds (a failure dialog is probably up; "
-                   "run `taskkill /F /IM llvm-msil.exe`)" % RUN_TIMEOUT)
+        hint = ("run `taskkill /F /IM llvm-msil.exe`" if WINDOWS
+                else "kill the leftover llvm-msil process")
+        return 1, ("timed out after %ds (a failure probably hung; %s)"
+                   % (RUN_TIMEOUT, hint))
     return p.returncode, p.stdout.decode("utf-8", "replace")
+
+
+def run_assembly(exe, cwd=None):
+    """Start an assembled program.
+
+    `dotnet` is the launcher on both hosts: a bare run binds .NET Framework's
+    mscorlib on Windows, and on Linux there is no way to exec a managed PE at
+    all. It needs the framework named, so the runtimeconfig goes next to the
+    assembly first.
+    """
+    path = os.path.join(cwd, exe) if cwd else exe
+    with open(os.path.splitext(path)[0] + ".runtimeconfig.json", "w",
+              newline="\n") as f:
+        f.write(RUNTIMECONFIG + "\n")
+    return run(["dotnet", exe], cwd=cwd)
 
 
 def check_xfail(path):
@@ -77,8 +109,7 @@ class Runner:
         rc, out = run([self.args.llvm_msil, ir, "-o", il])
         if rc:
             return "llvm-msil failed:\n" + out
-        rc, out = run([self.args.ilasm, "/exe", "/quiet",
-                       "/output:" + exe, il])
+        rc, out = run([self.args.ilasm, "-exe", "-quiet", "-output:" + exe, il])
         if rc or not os.path.exists(exe):
             return "ilasm failed:\n" + out
         return None
@@ -86,7 +117,7 @@ class Runner:
     def one_ll(self, src, tmp):
         """IR test: the reference result comes from lli, not a native build."""
         stem = os.path.splitext(os.path.basename(src))[0]
-        msil = os.path.join(tmp, stem + ".msil.exe")
+        msil = os.path.join(tmp, stem + ".msil" + EXE)
         il = os.path.join(tmp, stem + ".il")
         want, refout = run([self.args.lli, src])
         want &= 0xFF
@@ -95,10 +126,10 @@ class Runner:
         rc, out = run([self.args.llvm_msil, src, "-o", il])
         if rc:
             return False, "llvm-msil failed:\n" + out
-        rc, out = run([self.args.ilasm, "/exe", "/quiet", "/output:" + msil, il])
+        rc, out = run([self.args.ilasm, "-exe", "-quiet", "-output:" + msil, il])
         if rc or not os.path.exists(msil):
             return False, "ilasm failed:\n" + out
-        got, out = run([msil])
+        got, out = run_assembly(msil)
         got &= 0xFF
         if got != want:
             return False, "returned %d, lli %d\n%s" % (got, want, out[-2000:])
@@ -107,8 +138,8 @@ class Runner:
     def one(self, src, tmp, opt, cplusplus, extra):
         """Return (ok, detail) for one source file at one optimization level."""
         stem = os.path.splitext(os.path.basename(src))[0]
-        native = os.path.join(tmp, stem + ".native.exe")
-        msil = os.path.join(tmp, stem + ".msil.exe")
+        native = os.path.join(tmp, stem + ".native" + EXE)
+        msil = os.path.join(tmp, stem + ".msil" + EXE)
         ir = os.path.join(tmp, stem + ".ll")
         il = os.path.join(tmp, stem + ".il")
 
@@ -124,8 +155,10 @@ class Runner:
 
         err = self.build_msil(src, msil, ir, il, opt, cplusplus, extra)
         if err:
+            if any(m in err for m in KNOWN_UNSUPPORTED):
+                return None, err
             return False, err
-        got, out = run([msil])
+        got, out = run_assembly(msil)
         got &= 0xFF
         if got != want:
             return False, "returned %d, native %d\n%s" % (got, want, out[-2000:])

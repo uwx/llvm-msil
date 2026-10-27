@@ -21,6 +21,7 @@ set -eu
 
 MSIL=${1:?usage: sdl3_port.sh <llvm-msil>}
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/../platform.sh"
 CLANG=${CLANG:-I:/Downloads/llvm-project-18.1.7/bin/clang.exe}
 ILASM=${ILASM:-/tmp/tools/ilasm-core.exe}
 # llvm-link and llvm-dis come from the LLVM build, which a standalone
@@ -29,11 +30,15 @@ LLVM_BIN=${LLVM_BIN:-/w/projects/llvm-cbe/llvm-project/llvm/build/build64/bin}
 SDL3=${SDL3_DIR:-}
 
 skip() { echo "sdl3-port: skipped ($*)"; exit 0; }
+# The retained translation units are the win32 and dummy platform adapters, and
+# the pinvoke list below is Windows'. Porting SDL's own C is a Windows-ABI
+# exercise; see the README.
+[ "$MSIL_HOST" = windows ] || skip "SDL3's Windows platform adapters"
 [ -n "$SDL3" ] || skip "SDL3_DIR unset"
 [ -f "$SDL3/src/SDL.c" ] || skip "no SDL3 source at $SDL3"
 [ -x "$CLANG" ] || skip "no clang at $CLANG"
 [ -x "$ILASM" ] || skip "no ilasm at $ILASM"
-[ -x "$LLVM_BIN/llvm-link.exe" ] || skip "no llvm-link next to $MSIL"
+[ -x "$LLVM_BIN/llvm-link$EXE" ] || skip "no llvm-link next to $MSIL"
 
 # SDL has to be configured first: the include tree it generates carries the
 # HAVE_* answers the sources are written against.
@@ -105,7 +110,7 @@ done
   -I"$INC" -I"$SDL3/src" -o "$TMP/harness.ll" "$HERE/sdl3_port.c"
 
 # llvm-link refuses two definitions of one symbol, and SDL's own copies win.
-"$LLVM_BIN/llvm-link.exe" "$TMP/harness.ll" $OBJS "$TMP/stubs.ll" \
+"$LLVM_BIN/llvm-link$EXE" "$TMP/harness.ll" $OBJS "$TMP/stubs.ll" \
   -o "$TMP/all.bc"
 
 # The C runtime split is a name heuristic, so every DLL this program reaches
@@ -120,18 +125,18 @@ done
 # two CRTs buffer stdout separately, which scrambles the output order. The
 # builtin libc keeps stdio inside the module, where it is one stream.
 "$MSIL" "$TMP/all.bc" -o "$TMP/port.il" -msil-libc=builtin $LIBS
-"$ILASM" -exe -quiet -output:"$TMP/port.exe" "$TMP/port.il"
+"$ILASM" $MSIL_ILASM_OPTS -output:"$TMP/port$EXE" "$TMP/port.il"
 
 # `dotnet` needs the framework named; a bare exe resolves mscorlib's facade.
-printf '%s\n' '{"runtimeOptions":{"tfm":"net9.0","framework":{"name":"Microsoft.NETCore.App","version":"9.0.0"}}}' \
-  > "$TMP/port.runtimeconfig.json"
+write_runtimeconfig "$TMP/port"
 
 EXPECTED="init 1
 driver dummy
 window 1
 size 320 0
 quit 1"
-GOT=$(cd "$TMP" && SDL_VIDEODRIVER=dummy timeout 120 dotnet port.exe | tr -d '\r')
+GOT=$(cd "$TMP" && SDL_VIDEODRIVER=dummy timeout 120 run_msil "port$EXE" \
+      | tr -d '\r')
 if [ "$GOT" != "$EXPECTED" ]; then
   echo "sdl3-port: FAILED"
   echo "--- expected ---"; echo "$EXPECTED"

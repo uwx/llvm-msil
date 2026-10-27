@@ -9,6 +9,7 @@ set -eu
 
 MSIL=${1:?usage: int128-runtime.sh <llvm-msil>}
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/../platform.sh"
 CLANG=${CLANG:-I:/Downloads/llvm-project-18.1.7/bin/clang.exe}
 ILASM=${ILASM:-/tmp/tools/ilasm-core.exe}
 TMP=$(mktemp -d)
@@ -64,13 +65,12 @@ int main(void) {
 }
 SRC
 
-"$CLANG" -S -emit-llvm -O1 -w -o "$TMP/t.ll" "$TMP/t.c"
-"$MSIL" "$TMP/t.ll" -o "$TMP/t.il"
-"$ILASM" -exe -quiet -output:"$TMP/t.exe" "$TMP/t.il"
-printf '%s\n' '{"runtimeOptions":{"tfm":"net9.0","framework":{"name":"Microsoft.NETCore.App","version":"9.0.0"}}}' \
-  > "$TMP/t.runtimeconfig.json"
+"$CLANG" $MSIL_CFLAGS -S -emit-llvm -O1 -w -o "$TMP/t.ll" "$TMP/t.c"
+"$MSIL" "$TMP/t.ll" -o "$TMP/t.il" $MSIL_CRT_ARGS
+"$ILASM" $MSIL_ILASM_OPTS -output:"$TMP/t$EXE" "$TMP/t.il"
+write_runtimeconfig "$TMP/t"
 # The program writes CRLF on Windows; compare line content only.
-(cd "$TMP" && dotnet t.exe) | tr -d "\r" > "$TMP/got.txt"
+(cd "$TMP" && run_msil "t$EXE") | tr -d "\r" > "$TMP/got.txt"
 
 cat > "$TMP/want.txt" <<'EXPECT'
 a 1 12345

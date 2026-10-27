@@ -15,12 +15,42 @@ if (NOT DEFINED LLVM_VERSION_MAJOR)
   endif()
 
   # project() is what fixes the compiler flags, so the build type has to be
-  # known first. It is only available from LLVM's config, hence the throwaway
-  # project() here and the real one below.
+  # known first. It is only available from LLVM's config: LLVMConfig.cmake sets
+  # LLVM_BUILD_TYPE.
+  #
+  # Enabling a language is what makes LLVMConfig's find_package(ZLIB)/zstd/
+  # LibXml2 see the compiler's library directories -- without one they fail to
+  # find the multiarch path and configure dies on a missing ZLIB::ZLIB. Doing so
+  # also defaults CMAKE_BUILD_TYPE to Debug, so a user's choice is remembered
+  # and LLVM's is put back otherwise.
   project(msil-build-type-probe NONE)
+  if (CMAKE_BUILD_TYPE)
+    set(MSIL_BUILD_TYPE_GIVEN 1)
+  endif()
+  enable_language(CXX)
   find_package(LLVM 22.1 REQUIRED CONFIG)
-  if (NOT CMAKE_BUILD_TYPE)
+  if (NOT MSIL_BUILD_TYPE_GIVEN)
     set(CMAKE_BUILD_TYPE "${LLVM_BUILD_TYPE}" CACHE STRING "" FORCE)
+  endif()
+
+  # The Windows release tarball records the DIA SDK path of the machine that
+  # built it, which is not necessarily where DIA is installed, or whether it is
+  # installed at all. DIA is reached only through LLVMSymbolize, which nothing
+  # here links, so an entry naming a file that is not there is dropped instead
+  # of failing the link.
+  if (TARGET LLVMDebugInfoPDB)
+    get_target_property(MSIL_PDB_DEPS LLVMDebugInfoPDB INTERFACE_LINK_LIBRARIES)
+    if (MSIL_PDB_DEPS)
+      set(MSIL_PDB_KEPT)
+      foreach(DEP IN LISTS MSIL_PDB_DEPS)
+        if (DEP MATCHES "diaguids\\.lib$" AND NOT EXISTS "${DEP}")
+          continue()
+        endif()
+        list(APPEND MSIL_PDB_KEPT "${DEP}")
+      endforeach()
+      set_target_properties(LLVMDebugInfoPDB PROPERTIES
+                            INTERFACE_LINK_LIBRARIES "${MSIL_PDB_KEPT}")
+    endif()
   endif()
 
   project(llvm-msil CXX)
@@ -38,6 +68,7 @@ if (NOT DEFINED LLVM_VERSION_MAJOR)
   list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
   include(AddLLVM)
   set(CMAKE_CXX_STANDARD 17)
+
 endif()
 
 # Target names differ between the two modes; the artifact names do not.

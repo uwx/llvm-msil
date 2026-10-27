@@ -1,0 +1,12 @@
+# Shell and Python scripts are run by their shebang on Linux as well as by
+# bash on Windows, and a CRLF line ending makes the interpreter name "bash\r".
+# The checked-in form is LF; core.autocrlf can rewrite the working copy, so a
+# checkout used from both hosts pins these to LF.
+*.sh    text eol=lf
+*.py    text eol=lf
+
+# The IL fixtures are compared by FileCheck against emitted text, where a CRLF
+# would be a spurious mismatch.
+*.ll    text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf

@@ -173,3 +173,16 @@ define double @keep(double %x) {
   %c = call double @llvm.canonicalize.f64(double %x)
   ret double %c
 }
+
+; cttz.elts counts trailing zero elements, which -O2 produces for the
+; two-lane i1 that a vectorized `a && b` becomes. IL has no SIMD, so it
+; expands to one compare and select per lane: the answer is the index of the
+; first non-zero element, or the element count when there is none.
+; CHECK-LABEL: 'cttz2'
+; CHECK-COUNT-2: ceq
+define i64 @cttz2(<2 x i1> %v) {
+  %r = call i64 @llvm.experimental.cttz.elts.i64.v2i1(<2 x i1> %v, i1 false)
+  ret i64 %r
+}
+
+declare i64 @llvm.experimental.cttz.elts.i64.v2i1(<2 x i1>, i1 immarg)

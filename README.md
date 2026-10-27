@@ -38,24 +38,86 @@ read from LLVM's config rather than defaulted; `project()` fixes the compiler
 flags, which is why the CMake file probes the build type before creating the
 real project.
 
+### Building on Linux
+
+Same commands; the LLVM build can be the release tarball, which carries a CMake
+config, `llvm-config` and the static libraries the backend links:
+
+```
+curl -fsSLO https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-X64.tar.xz
+tar xf LLVM-22.1.8-Linux-X64.tar.xz            # ~/llvm22/LLVM-22.1.8-Linux-X64
+cmake -S . -B build -G Ninja -DLLVM_DIR=~/llvm22/LLVM-22.1.8-Linux-X64/lib/cmake/llvm
+cmake --build build -j 8
+```
+
+Five things the release tarball does not give you, and where each comes from:
+
+* **FileCheck, `not` and `count`.** The release script builds LLVM with
+  `LLVM_INSTALL_UTILS` off, so no archive has them. Either take the
+  distribution's (`apt-get install llvm-18-tools` puts them in
+  `/usr/lib/llvm-18/bin`) and pass `LLVM_TOOLS_DIR` to the gate, or build them
+  from the tagged sources; any LLVM version's FileCheck works, since the
+  backend only needs them for the lit suite.
+* **lit.** `pip install lit`. `run_tests.sh` finds it on `PATH`.
+* **ilasm.** Not in LLVM at all: take `runtime.linux-x64.Microsoft.NETCore.ILAsm`
+  from nuget, which carries `runtimes/linux-x64/native/ilasm`.
+* **dotnet.** The assembled programs run on the CLR, so a .NET 9 runtime has to
+  be on `PATH` (`dotnet-install.sh` is the shortest route).
+* **The C runtime.** `zlib1g-dev`, `libzstd-dev` and `libxml2-dev` are what
+  `find_package(LLVM)` resolves; without them configure fails on a missing
+  `ZLIB::ZLIB`.
+
+Then:
+
+```
+LLVM_TOOLS_DIR=/usr/lib/llvm-18/bin CLANG=~/llvm22/.../bin/clang \
+ILASM=~/tools/bin/ilasm PYTHON=python3 \
+  ./test/run_tests.sh ./build/tools/llvm-msil/llvm-msil
+```
+
+`CLANG` compiles the test programs and must be the same LLVM version the backend
+links against. The programs compile for `x86_64-unknown-linux-gnu`, so their
+`long` is 64-bit; the portable C library is built twice, once per ABI, and the
+program's triple picks the copy, so the two agree.
+
+The scripts read `uname` and pick `.exe` output and `dotnet` as the launcher;
+the Windows path is unchanged. `.github/workflows/ci.yml` runs this sequence on
+both `ubuntu-latest` and `windows-latest`, building the missing FileCheck tools
+from the tagged sources rather than assuming a distribution's.
+
 ## Usage
 
 ```
 clang -S -emit-llvm -O1 -o prog.ll prog.c
 llvm-msil prog.ll -o prog.il
-ilasm /exe /output:prog.exe prog.il
-./prog.exe
+ilasm -exe -output:prog.exe prog.il
+dotnet prog.exe
 ```
 
-A bare `.exe` run directly binds the .NET Framework, which is where `mscorlib`
-resolves. To run it on modern .NET instead, put a `prog.runtimeconfig.json`
-next to it naming `Microsoft.NETCore.App` and use `dotnet prog.exe`; without
-that file `dotnet` cannot find the framework. Types this backend emits
-(`System.Int128`, `System.Numerics.Vector<T>`, `System.Math`) are modern .NET
-types, so the runtimeconfig is what you want in practice.
+`-exe`/`-output:` is the .NET Core `ilasm` spelling and works on both hosts;
+the PowerShell `.NET Framework` assembler wants `/exe`/`/output:` instead.
+
+`dotnet prog.exe` needs a `prog.runtimeconfig.json` next to the assembly naming
+`Microsoft.NETCore.App`; without it `dotnet` cannot find the framework. On
+Windows a bare `./prog.exe` also runs, binding the .NET Framework where
+`mscorlib` resolves, and there it needs no runtimeconfig (on Linux there is no
+launcher for a managed PE, so `dotnet` is the only way). Types this backend
+emits (`System.Int128`, `System.Numerics.Vector<T>`, `System.Math`) are modern
+.NET types, so the runtimeconfig is what you want in practice.
 
 The input IR needs a target triple with a data layout, or the writer cannot
 size any aggregate type.
+
+The IL is the same whichever host emitted it, but three choices do follow the
+module's *triple* rather than the host: which library an unbound import pinvokes
+(`msvcrt.dll`/`ucrtbase.dll` for a Windows triple, `libc.so.6` for ELF), whether
+a vararg `double` crosses as its raw bits (Windows x64's shadow slot) or as a
+`float64` (SysV's SSE register), and which of the two portable C library builds
+is linked. A Windows triple on Linux and an ELF triple on Windows are both
+consistent; what is not is mixing a program compiled for one ABI with a library
+built for the other, which is why the libc is built twice (see below). Runtime
+support is a separate axis again: a managed vararg method, and therefore the
+portable `printf`, runs only on Windows (see "Known limitations").
 
 ## Options
 
@@ -176,18 +238,27 @@ that can be expressed in pure C, which is the part a portable program leans on.
 
 ### How it gets into the module
 
-The C is compiled to IR at build time (by a clang that can target the Windows
-ABI, since that decides `sizeof(long)`) and the IR is embedded in the backend
-as a string literal. At translate time it is linked in with
-`LinkOnlyNeeded`, which follows references from the program and skips
+The C is compiled to IR at build time, twice: once for the Windows ABI and once
+for SysV. `sizeof(long)` and `wchar_t` are what differ, and they are in the
+public signatures (`strtol` returns a 32-bit `long` on Windows and a 64-bit one
+on Linux), so a program compiled for one ABI cannot link the other's copy. Both
+builds are embedded in the backend as string literals, and `linkPortableLibc`
+picks by the module's triple. At translate time the chosen copy is linked in
+with `LinkOnlyNeeded`, which follows references from the program and skips
 everything else: a program that never calls `qsort` does not carry it. The
 linked functions then go through the same lowering and emission as user code.
 
 That ordering is why `lib/Target/MSIL/libc/*.c` is the source of truth. The
-build compiles it whenever it can find a clang that targets Windows; an
-in-tree LLVM build may not have one, so `lib/Target/MSIL/libc.ll` is checked in
-as the fallback and `scripts/update-libc-ir.sh` regenerates it. Change the C,
-run the script, and the two stay in step.
+build compiles it whenever it can find a clang that targets both; a build that
+cannot has no SysV copy, and `lib/Target/MSIL/libc.ll` is checked in as the
+Windows-ABI fallback for it, with `scripts/update-libc-ir.sh` regenerating that
+file. Change the C, run the script, and the checked-in copy stays in step.
+
+Whether the library *runs* is a different question from whether it links: its
+`printf` is a managed vararg method, which CoreCLR supports on Windows and
+rejects on Linux, so `-msil-libc=builtin` is usable only there. A plain program
+that calls the CRT's `printf` through a pinvoke thunk is unaffected on either
+host.
 
 ### The vararg seam
 
@@ -316,7 +387,8 @@ things:
 
 * the lit tests, which check emitted IL with `FileCheck`,
 * the upstream llvm-cbe suite (C, C++, and `.ll` tests at four optimization
-  levels) via `cbe_port.py` — 540 tests, 32 xfail,
+  levels) via `cbe_port.py` — 540 tests, 32 xfail (a Linux run skips two more,
+  the casts and C++ vtables noted under "Known limitations"),
 * the end-to-end programs in `test/programs/`, each compared against a native
   build of the same source.
 
@@ -326,7 +398,8 @@ which matters: the bugs they have caught so far each appeared at a single
 level. `int128.sh` and `sdl.sh` are self-contained. `sdl.sh` needs SDL2
 development files: set `SDL2_DIR` to a directory with `include/SDL2` and
 `lib/SDL2.lib`, and `SDL2_BIN` to `SDL2.dll` if it is not in `lib/`. Without
-them the test reports `sdl: skipped` and the gate still passes.
+them the test reports `sdl: skipped` and the gate still passes; it is also
+skipped off Windows, since `SDL2.dll` is what it pinvokes.
 
 `sdl3_port.sh` is the other half of that: rather than calling SDL, it compiles
 SDL3's own C (210 translation units) to CIL and runs it, so it tests the
@@ -334,7 +407,9 @@ backend against a large real codebase rather than against a demo. Set `SDL3_DIR`
 to a checked-out SDL3 tree that has been configured once — the script applies
 `sdl3-msil.patch` itself if the tree is clean — and it reports `sdl3-port:
 skipped` when unset. It takes a few minutes, so it is the slowest thing in the
-gate.
+gate. The retained translation units are SDL's win32 and dummy platform
+adapters and the pinvoke list is Windows', so it is skipped off Windows too:
+porting SDL's own C is a Windows-ABI exercise.
 
 `libc.sh` is the compatibility test for the portable C library: it runs
 `test/programs/libc.c` on the CLR at four optimization levels and diffs the
@@ -342,7 +417,8 @@ output against a native build of the same file. A port is only as good as its
 agreement with the real thing, so the native build is the reference. During
 development the same source also runs natively against the ported `.c` files
 rather than the CRT, which separates a portability bug from a translation bug
-before the MSIL side is involved.
+before the MSIL side is involved. The program's `printf` is the portable one, a
+managed vararg method, so the script skips off Windows.
 
 `doom.sh` runs PureDOOM for a fixed number of tics on a virtual clock and
 hashes the framebuffer; `stb.sh` exercises stb_image (including a PNG
@@ -351,7 +427,15 @@ sources are third-party, so they are fetched at a pinned commit into
 `/tmp/msil-thirdparty` and cached (`MSIL_TEST_CACHE` moves the cache). A
 machine with neither the cache nor network reports `skipped` and the gate
 still passes. `stb.sh` needs a TrueType font; `STB_TEST_FONT` overrides the
-default `C:/Windows/Fonts/arial.ttf`.
+default `C:/Windows/Fonts/arial.ttf`, and on Linux the DejaVu font that the
+distribution installs.
+
+The scripts are host-neutral through `test/platform.sh`, which they source. It
+picks `.exe` output and the ilasm option spelling, writes the runtimeconfig and
+starts assemblies through `dotnet` on both hosts, and on Linux compiles the IR
+for glibc and non-PIC (an ELF clang's default PIC turns switch tables into
+`llvm.load.relative`, which IL has no equivalent of). Tests that need Windows —
+an SDL2.dll pinvoke, MSVC's CRT split — print `skipped` and exit 0 there.
 
 `cbe_port.py` can be driven directly:
 
@@ -373,8 +457,39 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   the real export instead. The forward may go through another printf-family
   wrapper first (`snprintf` reaches `vsnprintf`), so those are matched by name.
   A vararg floating-point argument crosses the boundary as its raw `int64`
-  bits, because the CRT's `va_arg` reads the general-purpose shadow slot on
-  Windows x64.
+  bits on a Windows target, because the CRT's `va_arg` reads the
+  general-purpose shadow slot on Windows x64; an ELF target passes it in an
+  SSE register and the CLR pinvoke stub follows that ABI.
+* **Managed vararg methods do not run on Linux.** A *definition* of a C vararg
+  function is emitted as a `vararg` method with `System.ArgIterator` for
+  `va_start`. CoreCLR on Windows runs it; CoreCLR on Linux raises
+  `InvalidProgramException: Vararg calling convention not supported` for the
+  same assembly (verified with the identical, byte-for-byte IL). That is a
+  runtime limitation, not something the backend can emit around: it is why
+  `-msil-libc=builtin`'s `printf` works on Windows and not on Linux, and why
+  `libc.sh` skips there. A vararg *call* to a pinvoke thunk — what a plain
+  program that calls `printf` gets — works on both.
+* **`calli vararg` is not emitted.** A C function pointer with no prototype
+  (`void (*routine)()`) types as vararg in the IR, but every call through it
+  passes only the fixed arguments, and some runtimes reject `calli vararg`
+  outright. The instruction is emitted as a plain `calli`, which is the same
+  call.
+* **stb's PNG round trip is level-skipped where clang emits the bad loop.** A
+  Paeth-filter loop in stb_image comes out mis-translated (rows 0-1 are right,
+  later rows are noise). That is a real backend bug this suite found, not a
+  host difference; which levels hit it depends on the IR, which the target and
+  the clang that produced it both decide: every clang tried on the ELF target,
+  and clang 22 and later on the Windows target, while clang 18 on Windows is
+  correct. `stb.sh` runs `-O0` and skips the affected levels (`STB_SKIP_LEVELS`
+  overrides the choice) until it is fixed.
+* **Two constructs only an ELF clang emits are unsupported.** `long double` is
+  `x86_fp80` there (MSVC's is `double`), which the writer rejects as an
+  unsupported memory type; and an ELF C++ vtable holds `ptrtoint` function
+  addresses as constant expressions, which the constant writer does not fold.
+  `cbe_port.py` reports the tests that need either as skipped rather than
+  failed, matching on the backend's own error message so it cannot hide a
+  different failure. `llvm.global_ctors` (`__attribute__((constructor))`) is
+  supported: those run from `$MSIL_Startup` before `main`.
 * **`<N x i128>` vectors are broken.** The aggregate class has no valid IL type
   name, so the output does not assemble. There is a `report_fatal_error` on
   element extract/insert, but a vector-typed parameter or return reaches the

@@ -48,6 +48,7 @@
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/TargetParser/Triple.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MathExtras.h"
@@ -59,7 +60,15 @@
 
 // The portable C library, compiled to IR and embedded as a string literal by
 // the build. lib/Target/MSIL/libc/*.c is the source of truth.
-#include "LibcIR.inc"
+//
+// Two ABI builds exist because long and wchar_t follow the target triple and
+// the library's signatures have to match the program's. A build with no clang
+// falls back to the checked-in Windows-ABI IR alone.
+#include "libc-win.inc"
+#if __has_include("libc-sysv.inc")
+#include "libc-sysv.inc"
+#define MSIL_HAVE_LIBC_SYSV
+#endif
 
 using namespace llvm;
 
@@ -511,7 +520,13 @@ std::string MSILWriter::getMemSuffix(Type *Ty) {
 // general-purpose one. The CLR does not duplicate, so such arguments cross the
 // pinvoke boundary as their raw bit pattern in an int64.
 std::string MSILWriter::getVarArgTypeName(Type *Ty) {
-  return Ty->isFloatingPointTy() ? "int64" : getTypeName(Ty);
+  // A double crosses as its bits only for the Windows x64 convention this
+  // comment describes; the SysV ABI passes it in an SSE register and the CLR
+  // pinvoke stub follows the ABI. The choice follows the module's triple, not
+  // the host, so the same IR emits the same IL everywhere.
+  bool WindowsABI = !Triple(Mod->getTargetTriple()).isOSBinFormatELF();
+  return Ty->isFloatingPointTy() && WindowsABI ? "int64"
+                                               : getTypeName(Ty);
 }
 
 // Calls into the portable library normalize every vararg so the callee can
@@ -1570,7 +1585,7 @@ void MSILWriter::printFunctionCall(const Value *FnVal, const CallBase *CB) {
     printValueLoad(Arg);
     if (!FTy->isVarArg() || I < Fixed)
       continue;
-    if (Ty->isFloatingPointTy()) {
+    if (Ty->isFloatingPointTy() && getVarArgTypeName(Ty) == "int64") {
       // Reinterpret, do not convert. Storing an r8 into an int64 local through
       // stloc *converts* it, so go through memory instead: the bits of the
       // local are what the callee's va_arg reads.
@@ -1595,8 +1610,24 @@ void MSILWriter::printFunctionCall(const Value *FnVal, const CallBase *CB) {
 
   if (!Callee) {
     // Indirect call: the target sits above the arguments on the stack.
+    //
+    // The signature is taken as if the call were not vararg. A C function
+    // pointer with no prototype (`void (*routine)()`) is vararg in the IR, but
+    // every call through it passes only the fixed arguments, and the CLR
+    // rejects `calli vararg` outright on some runtimes (CoreCLR on Linux
+    // raises InvalidProgramException). Dropping the marker is the same call:
+    // no trailing argument types are being named anyway.
     printValueLoad(FnVal);
-    out() << "\tcalli\t" << getCallSignature(FTy, CB, "") << '\n';
+    std::string Sig;
+    Sig += getTypeName(FTy->getReturnType());
+    Sig += " (";
+    for (unsigned I = 0, E = FTy->getNumParams(); I != E; ++I) {
+      if (I)
+        Sig += ", ";
+      Sig += getTypeName(FTy->getParamType(I));
+    }
+    Sig += ")";
+    out() << "\tcalli\t" << Sig << '\n';
     return;
   }
 
@@ -3682,6 +3713,30 @@ void MSILWriter::lowerIntrinsics(Function &F) {
         CI->eraseFromParent();
         break;
       }
+      case Intrinsic::experimental_cttz_elts: {
+        // The number of trailing zero elements, which is the index of the
+        // first non-zero one, or the element count when they are all zero.
+        // IL has no SIMD, so this becomes one compare and select per lane;
+        // walking down from the last lane leaves the lowest index winning.
+        // The is_zero_poison flag needs no handling: returning the count for
+        // an all-zero vector is one of the values poison permits. Clang
+        // reaches this at -O2, for the two-lane i1 a vectorized `a && b`
+        // produces.
+        IRBuilder<> B(CI);
+        auto *VTy = cast<VectorType>(CI->getArgOperand(0)->getType());
+        unsigned N = VTy->getElementCount().getFixedValue();
+        Value *V = CI->getArgOperand(0);
+        Value *Zero = Constant::getNullValue(VTy->getElementType());
+        Value *R = ConstantInt::get(CI->getType(), N);
+        for (unsigned I = N; I-- > 0;) {
+          Value *E = B.CreateExtractElement(V, (uint64_t)I);
+          R = B.CreateSelect(B.CreateICmpNE(E, Zero),
+                             ConstantInt::get(CI->getType(), I), R);
+        }
+        CI->replaceAllUsesWith(R);
+        CI->eraseFromParent();
+        break;
+      }
       case Intrinsic::vector_reduce_add:
       case Intrinsic::vector_reduce_and:
       case Intrinsic::vector_reduce_or:
@@ -3874,6 +3929,16 @@ void MSILWriter::collectTypes() {
           if (auto *CV = dyn_cast<Constant>(Op))
             if (CV->getType()->isVectorTy())
               getAggregateName(CV->getType());
+
+  // llvm.global_ctors holds {priority, function, data} triples; the functions
+  // are called from $MSIL_Startup in the order they appear.
+  if (const GlobalVariable *Ctors = Mod->getNamedGlobal("llvm.global_ctors"))
+    if (const auto *Arr = dyn_cast_or_null<ConstantArray>(Ctors->getInitializer()))
+      for (const Use &U : Arr->operands())
+        if (const auto *CS = dyn_cast<ConstantStruct>(U.get()))
+          if (const auto *Fn = dyn_cast<Function>(CS->getOperand(1)->stripPointerCasts()))
+            if (!Fn->isDeclaration())
+              GlobalCtors.push_back(Fn);
 }
 
 void MSILWriter::printAggregateDeclarations() {
@@ -3934,6 +3999,10 @@ std::string MSILWriter::getCName(const Function *F) const {
 
 std::string MSILWriter::getImportName(const Function *F) const {
   std::string Name = getCName(F);
+  // The renames below are MSVC CRT spellings; an ELF target exports the C
+  // names themselves.
+  if (Triple(Mod->getTargetTriple()).isOSBinFormatELF())
+    return Name;
   // POSIX-only names (from an implicit declaration, so the MSVC header never
   // rewrote them) only exist under their underscore spelling in the CRT.
   // shortcut: hand-written list; grow it as programs need more names. Also
@@ -4653,10 +4722,18 @@ void MSILWriter::printLibcMethod(StringRef Name, StringRef Ret,
 void MSILWriter::linkPortableLibc() {
   LLVMContext &Ctx = Mod->getContext();
   SMDiagnostic Err;
+  // The library's C signatures carry the ABI's long and wchar_t, so the copy
+  // has to be the one built for the program's triple. A Linux-triple program
+  // declares strtol as returning i64; the Windows-ABI copy defines i32, and
+  // linking the two leaves the call unresolved.
+  const char *IR = PortableLibcIR;
+#ifdef MSIL_HAVE_LIBC_SYSV
+  if (Triple(Mod->getTargetTriple()).isOSBinFormatELF())
+    IR = PortableLibcIRSysV;
+#endif
   std::unique_ptr<MemoryBuffer> Buf =
-      MemoryBuffer::getMemBuffer(PortableLibcIR, "portable-libc", false);
-  std::unique_ptr<Module> Libc =
-      parseAssembly(*Buf, Err, Ctx, /*UpgradeDebugInfo=*/false);
+      MemoryBuffer::getMemBuffer(IR, "portable-libc", false);
+  std::unique_ptr<Module> Libc = parseAssembly(*Buf, Err, Ctx);
   if (!Libc)
     report_fatal_error("MSIL: the embedded portable libc does not parse: " +
                        Err.getMessage());
@@ -4665,6 +4742,13 @@ void MSILWriter::linkPortableLibc() {
   // agree; adopt this module's so the link does not warn about a mismatch.
   Libc->setDataLayout(Mod->getDataLayout());
   Libc->setTargetTriple(Mod->getTargetTriple());
+  // wchar_size and friends come from the triple that compiled the library, and
+  // the linker refuses two modules that disagree. The program's values are the
+  // ones that describe this module, so they replace the library's.
+  SmallVector<Module::ModuleFlagEntry, 8> Flags;
+  Mod->getModuleFlagsMetadata(Flags);
+  for (const Module::ModuleFlagEntry &Flag : Flags)
+    Libc->setModuleFlag(Flag.Behavior, Flag.Key->getString(), Flag.Val);
 
   // Only what the module actually reaches is merged: LinkOnlyNeeded follows
   // references from the module being linked into, and skips the rest, so a
@@ -4906,6 +4990,11 @@ StringRef MSILWriter::getLibraryForExports(StringRef Symbol) {
 }
 
 StringRef MSILWriter::getLibraryForCRT(StringRef Symbol) {
+  // On an ELF target the C runtime is libc.so.6 (and libm, but glibc 2.34+
+  // merged libm into libc, and the loader resolves through libc either way).
+  // The split below is a Windows fact.
+  if (Triple(Mod->getTargetTriple()).isOSBinFormatELF())
+    return "libc.so.6";
   // The C runtime is split: msvcrt.dll has the C89 functions, and every C99
   // addition is only exported from ucrtbase.dll. This list is checked against
   // the real export tables rather than guessed — `ldexp`, `sinh` and `atan`
@@ -5234,6 +5323,14 @@ void MSILWriter::printModuleStartup() {
 
   if (!Templates.empty())
     out() << "\tcall\tvoid " << C << "'$MSIL_Init'()\n";
+
+  // __attribute__((constructor)) functions, in priority order, before main.
+  // An ELF clang emits these as llvm.global_ctors; MSVC has no such attribute,
+  // so a Windows build never produces the list. The entries are {priority,
+  // function, data}; a null function is the terminator clang pads with.
+  for (const Function *Ctor : GlobalCtors)
+    out() << "\tcall\t" << getTypeName(Ctor->getReturnType()) << " "
+          << getFunctionRef(Ctor) << "()\n";
 
   if (!Main || Main->isDeclaration()) {
     out() << "\tldc.i4.0\n\tret\n}\n";

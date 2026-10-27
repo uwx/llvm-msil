@@ -1,0 +1,181 @@
+# Builds llvm-msil against a released LLVM and runs the gate on Windows and
+# Linux. The gate is the same one used locally: test/run_tests.sh.
+#
+# The LLVM download is the slow step (0.5-1.9 GB), so it is cached per runner
+# OS and keyed on the version.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  LLVM_VERSION: 22.1.8
+  # The .NET SDK the ilasm package and the emitted assemblies need. Must be a
+  # runtime the assembled .exe's runtimeconfig can name.
+  DOTNET_VERSION: 9.0.x
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    # The runner context is only available from job level down. Both paths are
+    # writable by the runner user, which the cache needs in order to restore
+    # into them; on Linux that rules out /opt, which would need root.
+    env:
+      LLVM_ROOT: ${{ runner.os == 'Windows' && 'C:\llvm-msil' || '/home/runner/llvm-msil' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # CMake looks for MSVC through the environment a developer prompt sets
+      # up, and a runner has none: without this, configure fails to identify
+      # any C++ compiler.
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Cache LLVM
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LLVM_ROOT }}
+          key: llvm-${{ env.LLVM_VERSION }}-${{ runner.os }}
+
+      # The Windows installer (LLVM-$VERSION-win64.exe) is tools only -- no
+      # headers, component .lib files or LLVMConfig.cmake -- so the standalone
+      # build cannot link against it. The clang+llvm archives carry the full
+      # development tree on both OSes, so both jobs use one of those.
+      - name: Install LLVM (Linux)
+        if: runner.os == 'Linux' && steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          url=https://github.com/llvm/llvm-project/releases/download
+          curl -fsSL -o /tmp/llvm.tar.xz \
+            "$url/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
+          mkdir -p "$LLVM_ROOT"
+          tar xf /tmp/llvm.tar.xz -C "$LLVM_ROOT" --strip-components=1
+
+      - name: Install LLVM (Windows)
+        if: runner.os == 'Windows' && steps.llvm-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$env:LLVM_VERSION/clang+llvm-$env:LLVM_VERSION-x86_64-pc-windows-msvc.tar.xz"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\llvm.tar.xz"
+          New-Item -ItemType Directory -Force -Path $env:LLVM_ROOT | Out-Null
+          # Windows' own tar unpacks the .xz container; --strip-components
+          # drops the clang+llvm-* root directory.
+          tar -xf "$env:RUNNER_TEMP\llvm.tar.xz" -C $env:LLVM_ROOT --strip-components=1
+
+      # The packages LLVM's own LLVMConfig.cmake resolves with find_package;
+      # without them configure dies on a target such as ZLIB::ZLIB.
+      - name: Install LLVM's link dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zlib1g-dev libzstd-dev libxml2-dev
+
+      # lit is a pip package. FileCheck, `not` and `count` are LLVM utilities
+      # that no release archive ships (the release script leaves
+      # LLVM_INSTALL_UTILS off), so they are compiled from the sources of the
+      # same tag against the libraries just installed. -fno-rtti matches how
+      # LLVM itself was built; without it the link fails on typeinfo.
+      - name: Install lit
+        shell: bash
+        run: python -m pip install lit
+
+      - name: Build lit tools
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            llvm=$(cygpath -u "$LLVM_ROOT")
+            ext=.exe
+            # --system-libs would print bare .lib names, which clang reads as
+            # file paths, plus xml2s.lib, which the archive does not ship
+            # because nothing linked here reaches LLVMWindowsManifest.
+            sys="-lpsapi -lshell32 -lole32 -luuid -ladvapi32 -lws2_32 -lntdll"
+          else
+            llvm=$LLVM_ROOT
+            ext=
+            sys=$("$llvm/bin/llvm-config" --link-static --system-libs)
+          fi
+          mkdir -p "$RUNNER_TEMP/lit-tools" && cd "$RUNNER_TEMP"
+          base="https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-${LLVM_VERSION}/llvm/utils"
+          curl -fsSL -o FileCheck.cpp "$base/FileCheck/FileCheck.cpp"
+          curl -fsSL -o not.cpp "$base/not/not.cpp"
+          curl -fsSL -o count.c "$base/count/count.c"
+          libs=$("$llvm/bin/llvm-config" --link-static --libs filecheck support demangle)
+          ldflags=$("$llvm/bin/llvm-config" --ldflags)
+          for t in FileCheck not; do
+            "$llvm/bin/clang++" -std=c++17 -fno-rtti -O2 "$t.cpp" -I"$llvm/include" \
+              $ldflags $libs $sys -o "lit-tools/$t$ext"
+          done
+          "$llvm/bin/clang" -O2 count.c -I"$llvm/include" -o "lit-tools/count$ext"
+          "./lit-tools/FileCheck$ext" --version
+          echo "LLVM_TOOLS_DIR=$RUNNER_TEMP/lit-tools" >> "$GITHUB_ENV"
+
+      - name: Install ilasm
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            pkg=runtime.win-x64.microsoft.netcore.ilasm
+            ext=.exe
+          else
+            pkg=runtime.linux-x64.microsoft.netcore.ilasm
+            ext=
+          fi
+          dest="$RUNNER_TEMP/ilasm"
+          # The package is versioned alongside the runtime; take the newest 9.0.
+          ver=$(curl -fsSL "https://api.nuget.org/v3-flatcontainer/$pkg/index.json" \
+                | python -c 'import json,sys; print([v for v in json.load(sys.stdin)["versions"] if v.startswith("9.0.")][-1])')
+          curl -fsSL -o "$RUNNER_TEMP/ilasm.nupkg" \
+            "https://api.nuget.org/v3-flatcontainer/$pkg/$ver/$pkg.$ver.nupkg"
+          mkdir -p "$dest"
+          # python's zipfile rather than unzip: the Windows runner has no unzip.
+          python -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+            "$RUNNER_TEMP/ilasm.nupkg" "$RUNNER_TEMP/ilasm-pkg"
+          cp "$RUNNER_TEMP"/ilasm-pkg/runtimes/*/native/ilasm* "$dest/"
+          chmod +x "$dest/ilasm$ext"
+          # Fail here rather than at the first test if the binary cannot start.
+          # With no arguments it prints its usage and exits nonzero, so the exit
+          # status is not the thing to test.
+          "$dest/ilasm$ext" 2>&1 | grep -q Usage
+          echo "ILASM=$dest/ilasm$ext" >> "$GITHUB_ENV"
+
+      - name: Configure
+        shell: bash
+        run: |
+          llvm=$LLVM_ROOT
+          if [ "$RUNNER_OS" = Windows ]; then llvm=$(cygpath -u "$LLVM_ROOT"); fi
+          cmake -S . -B build -G Ninja -DLLVM_DIR="$llvm/lib/cmake/llvm"
+
+      - name: Build
+        shell: bash
+        run: cmake --build build -j 4
+
+      - name: Gate
+        shell: bash
+        run: |
+          llvm=$LLVM_ROOT
+          msil=./build/tools/llvm-msil/llvm-msil
+          if [ "$RUNNER_OS" = Windows ]; then
+            llvm=$(cygpath -u "$LLVM_ROOT")
+            msil=$msil.exe
+          fi
+          # CLANG compiles the test programs and must be the LLVM the backend
+          # links against; LLVM_BIN_DIR is where the gate finds lli. The
+          # llvm-cbe suite needs a separate checkout CI does not have, so the
+          # gate reports it skipped here; that is expected.
+          LLVM_BIN_DIR="$llvm/bin" CLANG="$llvm/bin/clang" \
+            ./test/run_tests.sh "$msil"

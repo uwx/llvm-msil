@@ -4,6 +4,10 @@
 ; RUN: llvm-msil %s -o - -msil-lib-map 'SDL_Init=SDL2.dll' \
 ; RUN:   -msil-lib-map 'printf=mycrt.dll' | FileCheck %s --check-prefix=EXACT
 
+; The CRT fallback follows the target, not the host: an ELF triple binds these
+; to libc.so.6. Pinned so the check describes one behaviour on every machine.
+target triple = "x86_64-pc-windows-msvc"
+
 ; An imported symbol binds to the C runtime by default. -msil-lib-map rebinds
 ; it to another DLL, matched on the symbol the module references rather than on
 ; the export name a POSIX spelling might be rewritten to.

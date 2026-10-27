@@ -328,6 +328,8 @@ private:
     const Constant *Value;
   };
   std::vector<DynInit> DynInits;
+  /// llvm.global_ctors functions, in order; called by $MSIL_Startup.
+  std::vector<const Function *> GlobalCtors;
   const GlobalVariable *CurGV = nullptr;
 
   /// A pinvoke thunk. `ilasm` rejects `vararg` pinvokes, so every distinct

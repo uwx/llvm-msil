@@ -5,6 +5,11 @@
 ; about the plumbing: which definitions appear, how a vararg call reaches the
 ; C code, and what the seam methods look like. Behaviour is covered by
 ; test/programs/libc.sh, which compares against a native build.
+;
+; The signatures below are the Windows ABI's, where long is 32 bits. An ELF
+; triple selects a copy of the library built with a 64-bit long, so the triple
+; is pinned rather than left to the host.
+target triple = "x86_64-pc-windows-msvc"
 
 declare i32 @printf(ptr, ...)
 declare i32 @puts(ptr)

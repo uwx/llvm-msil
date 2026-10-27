@@ -12,8 +12,13 @@ set -eu
 
 MSIL=${1:?usage: sdl.sh <llvm-msil>}
 HERE=$(cd "$(dirname "$0")" && pwd)
+. "$HERE/../platform.sh"
 CLANG=${CLANG:-I:/Downloads/llvm-project-18.1.7/bin/clang.exe}
 ILASM=${ILASM:-/tmp/tools/ilasm-core.exe}
+
+# The demo pinvokes SDL2.dll, which is a Windows library. The backend emits the
+# same IL everywhere, but the test can only run where that DLL loads.
+[ "$MSIL_HOST" = windows ] || { echo "sdl: skipped (SDL2.dll is Windows-only)"; exit 0; }
 
 # shortcut: one machine's SDK path; override SDL2_DIR anywhere else.
 SDL2_DIR=${SDL2_DIR:-I:/New folder (2)/pcsx2/deps}
@@ -41,7 +46,7 @@ SRC="$HERE/sdl_demo.c"
 run() { (cd "$TMP" && SDL_VIDEODRIVER=dummy "$@" 2>&1 | tr -d '\r'); }
 
 # Native reference.
-"$CLANG" "${CFLAGS[@]}" -o "$TMP/native.exe" "$SRC" "$LIB" || {
+"$CLANG" "${CFLAGS[@]}" -o "$TMP/native$EXE" "$SRC" "$LIB" || {
   echo "sdl: native build failed"; exit 1; }
 
 # Through the backend. -msil-lib-map is what makes SDL_* bind to SDL2.dll
@@ -49,16 +54,15 @@ run() { (cd "$TMP" && SDL_VIDEODRIVER=dummy "$@" 2>&1 | tr -d '\r'); }
 "$CLANG" "${CFLAGS[@]}" -S -emit-llvm -o "$TMP/demo.ll" "$SRC"
 "$MSIL" "$TMP/demo.ll" -o "$TMP/demo.il" -msil-lib-map 'SDL_*=SDL2.dll' || {
   echo "sdl: llvm-msil failed"; exit 1; }
-"$ILASM" -exe -quiet -output:"$TMP/demo.exe" "$TMP/demo.il" || {
+"$ILASM" $MSIL_ILASM_OPTS -output:"$TMP/demo$EXE" "$TMP/demo.il" || {
   echo "sdl: ilasm failed"; exit 1; }
-printf '%s\n' '{"runtimeOptions":{"tfm":"net9.0","framework":{"name":"Microsoft.NETCore.App","version":"9.0.0"}}}' \
-  > "$TMP/demo.runtimeconfig.json"
+write_runtimeconfig "$TMP/demo"
 
 # Volatile lines (timing, driver names) are excluded on both sides; what is
 # compared is the frame checksum, the event round trip and the dynload probe.
 KEEP='^(frames|events|dynamics|version|ok|gl |FAIL)'
-run ./native.exe --frames 40 | grep -E "$KEEP" > "$TMP/want.txt"
-run dotnet demo.exe --frames 40 | grep -E "$KEEP" > "$TMP/got.txt"
+run "./native$EXE" --frames 40 | grep -E "$KEEP" > "$TMP/want.txt"
+run run_msil "demo$EXE" --frames 40 | grep -E "$KEEP" > "$TMP/got.txt"
 
 if ! diff -u "$TMP/want.txt" "$TMP/got.txt"; then
   echo "sdl: output mismatch"
