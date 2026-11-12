@@ -69,7 +69,11 @@ extern void __msil_write(const void *p, size_t n);
 
 /* Already implemented in IL behind these same C names, so they are only
  * declared here. Calling memcpy/strlen by name keeps the -msil-alloc hook
- * and the IL byte loops in effect for the C code too. */
+ * and the IL byte loops in effect for the C code too. malloc is the IL
+ * allocator (NativeMemory), available under -msil-libc=builtin; strndup
+ * below is the one C function here that allocates. */
+extern void *malloc(size_t n);
+extern void free(void *p);
 extern void *memcpy(void *dst, const void *src, size_t n);
 extern void *memmove(void *dst, const void *src, size_t n);
 extern void *memset(void *dst, int c, size_t n);
@@ -114,8 +118,20 @@ char *strtok_r(char *s, const char *sep, char **p);
 int strcasecmp(const char *a, const char *b);
 int strncasecmp(const char *a, const char *b, size_t n);
 void *memchr(const void *s, int c, size_t n);
+void *memrchr(const void *s, int c, size_t n);
 int strcoll(const char *a, const char *b);
 size_t strxfrm(char *dst, const char *src, size_t n);
+
+/* string.c, GNU/BSD/POSIX additions. */
+void *memccpy(void *dst, const void *src, int c, size_t n);
+void *mempcpy(void *dst, const void *src, size_t n);
+char *stpcpy(char *dst, const char *src);
+char *stpncpy(char *dst, const char *src, size_t n);
+char *strsep(char **sp, const char *sep);
+char *strcasestr(const char *haystack, const char *needle);
+char *strndup(const char *s, size_t n);
+char *strchrnul(const char *s, int c);
+void explicit_bzero(void *dst, size_t n);
 
 /* stdlib.c */
 int atoi(const char *s);
@@ -125,15 +141,25 @@ long strtol(const char *s, char **end, int base);
 unsigned long strtoul(const char *s, char **end, int base);
 long long strtoll(const char *s, char **end, int base);
 unsigned long long strtoull(const char *s, char **end, int base);
+intmax_t strtoimax(const char *s, char **end, int base);
+uintmax_t strtoumax(const char *s, char **end, int base);
+double strtod(const char *s, char **end);
+float strtof(const char *s, char **end);
 int abs(int x);
 long labs(long x);
 long long llabs(long long x);
 typedef struct { int quot, rem; } div_t;
 typedef struct { long quot, rem; } ldiv_t;
 typedef struct { long long quot, rem; } lldiv_t;
+typedef struct { intmax_t quot, rem; } imaxdiv_t;
 div_t div(int num, int den);
 ldiv_t ldiv(long num, long den);
 lldiv_t lldiv(long long num, long long den);
+imaxdiv_t imaxdiv(intmax_t num, intmax_t den);
+intmax_t imaxabs(intmax_t x);
+int ffs(int x);
+int ffsl(long x);
+int ffsll(long long x);
 void qsort(void *base, size_t n, size_t width,
            int (*cmp)(const void *, const void *));
 void *bsearch(const void *key, const void *base, size_t n, size_t width,
@@ -150,5 +176,14 @@ int vsprintf(char *dst, const char *fmt, va_list ap);
 int vsnprintf(char *dst, size_t n, const char *fmt, va_list ap);
 int puts(const char *s);
 int putchar(int c);
+
+/* Output without a FILE: stdout is the CLR console, so a `void *` stands in
+ * for the FILE* a program would pass. */
+int fputc(int c, void *stream);
+int fputs(const char *s, void *stream);
+size_t fwrite(const void *p, size_t sz, size_t n, void *stream);
+
+/* stdio.c: fixed English messages, no locale. */
+char *strerror(int errnum);
 
 #endif

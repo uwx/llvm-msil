@@ -122,7 +122,7 @@ built for the other, which is why the libc is built twice (see below).
 | Option | Effect |
 |---|---|
 | `-msil-class-name=Ns.Type` | Emit module members inside this class instead of `<Module>`, so C# can call them without reflection. |
-| `-msil-libc=builtin` | Link the portable C library into the module: `printf`/`snprintf`/`sprintf`/`puts`/`putchar`, `atoi`/`strtol`/`strtoul` and the rest of the conversion family, `abs`/`div`/`qsort`/`bsearch`/`rand`, the `str*` and `mem*` family, and `<ctype.h>`. Written in C (ported from musl), compiled to IR at build time, and linked selectively, so only what the program reaches is emitted. It is a superset of `il`: `malloc`/`free`/`calloc`/`realloc` come from the IL subset backed by `NativeMemory`, and are emitted for `builtin` too. |
+| `-msil-libc=builtin` | Link the portable C library into the module: `printf`/`snprintf`/`sprintf`/`puts`/`putchar` and the FILE-less `fputs`/`fputc`/`fwrite`/`strerror`, `atoi`/`strtol`/`strtoul`/`strtoimax` and the rest of the conversion family, `abs`/`div`/`imaxdiv`/`ffs`/`qsort`/`bsearch`/`rand`, the `str*` and `mem*` family (including the POSIX/GNU additions `stpcpy`/`stpncpy`/`memccpy`/`mempcpy`/`strsep`/`strcasestr`/`strndup`/`strchrnul`/`explicit_bzero`), and `<ctype.h>`. Written in C (ported from musl), compiled to IR at build time, and linked selectively, so only what the program reaches is emitted. It is a superset of `il`: `malloc`/`free`/`calloc`/`realloc` come from the IL subset backed by `NativeMemory`, and are emitted for `builtin` too. |
 | `-msil-libc=il` | Emit the smaller hand-written IL subset instead: `malloc`/`free`/`calloc`/`realloc` over `NativeMemory`, plus `memcpy`/`memset`/`memcmp` and the `str*` family, but no `printf`. For a module that must link no C in. |
 | `-msil-libc=<asm>[:<type>]` | Bind the same calls to a managed assembly you supply (type defaults to `MSIL.Libc`). |
 | `-msil-alloc=<asm>:<type>` | Route `malloc`/`free`/`calloc`/`realloc` to methods of that name on your type, so unmanaged allocations can be instrumented. |
@@ -384,7 +384,19 @@ path is enough.
   through unchanged anyway.
 * `errno` does not exist. `strtol` saturates silently on overflow instead of
   setting `ERANGE`; `%m`, `%n$` positional arguments and `%n` are not
-  implemented.
+  implemented. `strerror` therefore answers from a fixed English table indexed
+  by the C99/POSIX values, since there is no `errno` to consult and no locale
+  to translate through.
+* There is no `FILE`, so the stream functions that need one (`fopen`,
+  `fprintf`, `fread`, `fseek`, `fflush`) are absent and keep their CRT
+  pinvoke. The output functions whose only job is to write text -- `fputs`,
+  `fputc`, `fwrite` -- are present with a `void *` standing in for the unused
+  `FILE *` argument, and write to the same console as `printf`.
+* `strtod`, `strtof` and `sscanf` are not implemented: exact decimal-to-binary
+  conversion needs either a bignum (musl's `strtod`) or a `long double` wider
+  than the CLR has, and a version that merely looked right on common inputs
+  would mis-round the hard ones, which is worse than pinvoking the CRT.
+  `strtoimax`/`strtoumax` are the integer forms and are present.
 * `strtol("0x", &end, 0)` leaves `end` on the `x`, which is what musl and
   glibc do and what C99 7.20.1.4 says (the longest initial subsequence that is
   a prefix of a matching sequence). MSVC steps back over both characters and

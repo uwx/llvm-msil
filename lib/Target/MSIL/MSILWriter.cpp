@@ -179,13 +179,16 @@ bool isPortableLibcSymbol(StringRef N) {
       "strnlen", "strncat", "strspn", "strcspn", "strpbrk", "strtok",
       "strtok_r", "strcasecmp", "strncasecmp", "memchr", "memrchr",
       "strcoll", "strxfrm",
+      "memccpy", "mempcpy", "stpcpy", "stpncpy", "strsep", "strcasestr",
+      "strndup", "strchrnul", "explicit_bzero",
       // stdlib.h
       "atoi", "atol", "atoll", "strtol", "strtoul", "strtoll", "strtoull",
-      "abs", "labs", "llabs", "div", "ldiv", "lldiv", "qsort", "bsearch",
-      "rand", "srand",
+      "strtoimax", "strtoumax", "abs", "labs", "llabs", "div", "ldiv",
+      "lldiv", "imaxdiv", "imaxabs", "ffs", "ffsl", "ffsll", "qsort",
+      "bsearch", "rand", "srand",
       // stdio.h
       "printf", "vprintf", "sprintf", "snprintf", "vsprintf", "vsnprintf",
-      "puts", "putchar",
+      "puts", "putchar", "fputc", "fputs", "fwrite", "strerror",
   };
   return is_contained(Names, N);
 }
