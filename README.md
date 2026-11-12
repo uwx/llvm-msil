@@ -122,12 +122,14 @@ built for the other, which is why the libc is built twice (see below).
 | Option | Effect |
 |---|---|
 | `-msil-class-name=Ns.Type` | Emit module members inside this class instead of `<Module>`, so C# can call them without reflection. |
-| `-msil-libc=builtin` | Link the portable C library into the module: `printf`/`snprintf`/`sprintf`/`puts`/`putchar`, `atoi`/`strtol`/`strtoul` and the rest of the conversion family, `abs`/`div`/`qsort`/`bsearch`/`rand`, the `str*` and `mem*` family, and `<ctype.h>`. Written in C (ported from musl), compiled to IR at build time, and linked selectively, so only what the program reaches is emitted. `malloc` and friends still come from the IL subset, which is backed by `NativeMemory`. |
+| `-msil-libc=builtin` | Link the portable C library into the module: `printf`/`snprintf`/`sprintf`/`puts`/`putchar`, `atoi`/`strtol`/`strtoul` and the rest of the conversion family, `abs`/`div`/`qsort`/`bsearch`/`rand`, the `str*` and `mem*` family, and `<ctype.h>`. Written in C (ported from musl), compiled to IR at build time, and linked selectively, so only what the program reaches is emitted. It is a superset of `il`: `malloc`/`free`/`calloc`/`realloc` come from the IL subset backed by `NativeMemory`, and are emitted for `builtin` too. |
 | `-msil-libc=il` | Emit the smaller hand-written IL subset instead: `malloc`/`free`/`calloc`/`realloc` over `NativeMemory`, plus `memcpy`/`memset`/`memcmp` and the `str*` family, but no `printf`. For a module that must link no C in. |
 | `-msil-libc=<asm>[:<type>]` | Bind the same calls to a managed assembly you supply (type defaults to `MSIL.Libc`). |
 | `-msil-alloc=<asm>:<type>` | Route `malloc`/`free`/`calloc`/`realloc` to methods of that name on your type, so unmanaged allocations can be instrumented. |
 | `-msil-math=0` | Do not bind libm to `System.Math`/`System.MathF`; pinvoke the CRT instead. |
 | `-msil-lib-map='SDL_*=SDL2.dll'` | Bind matching imports to a native library. `*` matches any suffix, and the option repeats. |
+| `-msil-library` | Emit a library instead of a program: no `.entrypoint`, and a public `MSILInitialize` static method runs `llvm.global_ctors` behind a one-shot guard. Requires `-msil-class-name`. |
+| `-msil-assembly-name=Name` | Name the emitted assembly (default `MSIL`). |
 | `-msil-fp80=double` | Map `x86_fp80` (`long double` on the x86 ELF target) to binary64 instead of rejecting it. Lossy: 53 mantissa bits and an 11-bit exponent instead of 64 and 15, so a value round-trips changed or overflows to infinity. The 16-byte slot, the field offsets and `sizeof` are unchanged; only the value stored in the slot is a `float64`. A long-double libm call with no `System.Math` binding, or a `long double` passed through a vararg, is rejected by name rather than pinvoked with a mismatched signature. |
 
 ## How types map
@@ -145,8 +147,35 @@ built for the other, which is why the libc is built twice (see below).
 | a vector one SIMD register wide | `System.Numerics.Vector<T>` |
 | any other vector | explicit-layout value class (a byte blob) |
 
-Narrow integers are normalized to their declared width at every store and
-compare, so unsigned comparisons see the right high bits.
+`i1`/`i8`/`i16` are normalized to their declared width at every store, and any
+integer narrower than its CLR register is normalized before a compare, so
+unsigned comparisons see the right high bits. Widths with no CLR type (`i24`
+and friends) cannot be masked by a `conv`; their loads mask to the declared
+width (see below) while their stores stay `int32`.
+
+## Library mode
+
+`-msil-library` turns a translation unit into something a managed caller links
+against rather than a program. It changes three things: the module has no
+`.entrypoint` (ilasm's `/dll` is the matching switch), every member goes in the
+`-msil-class-name` type as before, and the class gets
+
+```
+.method public static void 'MSILInitialize'() cil managed
+```
+
+which checks a `'$MSIL_Initialized'` flag, runs `llvm.global_ctors` the first
+time, and returns immediately after. A C library's own constructor has no other
+way to run: `beforefieldinit` does not promise a class initializer runs before
+a static method call, and an IL `.cctor` is not something the module can rely
+on when the library is loaded through a managed reference. Call
+`MSILInitialize` once from the managed side (a `static` constructor in the
+wrapper is the natural place); calling it again is a no-op. If there are no
+constructors the guard is still emitted, and the call to `'$MSIL_Init'` is
+omitted.
+
+`-msil-library` without `-msil-class-name` is a fatal error: there would be no
+type to put the method in.
 
 ## Signed narrow integers
 
@@ -154,6 +183,17 @@ Because a stored narrow integer is held zero-extended, every *signed* use has
 to restore the sign first: `sitofp`, `sdiv`, `srem` and `ashr` emit
 `conv.i1`/`conv.i2` on their operand. Without it a negative `i8`/`i16` reads as
 a large positive number.
+
+The same applies to `lshr`, but in the other direction: the IL stack holds the
+operand as an `int32` even when the IR type is `i8`, so a logical shift must
+*zero*-extend first (`conv.u1`/`conv.u2`) or `lshr i8 0xf0, 2` shifts
+`0xfffffff0` and yields `0xfc` instead of `0x3c`. `zext` has the same trap and
+masks its source before widening.
+
+A width with no CLR type of its own — `i24` is what an APInt constant can
+produce — has no `conv` that isolates it, so those uses mask to the declared
+width with `and` instead (`lshr i24 0xffab0a0a, 8` would otherwise be masked
+to 8 bits by `conv.u1` and lose the table entirely).
 
 Likewise, `stloc` into a local of a different type *converts*; it does not
 reinterpret. A bitcast between integer and float therefore goes through memory
@@ -390,6 +430,12 @@ Three places where the managed and C semantics differ, all handled explicitly:
   while `sqrt`, `sin`, `ldexp`, `sinh` and friends are C89 and live in
   `msvcrt.dll`. The name-based split between the two is checked against the
   real export tables.
+
+`exp2` and `ldexp` never reach that split: `exp2` is a member of
+`System.Double`/`System.Single` itself (`System.Math` has no such method), and
+`ldexp` maps to `Math.ScaleB`, which is exact by definition. Both would
+otherwise pinvoke a CRT export on a module that is meant to have no CRT
+imports at all.
 
 `-msil-math=0` turns the binding off and restores CRT pinvokes.
 

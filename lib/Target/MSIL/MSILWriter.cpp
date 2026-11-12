@@ -199,6 +199,21 @@ static cl::opt<std::string> ExternClassName(
                                 "<Module>, so C# can call them directly"),
     cl::value_desc("namespace.Name"), cl::init(""));
 
+// Library output: no .entrypoint, and a public static MSILInitialize() that
+// the caller invokes once. A class name is mandatory, because that method must
+// be reachable from managed code.
+static cl::opt<bool> LibraryMode(
+    "msil-library",
+    cl::desc("Emit a library (no .entrypoint) with a public static "
+             "MSILInitialize() that must be called once before other members"),
+    cl::init(false));
+
+// The assembly's own identity, so the .il and the emitted DLL name agree.
+static cl::opt<std::string> AssemblyName(
+    "msil-assembly-name",
+    cl::desc("Name of the emitted assembly's .assembly directive"),
+    cl::value_desc("name"), cl::init("MSIL"));
+
 // A load or store whose address is `getelementptr inbounds %S, ptr %p, 0, N`
 // becomes ldfld/stfld on the struct class, so the member is named rather than
 // reached by adding an offset to a raw pointer. The pointer that goes on the
@@ -733,8 +748,7 @@ void MSILWriter::printValueLoad(const Value *V) {
                          Fn->getName() +
                          "'; call it directly instead");
     out() << "\tldftn\t"
-        << getCallSignature(Fn->getFunctionType(), nullptr,
-                            "'" + getValueName(Fn) + "'")
+        << getCallSignature(Fn->getFunctionType(), nullptr, getFunctionRef(Fn))
         << "\n";
     return;
   }
@@ -780,10 +794,29 @@ void MSILWriter::printValueLoadAsInt(const Value *V, bool Signed) {
       out() << "\tneg\n";
     return;
   }
-  if (N == 16)
+  if (N == 16) {
     out() << (Signed ? "\tconv.i2\n" : "\tconv.u2\n");
-  else
+    return;
+  }
+  if (N == 8) {
     out() << (Signed ? "\tconv.i1\n" : "\tconv.u1\n");
+    return;
+  }
+  // A width with no CLR type of its own (i24, from an APInt constant, is the
+  // one that shows up in practice) lives in an int32/int64 local with only its
+  // low N bits defined; there is no conv that isolates N bits. Mask instead,
+  // and sign-extend from bit N-1 when the caller needs a signed value.
+  unsigned Reg = N < 32 ? 32 : 64;
+  if (N < Reg) {
+    APInt Mask = APInt::getLowBitsSet(Reg, N);
+    out() << "\tldc." << (Reg == 32 ? "i4" : "i8") << "\t"
+          << Mask.getSExtValue() << "\n\tand\n";
+    if (Signed) {
+      unsigned Sh = Reg - N;
+      out() << "\tldc.i4\t" << Sh << "\n\tshl\n"
+            << "\tldc.i4\t" << Sh << "\n\tshr\n";
+    }
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -1010,7 +1043,10 @@ void MSILWriter::printConstantExpr(const ConstantExpr *CE) {
     case Instruction::Or: Op = "or"; break;
     default: Op = "xor"; break;
     }
-    printValueLoad(CE->getOperand(0));
+    if (CE->getOpcode() == Instruction::LShr)
+      printValueLoadAsInt(CE->getOperand(0), false);
+    else
+      printValueLoad(CE->getOperand(0));
     printValueLoad(CE->getOperand(1));
     out() << '\t' << Op << '\n';
     return;
@@ -1203,10 +1239,13 @@ void MSILWriter::printCastInstruction(unsigned Op, const Value *V, Type *Ty) {
       out() << '\t' << widthConv(Ty) << '\n';
     return;
   case Instruction::ZExt:
-    printValueLoad(V);
-    // Zero-extend: mask off the source's high bits first.
-    out() << "\tconv.u8\n";
-    if (Ty->getIntegerBitWidth() <= 32)
+    // Mask the source to its declared width first. An i8/i16 argument arrives
+    // sign-extended on the int32 stack, so plain conv.u8 would keep the high
+    // bits (0xFFFFFFAF instead of 0xAF) before the destination truncation.
+    printValueLoadAsInt(V, false);
+    if (Ty->getIntegerBitWidth() > 32)
+      out() << "\tconv.u8\n";
+    else if (Ty->getIntegerBitWidth() < 32)
       out() << '\t' << widthConv(Ty) << '\n';
     return;
   case Instruction::SExt:
@@ -2610,7 +2649,10 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
     out() << "\tconv.i4\n\tshl\n";
     return;
   case Instruction::LShr:
-    printValueLoad(Op0);
+    // A logical shift of the declared width, but the IL stack is int32 and
+    // loading an i8/i16 argument sign-extends it. Zero-extend first, or
+    // `lshr i8 0xf0, 2` becomes 0x3ffffffc >> ... -> 0xfc instead of 0x3c.
+    printValueLoadAsInt(Op0, false);
     printValueLoad(Op1);
     out() << "\tconv.i4\n\tshr.un\n";
     return;
@@ -3445,6 +3487,9 @@ void MSILWriter::lowerLinkedFunctions() {
   FPM.add(createUnreachableBlockEliminationPass());
   FPM.add(createLowerSwitchPass());
   FPM.add(createCFGSimplificationPass());
+  // CFGSimplify can rebuild a switch from LowerSwitch's comparison tree; the
+  // writer cannot emit one, so lower once more after the cleanup.
+  FPM.add(createLowerSwitchPass());
   FPM.add(createPromoteMemoryToRegisterPass());
   FPM.doInitialization();
   for (Function &F : *Mod)
@@ -4263,14 +4308,20 @@ std::string MSILWriter::getImportName(const Function *F) const {
 
 namespace {
 
-/// The set the built-in libc implements; a symbol outside it keeps its pinvoke.
-bool isBuiltinSymbol(StringRef N) {
+/// The set the built-in IL libc implements, and that libc/*.c deliberately
+/// leaves to IL: these must bind to $MSIL_Libc rather than a linked C copy.
+bool isILLibcSymbol(StringRef N) {
   static const char *const Names[] = {
       "malloc",  "free",    "calloc",  "realloc", "memcpy", "memmove",
       "memset",  "memcmp",  "strlen",  "strcmp",  "strncmp", "strcpy",
       "strncpy", "strcat",  "strchr",  "strrchr", "strstr", "strdup",
   };
-  if (is_contained(Names, N))
+  return is_contained(Names, N);
+}
+
+/// The set the built-in libc implements; a symbol outside it keeps its pinvoke.
+bool isBuiltinSymbol(StringRef N) {
+  if (isILLibcSymbol(N))
     return true;
   // The portable C library covers the string, character, conversion and stdio
   // surface too. Anything it defines is bound to the linked copy; the check is
@@ -4417,6 +4468,13 @@ bool MSILWriter::getManagedTarget(const Function *F, ManagedType &Out) const {
     Out = AllocType;
     return true;
   }
+  // In portable mode LibcType is {"", ""}, so the guard below would reject
+  // every symbol. The 18 names the IL libc implements must be routed to it
+  // first; everything else stays a declaration for the linked C library.
+  if (EmitPortable && isILLibcSymbol(Name)) {
+    Out = {"", "$MSIL_Libc"};
+    return true;
+  }
   if (LibcType.Type.empty())
     return false;
   // The hand-written IL subset implements a fixed set; anything else keeps
@@ -4428,10 +4486,11 @@ bool MSILWriter::getManagedTarget(const Function *F, ManagedType &Out) const {
   return true;
 }
 
-// The C libm names that have a System.Math/MathF equivalent with identical
-// semantics. Everything else keeps its CRT pinvoke: `exp2` and `exp10` have no
-// managed counterpart at all, and fmin/fmax deliberately do not because
-// Math.Min/Max propagate NaN where the C functions return the other operand.
+// The C libm names that have a managed equivalent with identical semantics.
+// Everything else keeps its CRT pinvoke: `exp10` has no managed counterpart,
+// and fmin/fmax deliberately do not because Math.Min/Max propagate NaN where
+// the C functions return the other operand. `exp2` binds to
+// System.Double/Single::Exp2 rather than a Math member.
 bool MSILWriter::getMathTarget(StringRef Symbol, Type *Ty,
                                ManagedType &Out) const {
   bool IsF32 = Ty->isFloatTy();
@@ -4451,7 +4510,7 @@ bool MSILWriter::getMathTarget(StringRef Symbol, Type *Ty,
       {"sinh", "Sinh"},   {"cosh", "Cosh"},    {"tanh", "Tanh"},
       {"exp", "Exp"},     {"log", "Log"},      {"log2", "Log2"},
       {"log10", "Log10"}, {"pow", "Pow"},      {"copysign", "CopySign"},
-      {"scalbn", "ScaleB"},
+      {"scalbn", "ScaleB"}, {"ldexp", "ScaleB"}, {"exp2", "Exp2"},
       // rint, nearbyint and roundeven all round to even under the default
       // rounding mode, which is Math.Round with no MidpointRounding argument.
       // (fabs is not here: the intrinsic lowering already clears the sign bit,
@@ -4479,6 +4538,9 @@ bool MSILWriter::getMathTarget(StringRef Symbol, Type *Ty,
   std::string Member = It->second;
   Out.Assembly = "System.Runtime";
   Out.Type = IsF32 ? "System.MathF" : "System.Math";
+  // Exp2 is a static member of the primitive types, not of Math/MathF.
+  if (Base == "exp2")
+    Out.Type = IsF32 ? "System.Single" : "System.Double";
   Out.Member = Member;
   Out.ExtraArg.clear();
   // Math.Round is banker's rounding, which is C's round() only for roundeven;
@@ -5120,8 +5182,8 @@ void MSILWriter::printBuiltinLibc() {
   // many types but not that one.
   out() << ".assembly extern System.Private.CoreLib { .ver 9:0:0:0\n"
            "  .publickeytoken = (B0 3F 5F 7F 11 D5 0A 3A ) }\n";
-  out() << ".class public auto ansi abstract sealed beforefieldinit '"
-      << LibcType.Type << "' extends [mscorlib]System.Object\n{\n";
+  out() << ".class public auto ansi abstract sealed beforefieldinit "
+           "'$MSIL_Libc' extends [mscorlib]System.Object\n{\n";
 
   // The allocator hook, when given, replaces the four allocating calls only:
   // the rest of the libc still runs on NativeMemory, and because strdup calls
@@ -5611,7 +5673,7 @@ void MSILWriter::printThreadLocalAccessor(const GlobalImage &Image) {
         out() << "\tldftn\t"
             << getCallSignature(cast<Function>(DI.Value)->getFunctionType(),
                                 nullptr,
-                                "'" + getValueName(DI.Value) + "'", false,
+                                getFunctionRef(cast<Function>(DI.Value)), false,
                                 isEmittedVarArgDef(cast<Function>(DI.Value)))
             << "\n";
       } else {
@@ -5689,7 +5751,7 @@ void MSILWriter::printInitializer() {
       out() << "\tldftn\t"
           << getCallSignature(cast<Function>(DI.Value)->getFunctionType(),
                               nullptr,
-                              "'" + getValueName(DI.Value) + "'", false,
+                              getFunctionRef(cast<Function>(DI.Value)), false,
                               isEmittedVarArgDef(cast<Function>(DI.Value)))
           << "\n";
     } else {
@@ -5704,7 +5766,31 @@ void MSILWriter::printInitializer() {
       printThreadLocalAccessor(T);
 }
 
+// A library has no .entrypoint, so nothing runs the module's one-time setup.
+// MSILInitialize is that entry point, with a bool guard so a second call is a
+// no-op. The guard is not thread-safe by itself; a managed wrapper's type
+// initializer is expected to provide that guarantee.
+void MSILWriter::printLibraryInitializer() {
+  std::string C = ClassPrefix();
+  out() << "\n.field private static bool '$MSIL_Initialized'\n";
+  out() << "\n.method public static void 'MSILInitialize'() cil managed\n{\n";
+  out() << "\t.maxstack\t8\n";
+  out() << "\tldsfld\tbool " << C << "'$MSIL_Initialized'\n";
+  out() << "\tbrtrue\tIL_msil_init_done\n";
+  out() << "\tldc.i4.1\n";
+  out() << "\tstsfld\tbool " << C << "'$MSIL_Initialized'\n";
+  if (!Templates.empty())
+    out() << "\tcall\tvoid " << C << "'$MSIL_Init'()\n";
+  for (const Function *Ctor : GlobalCtors)
+    out() << "\tcall\t" << getTypeName(Ctor->getReturnType()) << " "
+          << getFunctionRef(Ctor) << "()\n";
+  out() << "IL_msil_init_done:\n\tret\n}\n";
+}
+
 void MSILWriter::printModuleStartup() {
+  // A library has no entry point; MSILInitialize() is its one-time entry.
+  if (LibraryMode)
+    return;
   const Function *Main = Mod->getFunction("main");
   out() << "\n.method static public int32 '$MSIL_Startup'() cil managed\n{\n";
   out() << "\t.entrypoint\n\t.maxstack\t8\n";
@@ -5797,6 +5883,10 @@ bool MSILWriter::runOnModule(Module &M) {
   DL = &M.getDataLayout();
   IL = std::make_unique<IntrinsicLowering>(*DL);
   resolveLibcOptions();
+  if (LibraryMode && ExternClassName.empty())
+    report_fatal_error("MSIL: -msil-library needs -msil-class-name so "
+                       "MSILInitialize() is reachable from managed code",
+                       false);
 
   // The portable library is linked first so the functions it brings in go
   // through the same lowering and emission as user code. Linking before
@@ -5861,13 +5951,13 @@ bool MSILWriter::runOnModule(Module &M) {
   if (UsesVector)
     out() << ".assembly extern System.Numerics.Vectors { .ver 9:0:0:0\n"
              "  .publickeytoken = (B0 3F 5F 7F 11 D5 0A 3A ) }\n";
-  out() << ".assembly MSIL {}\n\n";
+  out() << ".assembly " << AssemblyName << " {}\n\n";
 
   // Class declarations must precede the globals that name them as templates.
   printAggregateDeclarations();
   collectPInvokes();
   printExternals();
-  if (EmitLibc && !EmitPortable)
+  if (EmitLibc || EmitPortable)
     printBuiltinLibc();
   if (UsesLibcSeam)
     printLibcSeam();
@@ -5883,8 +5973,11 @@ bool MSILWriter::runOnModule(Module &M) {
 
   printFunctions();
   printAllocHelper();
-  printArgHelper();
+  if (!LibraryMode)
+    printArgHelper();
   printInitializer();
+  if (LibraryMode)
+    printLibraryInitializer();
 
   if (Wrap)
     out() << "}\n";

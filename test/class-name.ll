@@ -9,6 +9,11 @@
 ; With it, the callable members move into the named class. C# can then write
 ; `My.App.main()` directly.
 ; CLASS: .class public auto ansi beforefieldinit 'My.App'
+; A function address taken from inside the class must name the class too, in
+; both a value-returning ldftn and the global initializer.
+; CLASS-DAG: ldftn {{.*}}'My.App'::'add'
+; A declaration is not moved into the class, so its address stays unqualified.
+; CLASS-DAG: ldftn {{.*}}'ext'(int32)
 ; CLASS: .method static public hidebysig int32 'add'
 ; CLASS: .method static public hidebysig int32 'main'
 ; The entry point has to stay in <Module> — IL does not allow .entrypoint
@@ -16,8 +21,19 @@
 ; CLASS: .method static public int32 '$MSIL_Startup'()
 ; CLASS: .entrypoint
 ; CLASS: call {{.*}}int32 'My.App'::'main'()
+; DEFAULT-DAG: ldftn {{.*}}'add'
 
 @g = global i32 100
+@fp = global ptr @add
+declare i32 @ext(i32)
+
+define ptr @getadd() {
+  ret ptr @add
+}
+
+define ptr @getext() {
+  ret ptr @ext
+}
 
 define i32 @add(i32 %a) {
   %v = load i32, ptr @g

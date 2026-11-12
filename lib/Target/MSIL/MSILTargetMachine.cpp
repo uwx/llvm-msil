@@ -50,6 +50,11 @@ bool MSILTargetMachine::addPassesToEmitFile(
   PM.add(createUnreachableBlockEliminationPass());
   PM.add(createLowerSwitchPass());
   PM.add(createCFGSimplificationPass());
+  // CFGSimplify can fold LowerSwitch's comparison tree back into a switch
+  // (e.g. when several cases are contiguous), and the writer cannot emit a
+  // switch at all. Lower again after the CFG cleanup; idempotent when no
+  // switch remains.
+  PM.add(createLowerSwitchPass());
   PM.add(createAtomicExpandLegacyPass());
   PM.add(createExpandReductionsPass());
   PM.add(createPromoteMemoryToRegisterPass());

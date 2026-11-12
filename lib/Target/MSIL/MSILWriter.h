@@ -311,6 +311,8 @@ private:
   void printArgHelper();
   void printModuleStartup();
   void printInitializer();
+  /// The library-mode one-time entry point, MSILInitialize().
+  void printLibraryInitializer();
 
 
   //===------------------------------------------------------------------===//

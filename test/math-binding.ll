@@ -17,6 +17,9 @@ declare double @llvm.sinh.f64(double)
 declare double @llvm.copysign.f64(double, double)
 declare double @llvm.pow.f64(double, double)
 declare double @llvm.ldexp.f64.i32(double, i32)
+; A direct libcall, as src/loaders/vorbis.c has, rather than the intrinsic.
+declare double @ldexp(double, i32)
+declare double @exp2(double)
 declare double @llvm.powi.f64.i32(double, i32)
 declare float  @llvm.sqrt.f32(float)
 declare double @llvm.minnum.f64(double, double)
@@ -34,6 +37,8 @@ declare double @llvm.maxnum.f64(double, double)
 ; MATH-DAG: System.Math::CopySign(float64, float64)
 ; MATH-DAG: System.Math::Pow(float64, float64)
 ; MATH-DAG: System.Math::ScaleB(float64, int32)
+; exp2 is a static member of the primitive types, not of Math/MathF.
+; MATH-DAG: System.Double::Exp2(float64)
 ; MATH-DAG: System.Math::Round(float64)
 ; C's round() rounds half away from zero; Math.Round rounds half to even, so
 ; the forwarder passes the mode argument.
@@ -51,6 +56,10 @@ declare double @llvm.maxnum.f64(double, double)
 ; CRT-DAG: pinvokeimpl({{.*}}"pow"
 ; ldexp lowers to a scalbn call in both modes.
 ; CRT-DAG: pinvokeimpl({{.*}}"scalbn"
+; A direct ldexp/exp2 call, not the intrinsic, keeps its pinvoke when the
+; binding is off.
+; CRT-DAG: pinvokeimpl({{.*}}"ldexp"
+; CRT-DAG: pinvokeimpl({{.*}}"exp2"
 
 define double @f(double %x, double %y, i32 %n) {
   %a = call double @llvm.sqrt.f64(double %x)
@@ -65,7 +74,9 @@ define double @f(double %x, double %y, i32 %n) {
   %j = call double @llvm.copysign.f64(double %i, double %y)
   %k = call double @llvm.pow.f64(double %j, double %y)
   %l = call double @llvm.ldexp.f64.i32(double %k, i32 %n)
-  %m = call double @llvm.powi.f64.i32(double %l, i32 %n)
+  %ld = call double @ldexp(double %l, i32 %n)
+  %ex = call double @exp2(double %ld)
+  %m = call double @llvm.powi.f64.i32(double %ex, i32 %n)
   %n1 = call double @llvm.minnum.f64(double %m, double %y)
   %o = call double @llvm.maxnum.f64(double %n1, double %y)
   ret double %o
