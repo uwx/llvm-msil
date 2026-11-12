@@ -227,3 +227,62 @@ int rand(void) {
 void srand(unsigned seed) {
   rng_state = seed;
 }
+
+/* --- intmax and bit-scan additions --------------------------------------- */
+
+intmax_t strtoimax(const char *s, char **endp, int base) {
+  return (intmax_t)strtoll(s, endp, base);
+}
+
+uintmax_t strtoumax(const char *s, char **endp, int base) {
+  return (uintmax_t)strtoull(s, endp, base);
+}
+
+intmax_t imaxabs(intmax_t a) {
+  return a > 0 ? a : (intmax_t)((uintmax_t)0 - (uintmax_t)a);
+}
+
+imaxdiv_t imaxdiv(intmax_t num, intmax_t den) {
+  imaxdiv_t r;
+  r.quot = num / den;
+  r.rem = num % den;
+  return r;
+}
+
+/* ffs returns the 1-based index of the least significant set bit, or 0 for
+ * a zero argument (which the BSD name distinguishes from ffs(0)). */
+int ffs(int x) {
+  unsigned u = (unsigned)x;
+  int n = 1;
+  if (!u)
+    return 0;
+  while (!(u & 1u)) {
+    u >>= 1;
+    n++;
+  }
+  return n;
+}
+
+int ffsl(long x) {
+  unsigned long u = (unsigned long)x;
+  int n = 1;
+  if (!u)
+    return 0;
+  while (!(u & 1ul)) {
+    u >>= 1;
+    n++;
+  }
+  return n;
+}
+
+int ffsll(long long x) {
+  unsigned long long u = (unsigned long long)x;
+  int n = 1;
+  if (!u)
+    return 0;
+  while (!(u & 1ull)) {
+    u >>= 1;
+    n++;
+  }
+  return n;
+}

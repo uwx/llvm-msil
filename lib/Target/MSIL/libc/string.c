@@ -141,3 +141,103 @@ size_t strxfrm(char *dst, const char *src, size_t n) {
   }
   return len;
 }
+
+/* --- POSIX/GNU additions, ported from musl ------------------------------- */
+
+void *memccpy(void *dst, const void *src, int c, size_t n) {
+  const unsigned char *s = src;
+  unsigned char *d = dst;
+  unsigned char ch = (unsigned char)c;
+  for (; n; n--, d++, s++) {
+    *d = *s;
+    if (*s == ch)
+      return d + 1;
+  }
+  return 0;
+}
+
+void *mempcpy(void *dst, const void *src, size_t n) {
+  return (char *)memcpy(dst, src, n) + n;
+}
+
+char *stpcpy(char *dst, const char *src) {
+  while ((*dst = *src++))
+    dst++;
+  return dst;
+}
+
+char *stpncpy(char *dst, const char *src, size_t n) {
+  for (; n && *src; n--, dst++, src++)
+    *dst = *src;
+  if (n) {
+    /* The terminator was copied as part of the loop's last iteration only if
+     * the source ran out exactly at n; otherwise pad the rest. */
+    char *end = dst;
+    while (n--)
+      *dst++ = 0;
+    return end;
+  }
+  return dst;
+}
+
+/* Each call returns the token starting at *sp and advances *sp past the
+ * separator that ended it; the separator is replaced with a null. */
+char *strsep(char **sp, const char *sep) {
+  char *s = *sp;
+  if (!s)
+    return 0;
+  char *p = s + strcspn(s, sep);
+  if (*p) {
+    *p++ = 0;
+    *sp = p;
+  } else {
+    *sp = 0;
+  }
+  return s;
+}
+
+/* Case-insensitive strstr. Without a locale, "case" is ASCII tolower. */
+char *strcasestr(const char *h, const char *n) {
+  size_t nl = strlen(n);
+  if (!nl)
+    return (char *)h;
+  for (; *h; h++) {
+    size_t i = 0;
+    while (i < nl && h[i] &&
+           tolower((unsigned char)h[i]) == tolower((unsigned char)n[i]))
+      i++;
+    if (i == nl)
+      return (char *)h;
+  }
+  return 0;
+}
+
+/* strndup is strdup with a bounded length: the result is at most n bytes
+ * plus a terminator. malloc/memcpy are the IL implementations. */
+char *strndup(const char *s, size_t n) {
+  size_t len = strnlen(s, n);
+  char *d = malloc(len + 1);
+  if (!d)
+    return 0;
+  memcpy(d, s, len);
+  d[len] = 0;
+  return d;
+}
+
+/* Like strchr, but returns the terminator's address rather than null when
+ * the character is not found. */
+char *strchrnul(const char *s, int c) {
+  unsigned char ch = (unsigned char)c;
+  for (;; s++)
+    if (*s == ch || !*s)
+      return (char *)s;
+}
+
+/* A volatile store is enough to stop the compiler from removing a scrub of
+ * memory that is about to be freed: the CLR never moves managed references
+ * here, so a plain byte loop through a volatile pointer is the whole job. */
+void explicit_bzero(void *dst, size_t n) {
+  volatile unsigned char *p = dst;
+  while (n--)
+    *p++ = 0;
+}

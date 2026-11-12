@@ -9,6 +9,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <limits.h>
+#include <inttypes.h>
 
 /* The case-insensitive comparisons are POSIX. The Windows CRT only has the
  * underscore spelling, so the native reference build needs the map there; on
@@ -24,6 +25,84 @@ int _strnicmp(const char *, const char *, size_t);
 int strcasecmp(const char *, const char *);
 int strncasecmp(const char *, const char *, size_t);
 #endif
+
+/* The additions below are POSIX/GNU spellings that the Windows CRT does not
+ * export at all. The MSIL build gets the portable library's own definitions;
+ * the native reference build gets the small fallbacks here so it still
+ * compiles and produces the same output to diff against. */
+void *memccpy(void *dst, const void *src, int c, size_t n);
+void *mempcpy(void *dst, const void *src, size_t n);
+char *stpcpy(char *dst, const char *src);
+char *stpncpy(char *dst, const char *src, size_t n);
+char *strsep(char **sp, const char *sep);
+char *strcasestr(const char *h, const char *n);
+char *strndup(const char *s, size_t n);
+char *strchrnul(const char *s, int c);
+void explicit_bzero(void *dst, size_t n);
+char *strerror(int errnum);
+#if !defined(MSIL_LIBC_NATIVE)
+int ffs(int);
+int ffsl(long);
+int ffsll(long long);
+#endif
+
+#if defined(MSIL_LIBC_NATIVE) && defined(_WIN32)
+static int ffs(int x) { unsigned u = (unsigned)x; int n = 1; if (!u) return 0; while (!(u & 1u)) { u >>= 1; n++; } return n; }
+static int ffsl(long x) { unsigned long u = (unsigned long)x; int n = 1; if (!u) return 0; while (!(u & 1ul)) { u >>= 1; n++; } return n; }
+static int ffsll(long long x) { unsigned long long u = (unsigned long long)x; int n = 1; if (!u) return 0; while (!(u & 1ull)) { u >>= 1; n++; } return n; }
+#endif
+
+#if defined(MSIL_LIBC_NATIVE) && defined(_WIN32)
+static char *strndup(const char *s, size_t n) {
+  size_t k = strnlen(s, n);
+  char *d = malloc(k + 1);
+  memcpy(d, s, k);
+  d[k] = 0;
+  return d;
+}
+static char *strchrnul(const char *s, int c) {
+  while (*s && *s != (char)c) s++;
+  return (char *)s;
+}
+static char *strsep(char **sp, const char *sep) {
+  char *s = *sp;
+  if (!s) return 0;
+  char *p = s + strcspn(s, sep);
+  if (*p) { *p++ = 0; *sp = p; } else { *sp = 0; }
+  return s;
+}
+static char *stpcpy(char *d, const char *s) {
+  while ((*d = *s++)) d++;
+  return d;
+}
+static char *stpncpy(char *d, const char *s, size_t n) {
+  for (; n && *s; n--, d++, s++) *d = *s;
+  if (n) { char *e = d; while (n--) *d++ = 0; return e; }
+  return d;
+}
+static void *memccpy(void *d, const void *s, int c, size_t n) {
+  const unsigned char *ss = s; unsigned char *dd = d;
+  for (; n; n--, dd++, ss++) { *dd = *ss; if (*ss == (unsigned char)c) return dd + 1; }
+  return 0;
+}
+static void *mempcpy(void *d, const void *s, size_t n) { return (char *)memcpy(d, s, n) + n; }
+static char *strcasestr(const char *h, const char *n) {
+  size_t nl = strlen(n);
+  if (!nl) return (char *)h;
+  for (; *h; h++) {
+    size_t i = 0;
+    while (i < nl && h[i] && tolower((unsigned char)h[i]) == tolower((unsigned char)n[i])) i++;
+    if (i == nl) return (char *)h;
+  }
+  return 0;
+}
+static void explicit_bzero(void *d, size_t n) { memset(d, 0, n); }
+#endif
+
+static void fail(const char *what) {
+  printf("FAILED: %s\n", what);
+  exit(1);
+}
 
 static char buf[256];
 
@@ -197,6 +276,87 @@ int main(void) {
     for (i = 0; i < 5; i++)
       show("word", w[i]);
   }
+
+  /* --- string.h additions ------------------------------------------------ */
+  {
+    char t[32];
+    char *p;
+    p = stpcpy(t, "hello");
+    pint("stpcpy idx", (long)(p - t));
+    memset(t, 0, sizeof t);
+    p = stpncpy(t, "abcdef", 3);
+    pint("stpncpy idx", (long)(p - t));
+    show("stpncpy str", t);
+    {
+      char *s = t;
+      strcpy(t, "a:b;c");
+      show("strsep1", strsep(&s, ":;"));
+      show("strsep2", strsep(&s, ":;"));
+      show("strsep3", strsep(&s, ":;"));
+      pint("strsep end", s == 0);
+    }
+    memcpy(t, "abcdef", 7);
+    p = memccpy(t, "xyzq", 'q', 4);
+    pint("memccpy idx", p ? (long)(p - t) : -1L);
+    p = mempcpy(t, "12", 2);
+    pint("mempcpy idx", (long)(p - t));
+    {
+      const char *h = "Hello World";
+      const char *r = strcasestr(h, "WOR");
+      pint("strcasestr", r ? (long)(r - h) : -1L);
+      pint("strcasestr miss", strcasestr(h, "zzz") == 0);
+      pint("strchrnul", (long)(strchrnul(h, 'W') - h));
+      pint("strchrnul eos", (long)(strchrnul(h, 'z') - h));
+    }
+    {
+      char *d = strndup("abcdef", 3);
+      show("strndup", d);
+      free(d);
+    }
+    {
+      char z[8] = "secret";
+      explicit_bzero(z, sizeof z);
+      pint("bzero", z[0] == 0 && z[7] == 0);
+    }
+  }
+
+  /* --- stdlib.h additions ----------------------------------------------- */
+  pint("strtoimax", (long)strtoimax("-12345", 0, 10));
+  pint("strtoumax", (long)strtoumax("0xFF", 0, 16));
+  {
+    imaxdiv_t q = imaxdiv(-17, 5);
+    pint("imaxdiv q", (long)q.quot);
+    pint("imaxdiv r", (long)q.rem);
+  }
+  pint("imaxabs", (long)imaxabs(-99));
+  pint("ffs", ffs(0x18));
+  pint("ffsl", ffsl(1L << 5));
+  pint("ffsll", ffsll(1LL << 10));
+  pint("ffs zero", ffs(0));
+
+  /* --- strerror: properties both C libraries agree on ------------------- */
+  /* Only one strerror result can be live at a time: MSVC's returns one static
+   * buffer, so comparing two calls against each other tests the CRT's aliasing
+   * rather than the message. Check one call at a time instead. */
+  pint("strerror nonempty", strerror(2)[0] != 0);
+  pint("strerror perm", strerror(13)[0] != 0);
+  pint("strerror unknown", strerror(9999)[0] != 0);
+
+  /* --- console output without a FILE ------------------------------------ */
+#if defined(MSIL_LIBC_NATIVE)
+#define OUTSTREAM stdout
+#else
+#define OUTSTREAM ((FILE *)0)
+#endif
+  fputs("fputs line\n", OUTSTREAM);
+  fputc('!', OUTSTREAM);
+  fputc('\n', OUTSTREAM);
+  {
+    const char *w = "fwrite line\n";
+    size_t n = fwrite(w, 1, strlen(w), OUTSTREAM);
+    pint("fwrite n", (long)n);
+  }
+#undef OUTSTREAM
 
   return 0;
 }

@@ -938,3 +938,82 @@ int putchar(int c) {
   __msil_write(&ch, 1);
   return c;
 }
+
+/* --- Output functions with no FILE ---------------------------------------
+ *
+ * There is no stdio stream object here: stdout is the CLR's console, reached
+ * through __msil_write. So the "puts-to-a-stream" spellings that a C program
+ * commonly uses keep their names and write to that console. The FILE-taking
+ * forms (fprintf, fwrite, fflush) stay out: they need a stream to take.
+ */
+
+int fputc(int c, void *stream);
+int fputs(const char *s, void *stream);
+size_t fwrite(const void *p, size_t sz, size_t n, void *stream);
+
+int fputc(int c, void *stream) {
+  char ch = (char)c;
+  (void)stream;
+  __msil_write(&ch, 1);
+  return (unsigned char)ch;
+}
+
+int fputs(const char *s, void *stream) {
+  (void)stream;
+  __msil_write(s, strlen(s));
+  return 0;
+}
+
+size_t fwrite(const void *p, size_t sz, size_t n, void *stream) {
+  (void)stream;
+  __msil_write(p, sz * n);
+  return n;
+}
+
+/* strerror: a fixed table indexed by the errno values C99 names, plus the
+ * POSIX ones a program tends to print. There is no locale, so the strings
+ * are the English ones. An unknown value reports what glibc and musl spell
+ * for an unrecognized errno. */
+static const char *const errlist[] = {
+    /* 0  */ "No error",
+    /* 1  */ "Operation not permitted",
+    /* 2  */ "No such file or directory",
+    /* 3  */ "No such process",
+    /* 4  */ "Interrupted system call",
+    /* 5  */ "Input/output error",
+    /* 6  */ "No such device or address",
+    /* 7  */ "Argument list too long",
+    /* 8  */ "Exec format error",
+    /* 9  */ "Bad file descriptor",
+    /* 10 */ "No child processes",
+    /* 11 */ "Resource temporarily unavailable",
+    /* 12 */ "Cannot allocate memory",
+    /* 13 */ "Permission denied",
+    /* 14 */ "Bad address",
+    /* 15 */ "Block device required",
+    /* 16 */ "Device or resource busy",
+    /* 17 */ "File exists",
+    /* 18 */ "Invalid cross-device link",
+    /* 19 */ "No such device",
+    /* 20 */ "Not a directory",
+    /* 21 */ "Is a directory",
+    /* 22 */ "Invalid argument",
+    /* 23 */ "Too many open files in system",
+    /* 24 */ "Too many open files",
+    /* 25 */ "Inappropriate ioctl for device",
+    /* 26 */ "Text file busy",
+    /* 27 */ "File too large",
+    /* 28 */ "No space left on device",
+    /* 29 */ "Illegal seek",
+    /* 30 */ "Read-only file system",
+    /* 31 */ "Too many links",
+    /* 32 */ "Broken pipe",
+    /* 33 */ "Numerical argument out of domain",
+    /* 34 */ "Numerical result out of range",
+};
+
+char *strerror(int errnum) {
+  if (errnum >= 0 && (size_t)errnum < sizeof errlist / sizeof *errlist)
+    return (char *)errlist[errnum];
+  return (char *)"Unknown error";
+}
