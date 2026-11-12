@@ -75,6 +75,10 @@ private:
   /// ldind/stind suffix, or "" for aggregates (which use ldobj/stobj).
   std::string getMemSuffix(Type *Ty);
 
+  /// Convert an address held as an int64 (with -msil-pointers=i64) back to a
+  /// native int before it is dereferenced. A no-op in the default mode.
+  void printPtrToNative();
+
   std::string getCallSignature(FunctionType *FTy, const CallBase *CB,
                                StringRef Name, bool PortableVarArgs = false,
                                bool VarArgDef = false);

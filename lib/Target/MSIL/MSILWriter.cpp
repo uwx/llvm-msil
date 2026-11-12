@@ -78,6 +78,10 @@ using namespace llvm;
 /// other options below, but the type helpers here need it.
 bool fp80MappedToDouble();
 
+/// Whether -msil-pointers=i64 keeps every pointer in an int64 slot. Defined
+/// beside the other options; the type and dereference helpers need it.
+bool pointersAsInt64();
+
 namespace {
 /// Render an IR type or constant for a diagnostic.
 template <typename T> std::string str(const T *V) {
@@ -317,6 +321,35 @@ static cl::opt<std::string> Fp80Spec(
 /// Whether -msil-fp80 asked for the lossy binary64 mapping.
 bool fp80MappedToDouble() { return Fp80Spec == "double"; }
 
+// Pointer representation. By default a pointer is an unmanaged `void*` (the
+// CLR's native int), which is the natural IL spelling and what the JIT uses as
+// an address directly.
+//
+// With -msil-pointers=i64 every pointer is instead stored as an `int64`. The
+// module is still laid out LP64: the data layout is untouched, so sizeof,
+// struct offsets and pointer strides keep saying what the native ABI says. Only
+// the *value* representation in the IL changes -- a pointer-typed slot holds
+// the address as a 64-bit integer, and each dereference converts it back to a
+// native int with `conv.u` first.
+//
+// Why: on a 64-bit host this is a straight bitmap with no indirection, and the
+// JIT treats conv.u (int64 -> native int) as a no-op, so the emitted address is
+// the real one. On a 32-bit host real addresses fit and the upper 32 bits are
+// simply zero, so conv.u still yields the right pointer. What it costs is
+// space: a struct that embeds a pointer pays 8 bytes for it on a 32-bit host
+// where the native layout would use 4, and its layout no longer matches the
+// native 32-bit struct, so interop with native code expecting real 32-bit
+// layouts needs a translation shim rather than a direct pointer pass.
+static cl::opt<std::string> PointerSpec(
+    "msil-pointers",
+    cl::desc("How a pointer is represented in IL. 'i64' keeps every pointer in "
+             "an int64 slot and converts with conv.u before each dereference; "
+             "the default is the unmanaged void* (native int)"),
+    cl::value_desc("i64"), cl::init(""));
+
+/// Whether -msil-pointers=i64 keeps pointers in int64 slots.
+bool pointersAsInt64() { return PointerSpec == "i64"; }
+
 char MSILWriter::ID = 0;
 
 MSILWriter::MSILWriter(raw_pwrite_stream &Sink)
@@ -454,7 +487,9 @@ std::string MSILWriter::getTypeName(Type *Ty) {
   case Type::DoubleTyID:
     return "float64";
   case Type::PointerTyID:
-    return "void*";
+    // -msil-pointers=i64 keeps the address in an int64 slot; the default is the
+    // CLR native int (`void*`), which the JIT uses as an address directly.
+    return pointersAsInt64() ? "int64" : "void*";
   case Type::FixedVectorTyID:
     // A register-wide vector travels as its Vector<T>: the blob class is
     // still emitted, but only for the shapes the lane path handles.
@@ -560,7 +595,9 @@ std::string MSILWriter::getVectorTypeName(Type *VTy) {
 namespace {
 StringRef memSuffixOf(Type *Ty) {
   if (Ty->isPointerTy())
-    return "i";
+    // A pointer in an int64 slot is loaded/stored as an int64; only the
+    // default void* representation has the native-int `i` suffix.
+    return pointersAsInt64() ? "i8" : "i";
   switch (Ty->getTypeID()) {
   case Type::IntegerTyID:
     switch (Ty->getIntegerBitWidth()) {
@@ -611,6 +648,16 @@ std::string MSILWriter::getMemSuffix(Type *Ty) {
   if (movesAsBlob(Ty))
     return "";
   return memSuffixOf(Ty).str();
+}
+
+// Dereference points in the emitted IL expect a native int (a managed/unmanaged
+// pointer) on the stack. With -msil-pointers=i64 the address is an int64 there,
+// so convert it first. On a 64-bit JIT conv.u is a no-op; on a 32-bit one it
+// truncates to the address width, which is correct because such an address
+// fits in the low 32 bits.
+void MSILWriter::printPtrToNative() {
+  if (pointersAsInt64())
+    out() << "\tconv.u\n";
 }
 
 // A vararg definition is emitted as an ordinary method with a fixed
@@ -735,10 +782,11 @@ void MSILWriter::printValueLoad(const Value *V) {
     // variable's storage. A thread-local global's storage is per thread, so
     // its address comes from an accessor that also initializes this thread's
     // copy on first use.
+    const char *PtrTy = pointersAsInt64() ? "int64" : "void*";
     if (GV->isThreadLocal() && !GV->isDeclaration())
-      out() << "\tcall\tvoid* " << getThreadLocalRef(GV) << "\n";
+      out() << "\tcall\t" << PtrTy << " " << getThreadLocalRef(GV) << "\n";
     else
-      out() << "\tldsfld\tvoid* '" << GV->getName() << "'\n";
+      out() << "\tldsfld\t" << PtrTy << " '" << GV->getName() << "'\n";
     return;
   }
   if (const auto *Fn = dyn_cast<Function>(V)) {
@@ -753,6 +801,9 @@ void MSILWriter::printValueLoad(const Value *V) {
     out() << "\tldftn\t"
         << getCallSignature(Fn->getFunctionType(), nullptr, getFunctionRef(Fn))
         << "\n";
+    // A function pointer is a pointer-typed value: keep it in its slot type.
+    if (pointersAsInt64())
+      out() << "\tconv.u8\n";
     return;
   }
   if (isa<Argument>(V))
@@ -895,6 +946,10 @@ void MSILWriter::printConstLoad(const Constant *C) {
       std::string Tmp = newTempLocal(Ty);
       out() << "\tldloca\t'" << Tmp << "'\n\tinitobj\t" << getTypeName(Ty)
           << "\n\tldloc\t'" << Tmp << "'\n";
+    } else if (pointersAsInt64() && Ty->isPointerTy()) {
+      // A null pointer in an int64 slot is `ldc.i8 0`; int32 would rely on the
+      // implicit widening, which is fine but reads as a pointer-sized literal.
+      out() << "\tldc.i8\t0\n";
     } else {
       out() << "\tldc.i4.0\n";
     }
@@ -1069,11 +1124,13 @@ void MSILWriter::printIndirectLoad(const Value *Ptr, Type *Ty) {
   const Value *Base = nullptr;
   if (StructType *STy = structFieldOf(Ptr, Ty, Field, Base)) {
     printValueLoad(Base);
+    printPtrToNative();
     out() << "\tldfld " << getTypeName(Ty) << " '"
           << getAggregateName(STy) << "'::'f" << Field << "'\n";
     return;
   }
   printValueLoad(Ptr);
+  printPtrToNative();
   if (movesAsBlob(Ty))
     out() << "\tldobj\t" << getTypeName(Ty) << '\n';
   else
@@ -1086,12 +1143,14 @@ void MSILWriter::printIndirectSave(const Value *Ptr, const Value *Val) {
   // stfld wants the address first, same as stind, so the order is unchanged.
   if (StructType *STy = structFieldOf(Ptr, Val->getType(), Field, Base)) {
     printValueLoad(Base);
+    printPtrToNative();
     printValueLoad(Val);
     out() << "\tstfld " << getTypeName(Val->getType()) << " '"
           << getAggregateName(STy) << "'::'f" << Field << "'\n";
     return;
   }
   printValueLoad(Ptr);
+  printPtrToNative();
   printValueLoad(Val);
   if (movesAsBlob(Val->getType()))
     out() << "\tstobj\t" << getTypeName(Val->getType()) << '\n';
@@ -1389,7 +1448,7 @@ void MSILWriter::printVectorGep(const GEPOperator *GEP) {
       }
       out() << "\tldc.i8\t" << ElemSize << "\n\tmul\n\tadd\n";
     }
-    out() << "\tstind.i\n";
+    out() << "\tstind." << getMemSuffix(EltTy) << "\n";
   }
   out() << "\tldloc\t'" << R << "'\n";
 }
@@ -1874,6 +1933,9 @@ void MSILWriter::printFunctionCall(const Value *FnVal, const CallBase *CB) {
     // raises InvalidProgramException). Dropping the marker is the same call:
     // no trailing argument types are being named anyway.
     printValueLoad(FnVal);
+    // A function pointer is a pointer-typed value: with -msil-pointers=i64 it
+    // sits in the stack as an int64, and calli wants a native int.
+    printPtrToNative();
     std::string Sig;
     Sig += getTypeName(FTy->getReturnType());
     Sig += " (";
@@ -2316,6 +2378,7 @@ StringRef MSILWriter::interlockedTypeName(Type *Ty) {
 // a width Interlocked does not cover.
 void MSILWriter::printAtomicLoad(const Value *Ptr, Type *Ty) {
   printValueLoad(Ptr);
+  printPtrToNative();
   out() << "\tvolatile.\n";
   if (Ty->isAggregateType() || Ty->isVectorTy())
     out() << "\tldobj\t" << getTypeName(Ty) << '\n';
@@ -2326,6 +2389,7 @@ void MSILWriter::printAtomicLoad(const Value *Ptr, Type *Ty) {
 void MSILWriter::printAtomicStore(const Value *Ptr, const Value *Val) {
   Type *Ty = Val->getType();
   printValueLoad(Ptr);
+  printPtrToNative();
   printValueLoad(Val);
   out() << "\tvolatile.\n";
   if (Ty->isAggregateType() || Ty->isVectorTy())
@@ -2382,6 +2446,7 @@ void MSILWriter::printAtomicRMW(const AtomicRMWInst *RMW) {
       (Op == AtomicRMWInst::Xchg || Op == AtomicRMWInst::Add ||
        Op == AtomicRMWInst::Sub)) {
     printValueLoad(RMW->getPointerOperand());
+    printPtrToNative();
     printValueLoad(RMW->getValOperand());
     if (Op == AtomicRMWInst::Sub)
       out() << "\tneg\n";
@@ -2439,11 +2504,13 @@ void MSILWriter::printAtomicRMW(const AtomicRMWInst *RMW) {
     // the zero-extended form every other narrow value has.
     printUnderAtomicLock([&] {
       printValueLoad(RMW->getPointerOperand());
+      printPtrToNative();
       out() << "\tldind." << getMemSuffix(RTy) << "\n\t" << widthConv(RTy)
             << "\n\tstloc\t'" << Old << "'\n";
       Compute();
       out() << "\tstloc\t'" << New << "'\n";
       printValueLoad(RMW->getPointerOperand());
+      printPtrToNative();
       out() << "\tldloc\t'" << New << "'\n\tstind." << getMemSuffix(RTy)
             << "\n";
     });
@@ -2459,6 +2526,7 @@ void MSILWriter::printAtomicRMW(const AtomicRMWInst *RMW) {
   Compute();
   out() << "\tstloc\t'" << New << "'\n";
   printValueLoad(RMW->getPointerOperand());
+  printPtrToNative();
   out() << "\tldloc\t'" << New << "'\n\tldloc\t'" << Old << "'\n";
   out() << "\tcall\t" << ILTy << " [mscorlib]System.Threading.Interlocked::"
         << "CompareExchange(" << ILTy << "&, " << ILTy << ", " << ILTy
@@ -2482,6 +2550,7 @@ void MSILWriter::printAtomicCmpXchg(const AtomicCmpXchgInst *CX) {
     std::string Done = "IL_cx" + utostr(getUniqID());
     printUnderAtomicLock([&] {
       printValueLoad(CX->getPointerOperand());
+      printPtrToNative();
       out() << "\tldind." << getMemSuffix(VTy) << "\n\t" << widthConv(VTy)
             << "\n\tstloc\t'" << Old << "'\n";
       // Both sides of the compare must be in the same form: `Old` was
@@ -2490,11 +2559,13 @@ void MSILWriter::printAtomicCmpXchg(const AtomicCmpXchgInst *CX) {
       out() << '\t' << widthConv(VTy) << "\n\tldloc\t'" << Old
             << "'\n\tbne.un\t" << Done << "\n";
       printValueLoad(CX->getPointerOperand());
+      printPtrToNative();
       printValueLoad(CX->getNewValOperand());
       out() << "\tstind." << getMemSuffix(VTy) << "\n" << Done << ":\n";
     });
   } else {
     printValueLoad(CX->getPointerOperand());
+    printPtrToNative();
     printValueLoad(CX->getNewValOperand());
     printValueLoad(CX->getCompareOperand());
     out() << "\tcall\t" << ILTy << " [mscorlib]System.Threading.Interlocked::"
@@ -4563,11 +4634,17 @@ std::string MSILWriter::getManagedName(const ManagedType &T,
 void MSILWriter::printManagedForwarder(const Function *F, const ManagedType &T,
                                        StringRef Name) {
   FunctionType *FTy = F->getFunctionType();
+  // With -msil-pointers=i64 the C-visible declaration uses int64 pointers, but
+  // the managed member it forwards to (the hand-written IL libc, a user's
+  // allocator) keeps the CLR native-int void*. Convert at this one boundary:
+  // conv.u on a pointer argument going in, conv.i8 on a pointer result out.
   std::string Params;
   for (unsigned I = 0, E = FTy->getNumParams(); I != E; ++I) {
     if (I)
       Params += ", ";
-    Params += getTypeName(FTy->getParamType(I));
+    Type *PTy = FTy->getParamType(I);
+    Params += (pointersAsInt64() && PTy->isPointerTy()) ? "void*"
+                                                       : getTypeName(PTy);
   }
   // A member whose signature is wider than the C function's takes the extra
   // argument as a literal before the forwarded ones.
@@ -4585,14 +4662,21 @@ void MSILWriter::printManagedForwarder(const Function *F, const ManagedType &T,
       << " cil managed\n{\n";
   out() << "\t.maxstack\t" << std::max<unsigned>(1, FTy->getNumParams() + 1)
       << "\n";
-  for (unsigned I = 0, E = FTy->getNumParams(); I != E; ++I)
+  for (unsigned I = 0, E = FTy->getNumParams(); I != E; ++I) {
     out() << "\tldarg\t" << I << '\n';
+    if (pointersAsInt64() && FTy->getParamType(I)->isPointerTy())
+      out() << "\tconv.u\n";
+  }
   out() << T.ExtraArg;
   // By value: the ternary would otherwise yield a temporary std::string and
   // the StringRef would point into it after it dies.
   std::string Member = T.Member.empty() ? getCName(F) : T.Member;
-  out() << "\tcall\t" << getTypeName(FTy->getReturnType()) << ' '
+  Type *RTy = FTy->getReturnType();
+  bool PtrRet = pointersAsInt64() && RTy->isPointerTy();
+  out() << "\tcall\t" << (PtrRet ? "void*" : getTypeName(RTy)) << ' '
       << getManagedName(T, Member) << '(' << Params << ")\n";
+  if (PtrRet)
+    out() << "\tconv.i8\n";
   out() << "\tret\n}\n";
 }
 
@@ -5087,6 +5171,8 @@ std::string MSILWriter::vaListPtr() {
   std::string B;
   raw_string_ostream OS(B);
   OS << "\n\tldarg.0";
+  if (pointersAsInt64())
+    OS << "\n\tconv.u";
   if (vaIsTag())
     OS << "\n\tldind.i";
   return B;
@@ -5100,8 +5186,11 @@ std::string MSILWriter::vaCursorAddr(StringRef Tag) {
   if (vaIsTag())
     OS << "\n\tldloc\t'" << Tag << "'"
           "\n\tldc.i8\t8\n\tadd";  // &tag->overflow_arg_area
-  else
+  else {
     OS << "\n\tldarg.0";           // the va_list slot is the cursor
+    if (pointersAsInt64())
+      OS << "\n\tconv.u";
+  }
   return B;
 }
 
@@ -5138,26 +5227,31 @@ void MSILWriter::printLibcSeam() {
   //
   // A vararg argument crosses into the linked C as one of four CLR types,
   // matching what printVarArgBuffer writes at the call site.
+  // The linked C declares these as taking a pointer; with -msil-pointers=i64
+  // that declaration is an int64, so the definition has to spell it the same.
+  std::string P = pointersAsInt64() ? "int64" : "void*";
   if (Wanted.count("__msil_va_i32"))
-    printLibcMethod("__msil_va_i32", "int32", "void*",
+    printLibcMethod("__msil_va_i32", "int32", P,
                     vaAccessorBody("\n\tldloc\t'v'\n\tconv.i4\n"));
   if (Wanted.count("__msil_va_i64"))
-    printLibcMethod("__msil_va_i64", "int64", "void*",
+    printLibcMethod("__msil_va_i64", "int64", P,
                     vaAccessorBody("\n\tldloc\t'v'\n"));
   if (Wanted.count("__msil_va_f64"))
     // The call site stored the double's raw bits in the slot, so the read
     // reinterprets them; conv.r8 would turn the integer into a value.
-    printLibcMethod("__msil_va_f64", "float64", "void*",
+    printLibcMethod("__msil_va_f64", "float64", P,
                     vaAccessorBody("\n\tldloca\t'v'\n\tconv.u8\n\tldind.r8\n"));
   if (Wanted.count("__msil_va_ptr"))
-    // A pointer is stored as its address, so the slot already holds the
-    // native int the return type wants.
-    printLibcMethod("__msil_va_ptr", "void*", "void*",
-                    vaAccessorBody("\n\tldloc\t'v'\n\tconv.u\n"));
+    // A pointer is stored as its address, so the slot holds the value the
+    // return type wants: an int64 in i64 mode, a native int otherwise.
+    printLibcMethod("__msil_va_ptr", P, P,
+                    vaAccessorBody(pointersAsInt64()
+                                       ? "\n\tldloc\t'v'\n"
+                                       : "\n\tldloc\t'v'\n\tconv.u\n"));
 
   if (Wanted.count("__msil_write"))
     printLibcMethod(
-        "__msil_write", "void", "void*, int64",
+        "__msil_write", "void", P + ", int64",
         "\tldarg.0\n\tconv.i\n\tldarg.1\n\tconv.i4\n"
         "\tcall\tstring [mscorlib]System.Runtime.InteropServices.Marshal::"
         "PtrToStringAnsi(native int, int32)\n"
@@ -5454,7 +5548,8 @@ void MSILWriter::printExternals() {
     if (G.isThreadLocal())
       report_fatal_error("MSIL: external thread-local '" + G.getName() +
                          "' is not supported; define it in this module");
-    out() << ".field static private void* '" << G.getName() << "'\n";
+    out() << ".field static private " << getTypeName(G.getType()) << " '"
+          << G.getName() << "'\n";
     AnyExternVar = true;
   }
   if (AnyExternVar)
@@ -5602,7 +5697,7 @@ void MSILWriter::printGlobals() {
     }
     out() << ".field static "
         << (G.hasLocalLinkage() ? std::string(HelperVis()) + " " : "public ")
-        << "void* '" << Name << "'\n";
+        << getTypeName(G.getType()) << " '" << Name << "'\n";
     // A thread-local's pointer slot is per thread, so $MSIL_Init cannot fill
     // it once for the whole program: each thread's first access does instead
     // (printThreadLocalAccessor). A module-level field takes the attribute;
@@ -5626,29 +5721,35 @@ void MSILWriter::printThreadLocalAccessor(const GlobalImage &Image) {
   std::string Tpl = "valuetype '" + getAggregateName(G.getValueType()) + "' '" +
                     Image.Template + "'";
   // The declaration cannot name the class it is inside; call sites do.
-  out() << "\n.method static " << HelperVis() << " void* '" << Name
+  out() << "\n.method static " << HelperVis() << " "
+        << getTypeName(G.getType()) << " '" << Name
         << "$tls'() cil managed\n{\n";
   out() << "\t.maxstack\t8\n";
   // The constant case pins the slot at the shared image and needs no scratch.
   if (Image.Writable || !Size)
-    out() << "\t.locals init (void* 'p')\n";
+    out() << "\t.locals init (" << getTypeName(G.getType()) << " 'p')\n";
   // A [ThreadStatic] slot is only ever read or written by the thread that owns
   // it, so two threads cannot race on one slot and this thread's first touches
   // are sequential: no lock is needed.
-  out() << "\tldsfld\tvoid* '" << Name << "'\n";
+  out() << "\tldsfld\t" << getTypeName(G.getType()) << " '" << Name << "'\n";
   out() << "\tbrfalse\tIL_tls_init\n";
-  out() << "\tldsfld\tvoid* '" << Name << "'\n\tret\n";
+  out() << "\tldsfld\t" << getTypeName(G.getType()) << " '" << Name
+        << "'\n\tret\n";
   out() << "IL_tls_init:\n";
   if (!Image.Writable && Size) {
     // A constant global cannot be stored through on any thread, so every
     // thread's slot points at the one read-only image. Comparing the address
     // of the same variable across threads then still compares equal.
     out() << "\tldsflda\t" << Tpl << "\n\tconv.u8\n";
-    out() << "\tstsfld\tvoid* '" << Name << "'\n";
+    if (pointersAsInt64())
+      out() << "\tconv.u8\n";
+    out() << "\tstsfld\t" << getTypeName(G.getType()) << " '" << Name << "'\n";
   } else {
     // The same bytes $MSIL_Init would have produced, but for this thread.
     out() << "\tldc.i8\t" << (Size ? Size : 1) << "\n";
     out() << "\tcall\tvoid* " << ClassPrefix() << "'$MSIL_Alloc'(int64)\n";
+    if (pointersAsInt64())
+      out() << "\tconv.u8\n";
     out() << "\tstloc\t'p'\n";
     if (Size) {
       // The zero-sized case has no bytes to copy, so the destination push
@@ -5662,7 +5763,8 @@ void MSILWriter::printThreadLocalAccessor(const GlobalImage &Image) {
     // name another thread-local and each thread gets its own address. The slot
     // is published first: a global whose initializer names itself then finds
     // its storage already there instead of recurring forever.
-    out() << "\tldloc\t'p'\n\tstsfld\tvoid* '" << Name << "'\n";
+    out() << "\tldloc\t'p'\n\tstsfld\t" << getTypeName(G.getType()) << " '"
+          << Name << "'\n";
     for (const DynInit &DI : DynInits) {
       if (DI.GV != &G)
         continue;
@@ -5685,7 +5787,8 @@ void MSILWriter::printThreadLocalAccessor(const GlobalImage &Image) {
       out() << "\tstind.i\n";
     }
   }
-  out() << "\tldsfld\tvoid* '" << Name << "'\n\tret\n}\n";
+  out() << "\tldsfld\t" << getTypeName(G.getType()) << " '" << Name
+        << "'\n\tret\n}\n";
 }
 
 void MSILWriter::printAllocHelper() {
@@ -5719,7 +5822,8 @@ void MSILWriter::printInitializer() {
       out() << "\tldsflda\tvaluetype '" << getAggregateName(G.getValueType())
           << "' '" << T.Template << "'\n";
       out() << "\tconv.u8\n";
-      out() << "\tstsfld\tvoid* '" << G.getName() << "'\n";
+      out() << "\tstsfld\t" << getTypeName(G.getType()) << " '"
+            << G.getName() << "'\n";
       continue;
     }
     // Allocate the real, writable storage. A zero-sized global still needs a
@@ -5727,11 +5831,15 @@ void MSILWriter::printInitializer() {
     // them must not compare equal.
     out() << "\tldc.i8\t" << (Size ? Size : 1) << "\n";
     out() << "\tcall\tvoid* " << ClassPrefix() << "'$MSIL_Alloc'(int64)\n";
-    out() << "\tstsfld\tvoid* '" << G.getName() << "'\n";
+    if (pointersAsInt64())
+      out() << "\tconv.u8\n";
+    out() << "\tstsfld\t" << getTypeName(G.getType()) << " '" << G.getName()
+          << "'\n";
     if (!Size)
       continue;
     // Copy the template bytes in.
-    out() << "\tldsfld\tvoid* '" << G.getName() << "'\n";
+    out() << "\tldsfld\t" << getTypeName(G.getType()) << " '" << G.getName()
+          << "'\n";
     out() << "\tldsflda\tvaluetype '" << getAggregateName(G.getValueType())
         << "' '" << T.Template << "'\n";
     out() << "\tconv.u8\n";
@@ -5744,7 +5852,8 @@ void MSILWriter::printInitializer() {
     // thread; its slot is still null here.
     if (DI.GV->isThreadLocal())
       continue;
-    out() << "\tldsfld\tvoid* '" << DI.GV->getName() << "'\n";
+    out() << "\tldsfld\t" << getTypeName(DI.GV->getType()) << " '"
+          << DI.GV->getName() << "'\n";
     if (DI.Offset) {
       printPtrLoad(DI.Offset);
       out() << "\tconv.i8\n\tadd\n";
@@ -5823,9 +5932,11 @@ void MSILWriter::printModuleStartup() {
   bool WantArgs = Main->arg_size() >= 1;
   if (WantArgs) {
     out() << "\tcall\tvoid " << C << "'$MSIL_MakeArgs'()\n";
-    out() << "\tldsfld\tvoid* " << C << "'$MSIL::argc'\n\tldind.i4\n";
+    out() << "\tldsfld\t" << (pointersAsInt64() ? "int64" : "void*") << " " << C
+          << "'$MSIL::argc'\n\tldind.i4\n";
     if (Main->arg_size() >= 2)
-      out() << "\tldsfld\tvoid* " << C << "'$MSIL::argv'\n";
+      out() << "\tldsfld\t" << (pointersAsInt64() ? "int64" : "void*") << " "
+            << C << "'$MSIL::argv'\n";
   }
 
   out() << "\tcall\t" << getTypeName(Main->getReturnType()) << " "
@@ -5845,8 +5956,9 @@ void MSILWriter::printModuleStartup() {
 
 void MSILWriter::printArgHelper() {
   // Allocate argc/argv and fill them from Environment.GetCommandLineArgs().
-  out() << "\n.field static " << HelperVis() << " void* '$MSIL::argc'\n";
-  out() << ".field static " << HelperVis() << " void* '$MSIL::argv'\n";
+  const char *PtrTy = pointersAsInt64() ? "int64" : "void*";
+  out() << "\n.field static " << HelperVis() << " " << PtrTy << " '$MSIL::argc'\n";
+  out() << ".field static " << HelperVis() << " " << PtrTy << " '$MSIL::argv'\n";
   out() << "\n.method static " << HelperVis()
         << " void '$MSIL_MakeArgs'() cil managed\n{\n";
   out() << "\t.maxstack\t4\n\t.locals init (int32 'n')\n"
@@ -5859,18 +5971,24 @@ void MSILWriter::printArgHelper() {
   out() << "\tldloc\t'a'\n\tldlen\n\tconv.i4\n\tstloc\t'n'\n";
   // argc storage
   std::string CP = ClassPrefix();
-  out() << "\tldc.i4.4\n\tcall\tvoid* " << CP << "'$MSIL_Alloc'(int64)\n"
-           "\tstsfld\tvoid* " << CP << "'$MSIL::argc'\n";
-  out() << "\tldsfld\tvoid* " << CP << "'$MSIL::argc'\n\tldloc\t'n'\n\tstind.i4\n";
+  out() << "\tldc.i4.4\n\tcall\tvoid* " << CP << "'$MSIL_Alloc'(int64)\n";
+  if (pointersAsInt64())
+    out() << "\tconv.u8\n";
+  out() << "\tstsfld\t" << PtrTy << " " << CP << "'$MSIL::argc'\n";
+  out() << "\tldsfld\t" << PtrTy << " " << CP
+        << "'$MSIL::argc'\n\tldloc\t'n'\n\tstind.i4\n";
   // argv = (char**)alloca(n * 8)
   out() << "\tldloc\t'n'\n\tconv.i8\n\tldc.i4.8\n\tconv.i8\n\tmul\n\tcall\tvoid* "
-        << CP << "'$MSIL_Alloc'(int64)\n\tstsfld\tvoid* " << CP
-        << "'$MSIL::argv'\n";
+        << CP << "'$MSIL_Alloc'(int64)\n";
+  if (pointersAsInt64())
+    out() << "\tconv.u8\n";
+  out() << "\tstsfld\t" << PtrTy << " " << CP << "'$MSIL::argv'\n";
   // for i in 0..n: argv[i] = StringToHGlobalAnsi(a[i])
   out() << "\tldc.i4.0\n\tstloc\t'i'\n";
   out() << "IL_args_loop:\n";
   out() << "\tldloc\t'i'\n\tldloc\t'n'\n\tbge\tIL_args_done\n";
-  out() << "\tldsfld\tvoid* " << CP << "'$MSIL::argv'\n\tldloc\t'i'\n\tconv.i8\n"
+  out() << "\tldsfld\t" << PtrTy << " " << CP
+        << "'$MSIL::argv'\n\tldloc\t'i'\n\tconv.i8\n"
            "\tldc.i4.8\n\tconv.i8\n\tmul\n\tadd\n";
   out() << "\tldloc\t'a'\n\tldloc\t'i'\n\tldelem.ref\n";
   out() << "\tcall\tnative int [mscorlib]System.Runtime.InteropServices."

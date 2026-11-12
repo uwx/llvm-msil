@@ -131,6 +131,7 @@ built for the other, which is why the libc is built twice (see below).
 | `-msil-library` | Emit a library instead of a program: no `.entrypoint`, and a public `MSILInitialize` static method runs `llvm.global_ctors` behind a one-shot guard. Requires `-msil-class-name`. |
 | `-msil-assembly-name=Name` | Name the emitted assembly (default `MSIL`). |
 | `-msil-fp80=double` | Map `x86_fp80` (`long double` on the x86 ELF target) to binary64 instead of rejecting it. Lossy: 53 mantissa bits and an 11-bit exponent instead of 64 and 15, so a value round-trips changed or overflows to infinity. The 16-byte slot, the field offsets and `sizeof` are unchanged; only the value stored in the slot is a `float64`. A long-double libm call with no `System.Math` binding, or a `long double` passed through a vararg, is rejected by name rather than pinvoked with a mismatched signature. |
+| `-msil-pointers=i64` | Keep every pointer in an `int64` slot in the IL rather than the CLR native int (`void*`), and convert with `conv.u` immediately before each dereference. The module is still laid out LP64, so `sizeof`, struct offsets and pointer strides match the native ABI; only the value representation changes. On a 64-bit JIT `conv.u` is a no-op; on a 32-bit JIT it truncates to the address width, which is correct because such an address fits in the low 32 bits (the upper bits are simply zero). The cost is space: a pointer embedded in a struct still occupies 8 bytes on a 32-bit host, so a struct's layout no longer matches a native 32-bit struct and native interop that expects the real 32-bit layout needs a translation shim. |
 
 ## How types map
 
@@ -142,7 +143,7 @@ built for the other, which is why the libc is built twice (see below).
 | `i128` | `System.Int128` from `System.Runtime` |
 | `float`, `double` | `float32`, `float64` |
 | `x86_fp80` | rejected, unless `-msil-fp80=double`: then a `float64` value in the same 16-byte slot |
-| pointers | unmanaged `void*` |
+| pointers | unmanaged `void*`, or `int64` with `-msil-pointers=i64` |
 | structs, arrays | explicit-layout value classes (`valuetype`, byte-exact `.size`) |
 | a vector one SIMD register wide | `System.Numerics.Vector<T>` |
 | any other vector | explicit-layout value class (a byte blob) |
@@ -626,6 +627,15 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   there is no thread-exit hook to run.
 * The 64-bit CLR layout is the only one. `argc`/`argv` are built from
   `Environment.GetCommandLineArgs()` and leaked for the program's lifetime.
+* **`-msil-pointers=i64` trades memory for directness.** The option keeps
+  pointers in `int64` slots so an address needs no indirection and `conv.u`
+  before each dereference is a no-op on a 64-bit JIT. The cost is on a 32-bit
+  host, where a pointer still occupies 8 bytes: a struct embedding one is
+  larger than its native 32-bit counterpart and its layout no longer matches,
+  so interop with native code expecting real 32-bit struct layouts needs a
+  translation shim rather than passing pointers straight through. It also means
+  a `void*` crossing a pinvoke boundary is marshalled from an `int64`; the
+  forwarders that bind to the managed libc convert at that one boundary.
 
 ## Notes
 
