@@ -100,6 +100,100 @@ else()
     "environment or pass -DMSIL_LIBC_CLANG=...")
 endif()
 
+#--- Portable C++ runtime -----------------------------------------------------
+#
+# libcxx/*.cpp is the runtime half of a freestanding C++ implementation: the
+# allocation operators, local-static guards and exit-time destructors. It is
+# compiled to IR at build time and embedded, then linked on demand with
+# -msil-libcxx=builtin, exactly like the portable C library.
+#
+# It needs a C++ compiler (clang++) and is optional: a build without one leaves
+# MSIL_CXXRT_INCS empty and the backend reports the option as unavailable.
+set(MSIL_CXXRT_SOURCES
+  cxxrt.cpp
+)
+
+find_program(MSIL_CXXRT_CLANGXX NAMES clang++ clang++.exe clang clang.exe
+             HINTS "${LLVM_TOOLS_BINARY_DIR}"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/../../../../build/bin"
+             PATHS ENV MSIL_CLANGXX ENV MSIL_CLANG
+                   "C:/Program Files/LLVM/bin")
+if (MSIL_CXXRT_CLANGXX)
+  get_filename_component(MSIL_CXXRT_DIR "${MSIL_CXXRT_CLANGXX}" DIRECTORY)
+  find_program(MSIL_CXXRT_LLVM_LINK NAMES llvm-link llvm-link.exe
+               HINTS "${MSIL_CXXRT_DIR}" "${LLVM_TOOLS_BINARY_DIR}"
+               PATHS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../build/bin")
+endif()
+
+set(MSIL_CXXRT_INCS)
+if (MSIL_CXXRT_CLANGXX AND MSIL_CXXRT_LLVM_LINK)
+  # The same two-ABI split the C library uses: the mangled names of the
+  # allocation operators follow the target's C++ ABI (Itanium vs MSVC), so a
+  # program compiled for one triple cannot link the other's copy.
+  set(MSIL_CXXRT_TRIPLES x86_64-pc-windows-msvc x86_64-unknown-linux-gnu)
+  set(MSIL_CXXRT_SUFFIXES win sysv)
+  list(LENGTH MSIL_CXXRT_TRIPLES NTRIPLES)
+  math(EXPR LAST_TRIPLE "${NTRIPLES} - 1")
+  foreach(I RANGE ${LAST_TRIPLE})
+    list(GET MSIL_CXXRT_TRIPLES ${I} TRIPLE)
+    list(GET MSIL_CXXRT_SUFFIXES ${I} SUFFIX)
+    set(MSIL_CXXRT_OBJS)
+    foreach(SRC IN LISTS MSIL_CXXRT_SOURCES)
+      get_filename_component(NAME "${SRC}" NAME_WE)
+      set(OBJ "${CMAKE_CURRENT_BINARY_DIR}/cxxrt-${SUFFIX}-${NAME}.ll")
+      add_custom_command(
+        OUTPUT "${OBJ}"
+        COMMAND "${MSIL_CXXRT_CLANGXX}" -target ${TRIPLE}
+                -std=c++17 -ffreestanding -nostdinc -nostdinc++
+                -fno-builtin -fno-exceptions -fno-rtti -fno-threadsafe-statics
+                -O2 -fno-vectorize -fno-slp-vectorize
+                -S -emit-llvm -w -fno-discard-value-names
+                -o "${OBJ}" "${CMAKE_CURRENT_SOURCE_DIR}/libcxx/${SRC}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/libcxx/${SRC}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/libcxx/cxxrt.h"
+        COMMENT "Compiling portable C++ runtime ${SRC} to ${TRIPLE} IR"
+        VERBATIM)
+      list(APPEND MSIL_CXXRT_OBJS "${OBJ}")
+    endforeach()
+
+    set(IR "${CMAKE_CURRENT_BINARY_DIR}/cxxrt-${SUFFIX}.ll")
+    add_custom_command(
+      OUTPUT "${IR}"
+      COMMAND "${MSIL_CXXRT_LLVM_LINK}" -S ${MSIL_CXXRT_OBJS} -o "${IR}"
+      DEPENDS ${MSIL_CXXRT_OBJS}
+      COMMENT "Linking portable C++ runtime IR (${TRIPLE})"
+      VERBATIM)
+    if(SUFFIX STREQUAL "win")
+      list(APPEND MSIL_CXXRT_EMBEDS "${IR}=cxxrt-win=PortableCxxRtIR")
+    else()
+      list(APPEND MSIL_CXXRT_EMBEDS "${IR}=cxxrt-sysv=PortableCxxRtIRSysV")
+    endif()
+  endforeach()
+
+  foreach(ENTRY IN LISTS MSIL_CXXRT_EMBEDS)
+    string(REPLACE "=" ";" PAIR "${ENTRY}")
+    list(GET PAIR 0 IR)
+    list(GET PAIR 1 STEM)
+    list(GET PAIR 2 SYMBOL)
+    set(INC "${CMAKE_CURRENT_BINARY_DIR}/${STEM}.inc")
+    add_custom_command(
+      OUTPUT "${INC}"
+      COMMAND ${CMAKE_COMMAND}
+              -DINPUT=${IR}
+              -DOUTPUT=${INC}
+              -DNAME=${SYMBOL}
+              -P "${CMAKE_CURRENT_SOURCE_DIR}/EmbedIR.cmake"
+      DEPENDS "${IR}" "${CMAKE_CURRENT_SOURCE_DIR}/EmbedIR.cmake"
+      COMMENT "Embedding portable C++ runtime IR"
+      VERBATIM)
+    list(APPEND MSIL_CXXRT_INCS "${INC}")
+  endforeach()
+  add_custom_target(MSILCxxRtIRInc DEPENDS ${MSIL_CXXRT_INCS})
+else()
+  message(STATUS "Portable C++ runtime: no clang++ found; "
+                 "-msil-libcxx=builtin will be unavailable")
+endif()
+
 # The IR ships as a C string literal so there is no data file to find at run
 # time. The Windows-ABI copy keeps the original symbol name.
 set(MSIL_LIBC_INCS)
@@ -124,6 +218,10 @@ endforeach()
 add_custom_target(MSILLibcIRInc DEPENDS ${MSIL_LIBC_INCS})
 set_source_files_properties(MSILWriter.cpp PROPERTIES OBJECT_DEPENDS
                             "${MSIL_LIBC_INCS}")
+if (MSIL_CXXRT_INCS)
+  set_source_files_properties(MSILWriter.cpp PROPERTIES OBJECT_DEPENDS
+                              "${MSIL_CXXRT_INCS}")
+endif()
 
 # A standalone build links against an LLVM whose export file may already define
 # LLVMMSILCodeGen (when that LLVM was itself built with this project in-tree),
@@ -167,3 +265,6 @@ else()
 endif()
 
 add_dependencies(${MSIL_CODEGEN_TARGET} MSILLibcIRInc)
+if (TARGET MSILCxxRtIRInc)
+  add_dependencies(${MSIL_CODEGEN_TARGET} MSILCxxRtIRInc)
+endif()
