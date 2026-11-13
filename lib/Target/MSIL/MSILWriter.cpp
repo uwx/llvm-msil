@@ -72,6 +72,18 @@
 #define MSIL_HAVE_LIBC_SYSV
 #endif
 
+// The portable C++ runtime (libcxx/cxxrt.cpp), compiled to IR and embedded the
+// same way. Optional: a build without clang++ has no copies, and the option
+// that asks for it then reports that the tool cannot supply it.
+#if __has_include("cxxrt-win.inc")
+#include "cxxrt-win.inc"
+#define MSIL_HAVE_CXXRT
+#if __has_include("cxxrt-sysv.inc")
+#include "cxxrt-sysv.inc"
+#define MSIL_HAVE_CXXRT_SYSV
+#endif
+#endif
+
 using namespace llvm;
 
 /// Whether -msil-fp80 asked for the lossy binary64 mapping. Defined with the
@@ -264,6 +276,20 @@ static cl::opt<std::string> LibcSpec(
              "type you supply (type defaults to MSIL.Libc). Functions neither "
              "implements still pinvoke the CRT."),
     cl::value_desc("builtin|assembly[:type]"), cl::init(""));
+
+// The C++ runtime: the half of a C++ implementation that lives in the library
+// rather than the headers -- operator new/delete, the local-static guards, and
+// exit-time destructors. 'builtin' links the portable one into this module;
+// off by default, so a C module is unaffected and a C++ module that supplies
+// its own can opt out.
+static cl::opt<std::string> LibcxxSpec(
+    "msil-libcxx",
+    cl::desc("Link a C++ runtime into the module. 'builtin' links the portable "
+             "one (operator new/delete, local-static guards, exit-time "
+             "destructors), which is what a program built with freestanding "
+             "libc++ headers needs. Its C++ part needs -fno-exceptions and "
+             "-fno-rtti."),
+    cl::value_desc("builtin"), cl::init(""));
 
 static cl::opt<std::string> AllocSpec(
     "msil-alloc",
@@ -4503,6 +4529,20 @@ void MSILWriter::resolveLibcOptions() {
     LibMap.emplace_back(StringRef(Spec).substr(0, Eq).str(),
                         StringRef(Spec).substr(Eq + 1).str());
   }
+  // The C++ runtime is a separate link from the C one: a C++ program needs
+  // both. Validated here so a typo fails at once instead of at run time.
+  if (!LibcxxSpec.empty()) {
+    if (LibcxxSpec != "builtin")
+      report_fatal_error("MSIL: -msil-libcxx only knows 'builtin', got '" +
+                         Twine(LibcxxSpec) + "'");
+#ifndef MSIL_HAVE_CXXRT
+    report_fatal_error("MSIL: -msil-libcxx=builtin needs the portable C++ "
+                       "runtime, which this build did not compile (no "
+                       "clang++)");
+#else
+    EmitCxxRt = true;
+#endif
+  }
   if (LibcSpec.empty())
     return;
   if (LibcSpec == "builtin") {
@@ -5159,6 +5199,66 @@ void MSILWriter::linkPortableLibc() {
     if (F.isDeclaration() && F.getName().starts_with("__msil_"))
       AnySeam = true;
   UsesLibcSeam = AnySeam;
+}
+
+// The C++ runtime is linked the same way the C library is: parse the embedded
+// IR, adopt this module's layout/triple/flags, then LinkOnlyNeeded so only the
+// symbols the program actually references are merged.
+void MSILWriter::linkPortableCxxRt() {
+#ifdef MSIL_HAVE_CXXRT
+  LLVMContext &Ctx = Mod->getContext();
+  SMDiagnostic Err;
+  const char *IR = PortableCxxRtIR;
+#ifdef MSIL_HAVE_CXXRT_SYSV
+  if (Triple(Mod->getTargetTriple()).isOSBinFormatELF())
+    IR = PortableCxxRtIRSysV;
+#endif
+  std::unique_ptr<MemoryBuffer> Buf =
+      MemoryBuffer::getMemBuffer(IR, "portable-cxxrt", false);
+  std::unique_ptr<Module> Rt = parseAssembly(*Buf, Err, Ctx);
+  if (!Rt)
+    report_fatal_error("MSIL: the embedded portable C++ runtime does not "
+                       "parse: " + Err.getMessage());
+  Rt->setDataLayout(Mod->getDataLayout());
+  Rt->setTargetTriple(Mod->getTargetTriple());
+  SmallVector<Module::ModuleFlagEntry, 8> Flags;
+  Mod->getModuleFlagsMetadata(Flags);
+  for (const Module::ModuleFlagEntry &Flag : Flags)
+    Rt->setModuleFlag(Flag.Behavior, Flag.Key->getString(), Flag.Val);
+  // The MSVC local-static protocol reads a per-thread epoch the front end
+  // declares as an external thread-local. This module has one thread and no
+  // way to reach another module's thread-local storage (an external thread-local
+  // is a diagnostic for exactly that reason), so rewrite the declaration into an
+  // ordinary external global of the same type before the link: the runtime
+  // defines it, and with a single thread a plain global is the same thing.
+  if (GlobalVariable *Epoch = Mod->getGlobalVariable("_Init_thread_epoch")) {
+    if (Epoch->isThreadLocal() && Epoch->isDeclaration()) {
+      auto *Plain = new GlobalVariable(
+          *Mod, Epoch->getValueType(), /*isConstant=*/false,
+          GlobalValue::ExternalLinkage, nullptr, "_Init_thread_epoch");
+      Epoch->replaceAllUsesWith(Plain);
+      Epoch->eraseFromParent();
+      // The name was taken while the thread-local declaration still existed, so
+      // the new global got a numbered suffix; take the plain name now that it is
+      // free, or the runtime's definition would not merge with the uses.
+      Plain->setName("_Init_thread_epoch");
+    }
+  }
+  // LinkOnlyNeeded keeps a source definition only when the destination already
+  // declares the name. Nothing in the IR refers to the teardown hook -- the
+  // startup stub calls it in emitted IL -- so declare it here to pull its body
+  // in. It is a no-op when no destructor was registered.
+  if (!Mod->getFunction("__msil_cxx_finalize"))
+    Mod->getOrInsertFunction("__msil_cxx_finalize",
+                             FunctionType::get(Type::getVoidTy(Ctx), false));
+  if (Linker::linkModules(*Mod, std::move(Rt), Linker::LinkOnlyNeeded))
+    report_fatal_error("MSIL: linking the portable C++ runtime failed");
+  // The runtime calls __msil_write on its abort path, which needs the seam
+  // emitted even if the C library did not pull it in.
+  for (Function &F : *Mod)
+    if (F.isDeclaration() && F.getName().starts_with("__msil_"))
+      UsesLibcSeam = true;
+#endif
 }
 
 // The address of the caller's va_list slot. The C passes &ap, so on Windows
@@ -5947,6 +6047,11 @@ void MSILWriter::printModuleStartup() {
     out() << getTypeName(Main->getArg(I)->getType());
   }
   out() << ")\n";
+  // Exit-time destructors run after main returns and before the process exits.
+  // The value main returned is still on the stack below; a void call leaves it
+  // where it is, so the order here is "call main, call finalize, return".
+  if (EmitCxxRt)
+    out() << "\tcall\tvoid __msil_cxx_finalize()\n";
   if (Main->getReturnType()->isVoidTy())
     out() << "\tldc.i4.0\n";
   else
@@ -6020,6 +6125,11 @@ bool MSILWriter::runOnModule(Module &M) {
     dropStdioWrappers();
     linkPortableLibc();
   }
+  // The C++ runtime goes in after the C library so its malloc/free/abort/mem*
+  // references are satisfied by declarations the C link already resolved, and
+  // before collectTypes so the functions it adds are lowered like user code.
+  if (EmitCxxRt)
+    linkPortableCxxRt();
 
   // An alias is just another name for its target; resolve it away so an alias
   // of a function is not mistaken for a variable.

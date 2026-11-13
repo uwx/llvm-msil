@@ -125,6 +125,7 @@ built for the other, which is why the libc is built twice (see below).
 | `-msil-libc=builtin` | Link the portable C library into the module: `printf`/`snprintf`/`sprintf`/`puts`/`putchar` and the FILE-less `fputs`/`fputc`/`fwrite`/`strerror`, `atoi`/`strtol`/`strtoul`/`strtoimax` and the rest of the conversion family, `abs`/`div`/`imaxdiv`/`ffs`/`qsort`/`bsearch`/`rand`, the `str*` and `mem*` family (including the POSIX/GNU additions `stpcpy`/`stpncpy`/`memccpy`/`mempcpy`/`strsep`/`strcasestr`/`strndup`/`strchrnul`/`explicit_bzero`), and `<ctype.h>`. Written in C (ported from musl), compiled to IR at build time, and linked selectively, so only what the program reaches is emitted. It is a superset of `il`: `malloc`/`free`/`calloc`/`realloc` come from the IL subset backed by `NativeMemory`, and are emitted for `builtin` too. |
 | `-msil-libc=il` | Emit the smaller hand-written IL subset instead: `malloc`/`free`/`calloc`/`realloc` over `NativeMemory`, plus `memcpy`/`memset`/`memcmp` and the `str*` family, but no `printf`. For a module that must link no C in. |
 | `-msil-libc=<asm>[:<type>]` | Bind the same calls to a managed assembly you supply (type defaults to `MSIL.Libc`). |
+| `-msil-libcxx=builtin` | Link the portable C++ runtime into the module: the global allocation operators (`new`/`delete`, scalar and array, sized, nothrow and aligned), the local-static guard functions (`__cxa_guard_*` and the MSVC `_Init_thread_*` trio), and exit-time destructors (`__cxa_atexit`/`atexit`, run after `main`). Written in freestanding C++ and compiled at build time for both ABIs, like the C library, and linked selectively. Implies nothing about headers: pair it with a freestanding libc++ built for `-fno-exceptions -fno-rtti`. |
 | `-msil-alloc=<asm>:<type>` | Route `malloc`/`free`/`calloc`/`realloc` to methods of that name on your type, so unmanaged allocations can be instrumented. |
 | `-msil-math=0` | Do not bind libm to `System.Math`/`System.MathF`; pinvoke the CRT instead. |
 | `-msil-lib-map='SDL_*=SDL2.dll'` | Bind matching imports to a native library. `*` matches any suffix, and the option repeats. |
@@ -423,6 +424,81 @@ path is enough.
   native build, which would be comparing against MSVC. `libc/tests/compare.sh`
   leaves `%a` out for the same reason.
 
+## The portable C++ runtime
+
+`-msil-libcxx=builtin` supplies the part of a C++ implementation that lives
+below the headers: the allocation operators, the local-static guard functions,
+and the exit-time destructor machinery. The headers are a separate concern; this
+is the library a freestanding libc++ (`-nostdinc++`, `-fno-exceptions
+-fno-rtti`) needs in order to link and run.
+
+It is written in C++ in `lib/Target/MSIL/libcxx/` and compiled to IR at build
+time the same way the C library is: twice, once per ABI, embedded as string
+literals, and linked with `LinkOnlyNeeded` when the option asks for it. Because
+the source is C++ rather than hand-written IL, the mangled names of the
+operators come out of the compiler: `operator new` is `_Znwm` for an ELF triple
+and `??2@YAPEAX_K@Z` for a Windows one, which is exactly the symbol the front
+end emits a call to for that triple. Spelling the labels by hand would be a
+second source of truth for the same fact.
+
+### What is in it
+
+* **Allocation operators.** Plain, array, sized-delete (C++14), nothrow
+  (C++11) and aligned (C++17) forms, in both the Itanium and MSVC spellings.
+  They funnel through `malloc`/`free` by name, so `-msil-alloc` still redirects
+  the allocator and the IL subset's `NativeMemory` allocator is still in effect.
+  A plain `new` that cannot allocate aborts (there is nowhere to throw
+  `std::bad_alloc`); the nothrow forms return null. A request for more than the
+  compiler's default new alignment (16 bytes) is refused rather than silently
+  under-aligned, since a portable `malloc` cannot satisfy it.
+* **Local static guards.** `__cxa_guard_acquire`/`release`/`abort` for the
+  Itanium protocol, and `_Init_thread_header`/`footer` plus the
+  `_Init_thread_epoch` global for the MSVC one. The module is single-threaded
+  from the CLR's point of view (there is no portable mutex without a threading
+  reference), so the guard states are used to catch *recursive* initialisation
+  -- a static whose initializer names the same static -- rather than to wait.
+* **Exit-time destructors.** `__cxa_atexit` and `atexit` append to one table
+  (512 entries); `__msil_cxx_finalize` runs it backwards, which is construction
+  order reversed, and `__cxa_finalize` forwards to it. The backend calls
+  `__msil_cxx_finalize` from `$MSIL_Startup` after `main` returns.
+* **Abort paths.** `__cxa_pure_virtual`, `__cxa_deleted_virtual`,
+  `__cxa_bad_cast`, `__cxa_bad_typeid` and `__libcpp_verbose_abort` all print a
+  diagnostic and trap, through `__msil_cxx_abort`.
+
+### The MSVC local-static protocol
+
+The MSVC epoch counter needs two details to be right, and both are places where
+the obvious implementation fails. The front end emits
+
+```
+if (load(guard) > epoch) { _Init_thread_header(&guard);
+  if (guard == -1) { <initializer>; atexit(dtor); _Init_thread_footer(&guard); } }
+```
+
+so `_Init_thread_epoch` has to start at `-1` and only ever decrease: a fresh
+guard is `0`, which is greater than any epoch and therefore uninitialized, while
+a guard stamped by the footer holds the epoch value that completed it. The front
+end also declares `_Init_thread_epoch` as an external *thread-local*, which this
+backend rejects (the storage is in another module and there is no way to reach a
+given thread's copy); the writer rewrites that declaration into a plain external
+global before the link, and the runtime defines the storage. It is a global here
+because the module has one thread.
+
+### What it does not do
+
+* **No exceptions and no RTTI.** The backend does not emit landing pads or
+  image-relative type information, so a `throw` reaches the CLR as an
+  `SEHException` and terminates the program (see "Known limitations"). Compile
+  with `-fno-exceptions -fno-rtti`.
+* **No `std::` library.** This is the runtime, not the standard library. The
+  container/algorithm half comes from libc++'s headers, which must be built for
+  this target; LLVM 22's libc++ headers additionally need a clang that provides
+  `__builtin_clzg` and friends (clang 20 or newer), and are not usable with the
+  clang 18 the rest of this tree is tested with.
+* **No thread safety.** Guards do not synchronise, because there is no thread
+  to synchronise with. A program that starts threads and initializes a local
+  static from more than one is outside what this supports.
+
 ## Math
 
 libm calls bind to `System.Math`/`System.MathF` rather than pinvoking the CRT,
@@ -636,6 +712,14 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   translation shim rather than passing pointers straight through. It also means
   a `void*` crossing a pinvoke boundary is marshalled from an `int64`; the
   forwarders that bind to the managed libc convert at that one boundary.
+* **The C++ runtime's destructors run once, after `main` returns.**
+  `-msil-libcxx=builtin` calls `__msil_cxx_finalize` from `$MSIL_Startup`, so a
+  program that calls `exit()` or `_Exit()` itself skips its static destructors,
+  where a hosted implementation would run those registered before the `exit`.
+  The registration table holds 512 entries; `__cxa_atexit` returns `-1` past
+  that. Static-local guards do not synchronise (single-threaded assumption), and
+  a `new` request for more than 16-byte alignment aborts instead of allocating
+  over-aligned storage.
 
 ## Notes
 

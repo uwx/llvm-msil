@@ -286,6 +286,13 @@ private:
   /// the added functions go through the same passes as user code.
   void linkPortableLibc();
 
+  /// Link the portable C++ runtime (libcxx/cxxrt.cpp, embedded at build time)
+  /// into the module, keeping only what the module reaches. Runs before
+  /// lowering, like the C library's link, so its functions are emitted by the
+  /// same code as user code.
+  void linkPortableCxxRt();
+
+
   /// Turn a front-end printf wrapper into the declaration the portable
   /// library's implementation will satisfy.
   void dropStdioWrappers();
@@ -402,6 +409,9 @@ private:
 
   /// Set when the linked library left seam declarations to satisfy.
   bool UsesLibcSeam = false;
+
+  /// -msil-libcxx=builtin: link the portable C++ runtime.
+  bool EmitCxxRt = false;
 
   /// A Math/MathF forwarder was emitted, so System.Runtime is referenced.
   bool UsesMath = false;
