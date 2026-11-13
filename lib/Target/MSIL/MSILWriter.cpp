@@ -2863,8 +2863,14 @@ bool MSILWriter::isCxxRuntimeGlobal(const GlobalVariable &G) {
   if (!G.isDeclaration())
     return false;
   StringRef Name = G.getName();
+  // `__dso_handle` is deliberately absent. Clang names it in every ELF module
+  // that registers an `__cxa_atexit`, so it is evidence that a global
+  // destructor exists, not that the exception runtime does; counting it made
+  // MSIL.Runtime.dll mandatory for an ordinary C++ program and changed its
+  // output. It still gets bound (bindsExternalGlobal) when the runtime is in
+  // use for another reason, and otherwise stays the private field it was.
   return Name.starts_with("_ZTVN10__cxxabiv1") || Name.starts_with("_ZTI") ||
-         Name.starts_with("_ZTS") || Name == "__dso_handle";
+         Name.starts_with("_ZTS");
 }
 
 // once a module talks to MSIL.Runtime anyway, every external global goes

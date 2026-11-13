@@ -10,6 +10,13 @@
 target triple = "x86_64-unknown-linux-gnu"
 
 @guard = internal global i64 0
+; A global destructor makes clang name __dso_handle: a link-time constant it
+; passes to __cxa_atexit. It is not evidence that the exception runtime is in
+; use, and counting it once dragged MSIL.Runtime.dll into every ELF C++
+; program with a global destructor -- which assembles but then dies at run
+; time with FileNotFoundException. The CHECK-NOT at the end pins that down.
+@__dso_handle = external hidden global i8
+@dtor = internal global i32 0
 
 declare i32 @printf(ptr, ...)
 declare ptr @_Znwm(i64)
@@ -18,9 +25,18 @@ declare ptr @malloc(i64)
 declare void @free(ptr)
 declare i32 @__cxa_guard_acquire(ptr)
 declare void @__cxa_guard_release(ptr)
+declare i32 @__cxa_atexit(ptr, ptr, ptr)
+declare void @destroy(i32)
 
 ; The module's own functions are emitted first; the calls name the runtime
 ; symbols, which the link supplied.
+; A global destructor makes clang name __dso_handle, which is a link-time
+; constant for __cxa_atexit, not evidence that the exception runtime is in
+; use. Counting it once dragged MSIL.Runtime.dll into every ELF C++ program
+; with a global destructor, which assembled but then died at run time with
+; FileNotFoundException. This is the first check so it covers the header,
+; where that assembly reference would appear.
+; CHECK-NOT: MSIL.Runtime
 ; CHECK: call void* '_Znwm'(int64)
 ; CHECK: call void '_ZdlPv'(void*)
 ; CHECK: call int32 '__cxa_guard_acquire'(void*)
@@ -52,6 +68,7 @@ define i32 @main() {
   call void @free(ptr %r)
   call i32 @__cxa_guard_acquire(ptr @guard)
   call void @__cxa_guard_release(ptr @guard)
+  %d = call i32 @__cxa_atexit(ptr @destroy, ptr @dtor, ptr @__dso_handle)
   ret i32 0
 }
 
