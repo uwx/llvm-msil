@@ -61,7 +61,14 @@ llvm_config.use_default_substitutions()
 llvm_config.add_tool_substitutions(
     ["llvm-msil"], [msil_dir])
 llvm_config.add_tool_substitutions(
-    ["FileCheck", "not", "count"], [config.llvm_tools_dir])
+    ["FileCheck", "not", "count", "yaml2obj"], [config.llvm_tools_dir])
+
+# yaml2obj synthesises the ELF fixtures some tests read. A build of the tools
+# from a release archive may not have it, so a test that needs it has to skip
+# rather than fail with "command not found".
+if os.path.exists(os.path.join(config.llvm_tools_dir,
+                               "yaml2obj" + config.llvm_exe_ext)):
+    config.available_features.add("yaml2obj")
 
 if not os.path.exists(os.path.join(msil_dir,
                                    "llvm-msil" + config.llvm_exe_ext)):

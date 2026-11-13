@@ -30,20 +30,25 @@
 //===----------------------------------------------------------------------===//
 
 #include "MSILWriter.h"
+#include "MSILWideIntegers.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/Object/Binary.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/Object/COFF.h"
+#include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Program.h"
 #include "llvm/CodeGen/IntrinsicLowering.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
@@ -57,6 +62,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/xxhash.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils.h"
 
@@ -81,6 +87,10 @@
 #if __has_include("cxxrt-sysv.inc")
 #include "cxxrt-sysv.inc"
 #define MSIL_HAVE_CXXRT_SYSV
+#endif
+#if __has_include("cxxrt-mingw.inc")
+#include "cxxrt-mingw.inc"
+#define MSIL_HAVE_CXXRT_MINGW
 #endif
 #endif
 
@@ -111,6 +121,25 @@ const char *const UInt128Ty = "valuetype [System.Runtime]System.UInt128";
 // call's return type.
 const char *const Int128Ref = "[System.Runtime]System.Int128";
 const char *const UInt128Ref = "[System.Runtime]System.UInt128";
+
+const char *const CxxRuntimeAssembly = "MSIL.Runtime";
+const char *const CxxAbiTypeName = "MSIL.Runtime.CxxAbi";
+const char *const CxxAbiRef = "[MSIL.Runtime]MSIL.Runtime.CxxAbi";
+const char *const CxxExceptionRef = "[MSIL.Runtime]MSIL.Runtime.CxxException";
+const char *const CxxExceptionTy = "class [MSIL.Runtime]MSIL.Runtime.CxxException";
+const char *const ExceptionLocal = "$exn";
+
+std::string asILComment(const Instruction &I) {
+  std::string Text;
+  raw_string_ostream(Text) << I;
+  std::string Comment = "// ";
+  for (char C : Text) {
+    Comment += C;
+    if (C == '\n')
+      Comment += "// ";
+  }
+  return Comment;
+}
 
 bool isWideInt(Type *Ty) { return Ty->isIntegerTy(128); }
 
@@ -502,11 +531,12 @@ std::string MSILWriter::getTypeName(Type *Ty) {
       return "bool";
     if (N == 128)
       return Int128Ty;
-    if (N <= 32)
-      return "int" + utostr(N);
     // The CLR has no integer wider than 64 bits; wide IR integers (i33 from
     // overflow-avoiding transforms, i64, ...) use an int64 slot.
-    return "int64";
+    if (N > 32)
+      return "int64";
+    // the slot matches the alloc size, so an i24 field is still 4 bytes
+    return "int" + utostr(llvm::bit_ceil(std::max(N, 8u)));
   }
   case Type::FloatTyID:
     return "float32";
@@ -625,19 +655,20 @@ StringRef memSuffixOf(Type *Ty) {
     // default void* representation has the native-int `i` suffix.
     return pointersAsInt64() ? "i8" : "i";
   switch (Ty->getTypeID()) {
-  case Type::IntegerTyID:
-    switch (Ty->getIntegerBitWidth()) {
-    case 1:
-    case 8:
+  case Type::IntegerTyID: {
+    // only widths whose store size is exactly the CLR access, or a store
+    // would write past the value
+    unsigned N = Ty->getIntegerBitWidth();
+    if (N <= 8)
       return "i1";
-    case 16:
+    if (N <= 16)
       return "i2";
-    case 32:
+    if (N > 24 && N <= 32)
       return "i4";
-    case 64:
+    if (N > 56 && N <= 64)
       return "i8";
-    }
     break;
+  }
   case Type::FloatTyID:
     return "r4";
   case Type::DoubleTyID:
@@ -649,7 +680,7 @@ StringRef memSuffixOf(Type *Ty) {
   default:
     break;
   }
-  report_fatal_error("MSIL: unsupported memory type");
+  report_fatal_error("MSIL: unsupported memory type " + Twine(str(Ty)));
 }
 
 /// Instructions that normalize an int on the stack to \p Ty's declared width.
@@ -708,6 +739,13 @@ bool MSILWriter::isEmittedVarArgDef(const Function *F) {
 // so both triples advance the same 8-byte slots.
 bool MSILWriter::vaIsTag() const {
   return Triple(Mod->getTargetTriple()).isOSBinFormatELF();
+}
+
+// Whether the module's C++ ABI is Itanium's. The environment carries that:
+// `x86_64-w64-windows-gnu` is COFF but Itanium, `x86_64-pc-windows-msvc` is
+// both COFF and MSVC.
+bool MSILWriter::usesItaniumCxxAbi() const {
+  return !Triple(Mod->getTargetTriple()).isWindowsMSVCEnvironment();
 }
 
 uint64_t MSILWriter::vaSlotSize() const { return vaIsTag() ? 24 : 8; }
@@ -903,8 +941,40 @@ void MSILWriter::printValueLoadAsInt(const Value *V, bool Signed) {
 // Constants
 //===----------------------------------------------------------------------===//
 
+// newer LLVM spells a splat as a vector-typed ConstantInt/ConstantFP
+static bool isLaneConstant(const Constant *C) {
+  if (isa<ConstantVector>(C) || isa<ConstantDataVector>(C))
+    return true;
+  return C->getType()->isVectorTy() && (isa<ConstantInt>(C) || isa<ConstantFP>(C));
+}
+
+void MSILWriter::printVectorConstant(const Constant *C) {
+  auto *VTy = cast<FixedVectorType>(C->getType());
+  Type *ElemTy = VTy->getElementType();
+  uint64_t ElemSize = DL->getTypeAllocSize(ElemTy).getFixedValue();
+  std::string Tmp = newTempLocal(VTy);
+  out() << "\tldloca\t'" << Tmp << "'\n\tinitobj\t" << getTypeName(VTy) << "\n";
+  std::string Sfx = getMemSuffix(ElemTy);
+  for (unsigned I = 0, E = VTy->getNumElements(); I != E; ++I) {
+    const Constant *Elt = C->getAggregateElement(I);
+    if (!Elt || isa<UndefValue>(Elt) || Elt->isNullValue())
+      continue;
+    out() << "\tldloca\t'" << Tmp << "'\n\tconv.u8\n";
+    printPtrLoad(I * ElemSize);
+    out() << "\tconv.i8\n\tadd\n";
+    printConstLoad(Elt);
+    out() << "\tstind." << Sfx << "\n";
+  }
+  out() << "\tldloc\t'" << Tmp << "'\n";
+}
+
 void MSILWriter::printConstLoad(const Constant *C) {
   Type *Ty = C->getType();
+
+  if (isLaneConstant(C)) {
+    printVectorConstant(C);
+    return;
+  }
 
   if (const auto *CI = dyn_cast<ConstantInt>(C)) {
     unsigned N = Ty->getIntegerBitWidth();
@@ -936,6 +1006,15 @@ void MSILWriter::printConstLoad(const Constant *C) {
 
   if (const auto *FP = dyn_cast<ConstantFP>(C)) {
     const APFloat V = emittedFloat(FP->getValueAPF());
+    // the JIT holds float constants as doubles, and the round trip quiets a
+    // signaling NaN, so its bits go in as an int32 and are reread
+    if (Ty->isFloatTy() && V.isSignaling()) {
+      std::string Bits = newTempLocal(Type::getInt32Ty(Ty->getContext()));
+      out() << "\tldc.i4\t" << (int32_t)V.bitcastToAPInt().getZExtValue()
+            << "\n\tstloc\t'" << Bits << "'\n\tldloca\t'" << Bits
+            << "'\n\tconv.u8\n\tldind.r4\n";
+      return;
+    }
     SmallString<40> Str;
     // A NaN or an infinity has no decimal literal ilasm accepts, and its
     // hex form is silently read as zero; the bit-pattern form is the only one
@@ -987,47 +1066,8 @@ void MSILWriter::printConstLoad(const Constant *C) {
     return;
   }
 
-  if (auto *CV = dyn_cast<ConstantVector>(C)) {
-    // A non-splat ConstantVector (may hold poison/undef lanes, which stay 0).
-    Type *ElemTy = CV->getType()->getElementType();
-    uint64_t ElemSize = DL->getTypeAllocSize(ElemTy).getFixedValue();
-    std::string Tmp = newTempLocal(CV->getType());
-    out() << "\tldloca\t'" << Tmp << "'\n\tinitobj\t"
-          << getTypeName(CV->getType()) << "\n";
-    std::string Sfx = getMemSuffix(ElemTy);
-    for (unsigned I = 0, E = CV->getType()->getNumElements(); I != E; ++I) {
-      const Constant *Elt = CV->getAggregateElement(I);
-      if (!Elt || isa<UndefValue>(Elt) || Elt->isNullValue())
-        continue;
-      out() << "\tldloca\t'" << Tmp << "'\n\tconv.u8\n";
-      printPtrLoad(I * ElemSize);
-      out() << "\tconv.i8\n\tadd\n";
-      printConstLoad(Elt);
-      out() << "\tstind." << Sfx << "\n";
-    }
-    out() << "\tldloc\t'" << Tmp << "'\n";
-    return;
-  }
-
-  if (const auto *CDV = dyn_cast<ConstantDataVector>(C)) {
-    // Build the blob lane by lane in a scratch local.
-    Type *ElemTy = CDV->getType()->getElementType();
-    uint64_t ElemSize = DL->getTypeAllocSize(ElemTy).getFixedValue();
-    std::string Tmp = newTempLocal(CDV->getType());
-    out() << "\tldloca\t'" << Tmp << "'\n\tinitobj\t"
-          << getTypeName(CDV->getType()) << "\n";
-    std::string Sfx = getMemSuffix(ElemTy);
-    for (unsigned I = 0, E = CDV->getNumElements(); I != E; ++I) {
-      const Constant *Elt = CDV->getElementAsConstant(I);
-      if (!Elt || isa<UndefValue>(Elt) || Elt->isNullValue())
-        continue;
-      out() << "\tldloca\t'" << Tmp << "'\n\tconv.u8\n";
-      printPtrLoad(I * ElemSize);
-      out() << "\tconv.i8\n\tadd\n";
-      printConstLoad(Elt);
-      out() << "\tstind." << Sfx << "\n";
-    }
-    out() << "\tldloc\t'" << Tmp << "'\n";
+  if (const auto *CE = dyn_cast<ConstantExpr>(C)) {
+    printConstantExpr(CE);
     return;
   }
 
@@ -1262,23 +1302,23 @@ void MSILWriter::printCastInstruction(unsigned Op, const Value *V, Type *Ty) {
     }
   }
 
-  // Vector casts and bitcasts are byte-level moves between two blobs; the
-  // scalar paths below would truncate the aggregate to a single value.
-  if (auto *DstVTy = dyn_cast<VectorType>(Ty)) {
-    if (Op == Instruction::BitCast && V->getType() == Ty) {
+  bool VectorInvolved = Ty->isVectorTy() || V->getType()->isVectorTy();
+  if (Op == Instruction::BitCast && VectorInvolved) {
+    if (V->getType() == Ty)
       printValueLoad(V);
-      return;
-    }
+    else
+      printVectorBitcast(V, Ty);
+    return;
+  }
+
+  // The scalar paths below would truncate the aggregate to a single value.
+  if (auto *DstVTy = dyn_cast<VectorType>(Ty)) {
     if (auto *SrcVTy = dyn_cast<VectorType>(V->getType())) {
       if (SrcVTy->getElementCount() == DstVTy->getElementCount() &&
           SrcVTy->getElementType() != DstVTy->getElementType()) {
         printVectorCast(Op, V, Ty);
         return;
       }
-    }
-    if (Op == Instruction::BitCast) {
-      printValueLoad(V);
-      return;
     }
   }
 
@@ -1499,16 +1539,24 @@ void MSILWriter::printVectorCmp(unsigned Pred, const Value *L, const Value *R,
   out() << "\tstloc\t'" << B << "'\n";
   out() << "\tldloca\t'" << Res << "'\n\tinitobj\t"
         << getTypeName(ResTy) << "\n";
+  std::string Sfx = getMemSuffix(EltTy);
   for (unsigned I = 0; I < N; ++I) {
+    auto LoadLaneA = [&] {
+      printAggregateLaneAddr(A, EltTy, I * ElemSize);
+      out() << "\tldind." << Sfx << "\n";
+    };
+    auto LoadLaneB = [&] {
+      printAggregateLaneAddr(B, EltTy, I * ElemSize);
+      out() << "\tldind." << Sfx << "\n";
+    };
     printAggregateLaneAddr(Res, ResTy->getElementType(), I);
-    printAggregateLaneAddr(A, EltTy, I * ElemSize);
-    out() << "\tldind." << getMemSuffix(EltTy) << "\n";
-    printAggregateLaneAddr(B, EltTy, I * ElemSize);
-    out() << "\tldind." << getMemSuffix(EltTy) << "\n";
-    if (IsFP)
-      printFCmp(Pred, nullptr, nullptr, /*EmitOperands=*/false);
-    else
+    if (IsFP) {
+      printFCmp(Pred, LoadLaneA, LoadLaneB);
+    } else {
+      LoadLaneA();
+      LoadLaneB();
       printICmp(Pred, nullptr, nullptr, /*EmitOperands=*/false);
+    }
     out() << "\tstind.i1\n";
   }
   out() << "\tldloc\t'" << Res << "'\n";
@@ -1556,11 +1604,9 @@ void MSILWriter::printICmp(unsigned Pred, const Value *L, const Value *R,
   }
 }
 
-void MSILWriter::printFCmp(unsigned Pred, const Value *L, const Value *R,
-                           bool EmitOperands) {
-  auto LoadL = [&] { if (EmitOperands) printValueLoad(L); };
-  auto LoadR = [&] { if (EmitOperands) printValueLoad(R); };
-  // ceq is false when either operand is NaN; clt/cgt are "unordered or ...".
+void MSILWriter::printFCmp(unsigned Pred, function_ref<void()> LoadL,
+                           function_ref<void()> LoadR) {
+  // ceq/clt/cgt are false for NaN, clt.un/cgt.un are true
   auto Cmp = [&](const char *Op) {
     LoadL();
     LoadR();
@@ -1605,11 +1651,11 @@ void MSILWriter::printFCmp(unsigned Pred, const Value *L, const Value *R,
     Ordered("cgt");
     return;
   case CmpInst::FCMP_OLE:
-    Ordered("cgt");
+    Cmp("cgt.un");
     printNot();
     return;
   case CmpInst::FCMP_OGE:
-    Ordered("clt");
+    Cmp("clt.un");
     printNot();
     return;
   case CmpInst::FCMP_ULT:
@@ -2030,9 +2076,10 @@ void MSILWriter::printPHICopy(const BasicBlock *From, const BasicBlock *To) {
   }
 }
 
-void MSILWriter::printBranchInstruction(const BranchInst *Inst) {
+void MSILWriter::printBranchInstruction(const Instruction *Inst) {
   const BasicBlock *From = Inst->getParent();
-  if (Inst->isUnconditional()) {
+  bool Unconditional = Inst->getNumSuccessors() == 1;
+  if (Unconditional) {
     printPHICopy(From, Inst->getSuccessor(0));
     out() << "\tbr\t" << getLabelName(Inst->getSuccessor(0)) << '\n';
     return;
@@ -2043,7 +2090,8 @@ void MSILWriter::printBranchInstruction(const BranchInst *Inst) {
   bool TPhi = !T->phis().empty();
   bool FPhi = !F->phis().empty();
 
-  printValueLoad(Inst->getCondition());
+  const Value *Condition = Inst->getOperand(0);
+  printValueLoad(Condition);
 
   if (!TPhi && !FPhi) {
     out() << "\tbrtrue\t" << getLabelName(T) << '\n';
@@ -2210,43 +2258,40 @@ bool MSILWriter::tryPrintSimdCmpToStack(const User *Inst, bool IsFP) {
   unsigned Pred = IsFP ? cast<FCmpInst>(Inst)->getPredicate()
                        : cast<ICmpInst>(Inst)->getPredicate();
   // Only the ordered predicates have a single Vector<T> helper; the rest fall
-  // back to the lane loop.
+  // back to the lane loop. The lanes are int32/int64, so the helpers compare
+  // signed and unsigned predicates take the lane loop too.
   const char *Name = nullptr;
-  bool Swap = false, Invert = false;
+  bool Invert = false;
   if (IsFP) {
     switch (Pred) {
     case CmpInst::FCMP_OEQ: Name = "Equals"; break;
     case CmpInst::FCMP_OLT: Name = "LessThan"; break;
     case CmpInst::FCMP_OGT: Name = "GreaterThan"; break;
-    case CmpInst::FCMP_OLE: Name = "GreaterThan"; Swap = true; break;
-    case CmpInst::FCMP_OGE: Name = "LessThan"; Swap = true; break;
+    case CmpInst::FCMP_OLE: Name = "LessThanOrEqual"; break;
+    case CmpInst::FCMP_OGE: Name = "GreaterThanOrEqual"; break;
     default: return false;
     }
   } else {
     switch (Pred) {
     case CmpInst::ICMP_EQ: Name = "Equals"; break;
     case CmpInst::ICMP_NE: Name = "Equals"; Invert = true; break;
-    case CmpInst::ICMP_SLT:
-    case CmpInst::ICMP_ULT: Name = "LessThan"; break;
-    case CmpInst::ICMP_SGT:
-    case CmpInst::ICMP_UGT: Name = "GreaterThan"; break;
-    case CmpInst::ICMP_SLE:
-    case CmpInst::ICMP_ULE: Name = "GreaterThan"; Swap = true; break;
-    case CmpInst::ICMP_SGE:
-    case CmpInst::ICMP_UGE: Name = "LessThan"; Swap = true; break;
+    case CmpInst::ICMP_SLT: Name = "LessThan"; break;
+    case CmpInst::ICMP_SGT: Name = "GreaterThan"; break;
+    case CmpInst::ICMP_SLE: Name = "LessThanOrEqual"; break;
+    case CmpInst::ICMP_SGE: Name = "GreaterThanOrEqual"; break;
     default: return false;
     }
   }
 
-  printValueLoad(Inst->getOperand(Swap ? 1 : 0));
-  printValueLoad(Inst->getOperand(Swap ? 0 : 1));
+  printValueLoad(Inst->getOperand(0));
+  printValueLoad(Inst->getOperand(1));
   emitVecCall(out(), E, Name,
               std::string("valuetype ") + NV.str() + "<!!0>, valuetype " +
                   NV.str() + "<!!0>");
   if (Invert) {
     // A mask is all-ones where the comparison holds; xor flips every lane.
     printConstLoad(Constant::getAllOnesValue(OpTy));
-    emitVecCall(out(), E, "op_ExclusiveOr",
+    emitVecCall(out(), E, "Xor",
                 std::string("valuetype ") + NV.str() + "<!!0>, valuetype " +
                   NV.str() + "<!!0>");
   }
@@ -2313,11 +2358,18 @@ void MSILWriter::printVectorCast(unsigned Op, const Value *V, Type *Ty) {
     out() << "\tldind." << getMemSuffix(SrcElt) << "\n";
     switch (Op) {
     case Instruction::ZExt:
-      if (SrcElt->getIntegerBitWidth() <= 32)
+      if (SrcElt->getIntegerBitWidth() <= 32) {
         out() << '\t' << widthConv(SrcElt) << '\n';
+        if (DstElt->getIntegerBitWidth() > 32)
+          out() << "\tconv.u8\n";
+      }
       break;
     case Instruction::SExt:
-      out() << "\tconv.i4\n";
+      // an i1 lane is stored as 0/1, true has to become all ones
+      if (SrcElt->isIntegerTy(1))
+        out() << "\tldc.i4.1\n\tand\n\tneg\n";
+      out() << (DstElt->getIntegerBitWidth() > 32 ? "\tconv.i8\n"
+                                                  : "\tconv.i4\n");
       break;
     case Instruction::Trunc:
       if (DstElt->getIntegerBitWidth() <= 32)
@@ -2352,6 +2404,61 @@ void MSILWriter::printVectorCast(unsigned Op, const Value *V, Type *Ty) {
     out() << "\tstind." << getMemSuffix(DstElt) << "\n";
   }
   out() << "\tldloc\t'" << R << "'\n";
+}
+
+// A bitcast keeps the bits, so it goes through memory of the source type. The
+// one exception is an i1 vector: a lane is a byte in the blob but a bit in the
+// integer it is cast to or from.
+void MSILWriter::printVectorBitcast(const Value *V, Type *Ty) {
+  Type *SrcTy = V->getType();
+  std::string Src = newTempLocal(SrcTy);
+  printValueLoad(V);
+  out() << "\tstloc\t'" << Src << "'\n";
+
+  auto *SrcVTy = dyn_cast<FixedVectorType>(SrcTy);
+  auto *DstVTy = dyn_cast<FixedVectorType>(Ty);
+  bool PacksBits = SrcVTy && SrcVTy->getElementType()->isIntegerTy(1);
+  bool UnpacksBits = DstVTy && DstVTy->getElementType()->isIntegerTy(1);
+  if ((PacksBits && !Ty->isIntegerTy()) ||
+      (UnpacksBits && !SrcTy->isIntegerTy()))
+    report_fatal_error("MSIL: unsupported i1 vector bitcast: " +
+                       Twine(str(SrcTy)) + " to " + Twine(str(Ty)));
+
+  Type *I1 = Type::getInt1Ty(Mod->getContext());
+  if (PacksBits) {
+    bool Wide = Ty->getIntegerBitWidth() > 32;
+    out() << (Wide ? "\tldc.i8\t0\n" : "\tldc.i4.0\n");
+    for (unsigned I = 0, E = SrcVTy->getNumElements(); I != E; ++I) {
+      printAggregateLaneAddr(Src, I1, I);
+      out() << "\tldind.u1\n\tldc.i4.1\n\tand\n";
+      if (Wide)
+        out() << "\tconv.u8\n";
+      out() << "\tldc.i4\t" << I << "\n\tshl\n\tor\n";
+    }
+    return;
+  }
+
+  if (UnpacksBits) {
+    bool Wide = SrcTy->getIntegerBitWidth() > 32;
+    std::string Dst = newTempLocal(Ty);
+    out() << "\tldloca\t'" << Dst << "'\n\tinitobj\t" << getTypeName(Ty)
+          << "\n";
+    for (unsigned I = 0, E = DstVTy->getNumElements(); I != E; ++I) {
+      printAggregateLaneAddr(Dst, I1, I);
+      out() << "\tldloc\t'" << Src << "'\n\tldc.i4\t" << I << "\n\tshr.un\n";
+      if (Wide)
+        out() << "\tconv.u4\n";
+      out() << "\tldc.i4.1\n\tand\n\tstind.i1\n";
+    }
+    out() << "\tldloc\t'" << Dst << "'\n";
+    return;
+  }
+
+  out() << "\tldloca\t'" << Src << "'\n\tconv.u8\n";
+  if (movesAsBlob(Ty))
+    out() << "\tldobj\t" << getTypeName(Ty) << '\n';
+  else
+    out() << "\tldind." << getMemSuffix(Ty) << '\n';
 }
 
 //===----------------------------------------------------------------------===//
@@ -2461,6 +2568,35 @@ void MSILWriter::printFloatBitsNe(const std::string &A, const std::string &B,
   printNot();
 }
 
+static bool isIntMinMax(AtomicRMWInst::BinOp Op) {
+  return Op == AtomicRMWInst::Min || Op == AtomicRMWInst::Max ||
+         Op == AtomicRMWInst::UMin || Op == AtomicRMWInst::UMax;
+}
+
+void MSILWriter::printMinMaxOf(AtomicRMWInst::BinOp Op, const std::string &Old,
+                               const std::string &Val, Type *Ty) {
+  bool Signed = Op == AtomicRMWInst::Min || Op == AtomicRMWInst::Max;
+  bool KeepGreater = Op == AtomicRMWInst::Max || Op == AtomicRMWInst::UMax;
+  unsigned Bits = Ty->getIntegerBitWidth();
+  // narrow locals hold the zero-extended form
+  auto LoadOperand = [&](const std::string &Local) {
+    out() << "\tldloc\t'" << Local << "'\n";
+    if (Signed && Bits == 8)
+      out() << "\tconv.i1\n";
+    else if (Signed && Bits == 16)
+      out() << "\tconv.i2\n";
+  };
+  std::string Keep = "IL_keepold" + utostr(getUniqID());
+  std::string Done = "IL_minmax" + utostr(getUniqID());
+  LoadOperand(Old);
+  LoadOperand(Val);
+  out() << '\t' << (KeepGreater ? "cgt" : "clt") << (Signed ? "" : ".un")
+        << "\n\tbrtrue\t" << Keep << '\n';
+  out() << "\tldloc\t'" << Val << "'\n\tbr\t" << Done << '\n';
+  out() << Keep << ":\n\tldloc\t'" << Old << "'\n";
+  out() << Done << ":\n";
+}
+
 void MSILWriter::printAtomicRMW(const AtomicRMWInst *RMW) {
   Type *RTy = RMW->getType();
   AtomicRMWInst::BinOp Op = RMW->getOperation();
@@ -2479,6 +2615,11 @@ void MSILWriter::printAtomicRMW(const AtomicRMWInst *RMW) {
     out() << "\tcall\t" << ILTy << " [mscorlib]System.Threading.Interlocked::"
           << (Op == AtomicRMWInst::Xchg ? "Exchange" : "Add") << "(" << ILTy
           << "&, " << ILTy << ")\n";
+    // Interlocked.Add returns the new value, atomicrmw the old one
+    if (Op != AtomicRMWInst::Xchg) {
+      printValueLoad(RMW->getValOperand());
+      out() << (Op == AtomicRMWInst::Add ? "\tsub\n" : "\tadd\n");
+    }
     return;
   }
 
@@ -2493,6 +2634,10 @@ void MSILWriter::printAtomicRMW(const AtomicRMWInst *RMW) {
     if (Op == AtomicRMWInst::Xchg) {
       // The new value is simply the operand, with no old value read.
       out() << "\tldloc\t'" << Val << "'\n";
+      return;
+    }
+    if (isIntMinMax(Op)) {
+      printMinMaxOf(Op, Old, Val, RTy);
       return;
     }
     out() << "\tldloc\t'" << Old << "'\n\tldloc\t'" << Val << "'\n";
@@ -2626,6 +2771,243 @@ void MSILWriter::printAtomicLock() {
   out() << "\tnewobj\tinstance void [mscorlib]System.Object::.ctor()\n";
   out() << "\tstsfld\tobject '$MSIL::atomicLock'\n\tret\n}\n";
 }
+
+//===----------------------------------------------------------------------===//
+// C++ exceptions
+//===----------------------------------------------------------------------===//
+
+// has to match the public methods of MSIL.Runtime.CxxAbi
+//
+// These are the functions that only the *exception* machinery calls. They are
+// the ones whose presence means the C++ runtime is in use, so they are also
+// what `usesCxxRuntime` tests for.
+bool MSILWriter::isCxxRuntimeFunction(StringRef Name) {
+  static const StringLiteral Names[] = {
+      "__cxa_allocate_exception",
+      "__cxa_free_exception",
+      "__cxa_allocate_dependent_exception",
+      "__cxa_free_dependent_exception",
+      "__cxa_init_primary_exception",
+      "__cxa_throw",
+      "__cxa_begin_catch",
+      "__cxa_end_catch",
+      "__cxa_rethrow",
+      "__cxa_get_exception_ptr",
+      "__cxa_current_exception_type",
+      "__cxa_increment_exception_refcount",
+      "__cxa_decrement_exception_refcount",
+      "__cxa_current_primary_exception",
+      "__cxa_rethrow_primary_exception",
+      "__cxa_uncaught_exception",
+      "__cxa_uncaught_exceptions",
+      "__cxa_get_globals",
+      "__cxa_get_globals_fast",
+      "_ZN10__cxxabiv119__getExceptionClassEPK17_Unwind_Exception",
+      "_ZN10__cxxabiv121__isOurExceptionClassEPK17_Unwind_Exception",
+  };
+  return is_contained(Names, Name);
+}
+
+// Allocation operators and the exit-time hooks. CxxAbi defines them so an
+// exception-using program needs no separate C++ runtime, but a program that
+// never throws must not be dragged onto MSIL.Runtime by `new` alone: that
+// would make the DLL mandatory for any C++ program and change the output of
+// every module that allocates. They bind to CxxAbi only when
+// `usesCxxRuntime()` is already true for another reason.
+bool MSILWriter::isCxxSupportFunction(StringRef Name) {
+  static const StringLiteral Names[] = {
+      "__cxa_atexit",
+      "__cxa_thread_atexit_impl",
+      "__cxa_pure_virtual",
+      "_ZSt9terminatev",
+      // operator new/delete. The Itanium-manglable ones come in two spellings
+      // because `size_t` is `unsigned long` on ELF and `unsigned long long`
+      // on mingw, so the same operator is `_Znwm` on one and `_Znwy` on the
+      // other; both have to reach the same CxxAbi member.
+      "_Znwm", "_Znam", "_ZdlPv", "_ZdaPv", "_ZdlPvm", "_ZdaPvm",
+      "_Znwy", "_Znay", "_ZdlPvy", "_ZdaPvy",
+  };
+  return is_contained(Names, Name);
+}
+
+// The CxxAbi member a C symbol binds to. Usually the symbol's own name; the
+// mingw allocation operators share the ELF member because the parameter is an
+// i64 either way and CxxAbi spells each one once.
+StringRef MSILWriter::getCxxRuntimeMember(StringRef Name) {
+  if (Name == "_Znwy" || Name == "_Znay")
+    return Name == "_Znwy" ? "_Znwm" : "_Znam";
+  if (Name == "_ZdlPvy")
+    return "_ZdlPvm";
+  if (Name == "_ZdaPvy")
+    return "_ZdaPvm";
+  return Name;
+}
+
+// glibc keeps the exit ones in libc_nonshared.a, so they can't be pinvoked,
+// and the pthread ones take managed callbacks that glibc would otherwise call
+// on threads the runtime doesn't know. they only go to the runtime in a
+// module that already depends on it
+bool MSILWriter::isRuntimeHookFunction(StringRef Name) {
+  return Name == "atexit" || Name == "at_quick_exit" || Name == "quick_exit" ||
+         isThreadHookFunction(Name);
+}
+
+// a managed thread routine or key destructor can't run without the runtime,
+// so these pull it in on their own
+bool MSILWriter::isThreadHookFunction(StringRef Name) {
+  return Name == "pthread_create" || Name == "pthread_key_create" ||
+         Name == "pthread_key_delete";
+}
+
+bool MSILWriter::isCxxRuntimeGlobal(const GlobalVariable &G) {
+  if (!G.isDeclaration())
+    return false;
+  StringRef Name = G.getName();
+  return Name.starts_with("_ZTVN10__cxxabiv1") || Name.starts_with("_ZTI") ||
+         Name.starts_with("_ZTS") || Name == "__dso_handle";
+}
+
+// once a module talks to MSIL.Runtime anyway, every external global goes
+// through it: data symbols like glibc's stdout can't be pinvoked
+bool MSILWriter::bindsExternalGlobal(const GlobalVariable &G) const {
+  return UsesCxxRuntime && G.isDeclaration() && !G.isThreadLocal();
+}
+
+static bool isAbiTypeInfoVTable(const GlobalVariable &G) {
+  return !G.isDeclaration() && G.getName().starts_with("_ZTVN10__cxxabiv1");
+}
+
+bool MSILWriter::hasCxxRuntimeGlobals() const {
+  return any_of(Mod->globals(), [](const GlobalVariable &G) {
+    return isCxxRuntimeGlobal(G);
+  });
+}
+
+bool MSILWriter::usesCxxRuntime() const {
+  if (hasCxxRuntimeGlobals() || any_of(Mod->globals(), isAbiTypeInfoVTable))
+    return true;
+  for (const Function &Fn : *Mod) {
+    if (Fn.isDeclaration()) {
+      if (isCxxRuntimeFunction(Fn.getName()) ||
+          isThreadHookFunction(Fn.getName()))
+        return true;
+      continue;
+    }
+    for (const BasicBlock &BB : Fn)
+      if (isa<InvokeInst>(BB.getTerminator()) ||
+          isa<ResumeInst>(BB.getTerminator()) || BB.isLandingPad())
+        return true;
+  }
+  return false;
+}
+
+bool MSILWriter::needsInitializer() const {
+  if (!Templates.empty())
+    return true;
+  return any_of(Mod->globals(), [this](const GlobalVariable &G) {
+    return bindsExternalGlobal(G);
+  });
+}
+
+// selector 0 means no clause matched, so ids start at 1
+unsigned MSILWriter::getEHTypeId(const Value *TypeInfo) {
+  const Value *Key = TypeInfo->stripPointerCasts();
+  auto Inserted = EHTypeIds.try_emplace(Key, EHTypeIds.size() + 1);
+  return Inserted.first->second;
+}
+
+// only CxxException is caught, so abort/unreachable/faults skip C++ handlers
+// like they do natively
+void MSILWriter::printInvoke(const InvokeInst *II) {
+  const BasicBlock *From = II->getParent();
+  std::string Label = "IL_invoke" + utostr(getUniqID());
+  out() << "\t.try\n\t{\n";
+  printCallInstruction(II);
+  if (!II->getType()->isVoidTy())
+    printValueSave(II);
+  out() << "\tleave\t" << Label << "_normal\n\t}\n";
+  out() << "\tcatch " << CxxExceptionRef << "\n\t{\n";
+  out() << "\tcall\tvoid* " << CxxAbiRef << "::Landing(" << CxxExceptionTy
+        << ")\n";
+  out() << "\tstloc\t'" << ExceptionLocal << "'\n";
+  out() << "\tleave\t" << Label << "_unwind\n\t}\n";
+
+  out() << Label << "_unwind:\n";
+  printPHICopy(From, II->getUnwindDest());
+  out() << "\tbr\t" << getLabelName(II->getUnwindDest()) << '\n';
+  out() << Label << "_normal:\n";
+  printPHICopy(From, II->getNormalDest());
+  out() << "\tbr\t" << getLabelName(II->getNormalDest()) << '\n';
+}
+
+void MSILWriter::printLandingPad(const LandingPadInst *LP) {
+  auto *ResultTy = cast<StructType>(LP->getType());
+  Type *I32 = Type::getInt32Ty(Mod->getContext());
+  std::string Selector = newTempLocal(I32);
+  std::string Result = newTempLocal(ResultTy);
+  std::string Done = "IL_lpad" + utostr(getUniqID());
+
+  out() << "\tldc.i4.0\n\tstloc\t'" << Selector << "'\n";
+  for (unsigned I = 0, E = LP->getNumClauses(); I != E; ++I) {
+    if (LP->isFilter(I))
+      report_fatal_error("MSIL: landingpad filter clauses (dynamic exception "
+                         "specifications) are not supported");
+    const Value *TypeInfo = LP->getClause(I);
+    std::string Next = Done + "_next" + utostr(I);
+    out() << "\tldloc\t'" << ExceptionLocal << "'\n";
+    printValueLoad(TypeInfo);
+    out() << "\tcall\tbool " << CxxAbiRef << "::Matches(void*, void*)\n";
+    out() << "\tbrfalse\t" << Next << '\n';
+    out() << "\tldc.i4\t" << getEHTypeId(TypeInfo) << "\n\tstloc\t'" << Selector
+          << "'\n\tbr\t" << Done << '\n';
+    out() << Next << ":\n";
+  }
+  out() << Done << ":\n";
+
+  const StructLayout *Layout = DL->getStructLayout(ResultTy);
+  printAggregateLaneAddr(Result, ResultTy->getElementType(0), 0);
+  out() << "\tldloc\t'" << ExceptionLocal << "'\n\tstind.i\n";
+  printAggregateLaneAddr(Result, I32, Layout->getElementOffset(1));
+  out() << "\tldloc\t'" << Selector << "'\n\tstind.i4\n";
+  out() << "\tldloc\t'" << Result << "'\n";
+}
+
+void MSILWriter::printResume(const ResumeInst *RI) {
+  const Value *Pair = RI->getValue();
+  std::string PairLocal = newTempLocal(Pair->getType());
+  printValueLoad(Pair);
+  out() << "\tstloc\t'" << PairLocal << "'\n";
+  printAggregateLaneAddr(PairLocal, PointerType::getUnqual(Mod->getContext()),
+                         0);
+  out() << "\tldind.i\n";
+  out() << "\tcall\t" << CxxExceptionTy << ' ' << CxxAbiRef
+        << "::Resume(void*)\n\tthrow\n";
+}
+
+void MSILWriter::printCxxRuntimeSymbols() {
+  for (const GlobalVariable &G : Mod->globals()) {
+    if (!bindsExternalGlobal(G))
+      continue;
+    out() << "\tldstr\t\"" << G.getName() << "\"\n";
+    out() << "\tcall\tvoid* " << CxxAbiRef << "::Symbol(string)\n";
+    out() << "\tstsfld\tvoid* '" << G.getName() << "'\n";
+  }
+}
+
+// libc++abi's own type_info vtables, so a catch can use its can_catch
+void MSILWriter::printAbiVTableRegistrations() {
+  if (!UsesCxxRuntime)
+    return;
+  for (const GlobalVariable &G : Mod->globals()) {
+    if (!isAbiTypeInfoVTable(G))
+      continue;
+    out() << "\tldstr\t\"" << G.getName() << "\"\n";
+    printValueLoad(&G);
+    out() << "\tcall\tvoid " << CxxAbiRef
+          << "::RegisterVTable(string, void*)\n";
+  }
+}
+
 void MSILWriter::printInstruction(const Instruction *Inst) {
   const Value *Op0 = Inst->getNumOperands() > 0 ? Inst->getOperand(0) : nullptr;
   const Value *Op1 = Inst->getNumOperands() > 1 ? Inst->getOperand(1) : nullptr;
@@ -2683,8 +3065,13 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
       printValueLoad(RV);
     out() << "\tret\n";
     return;
+#if LLVM_VERSION_MAJOR >= 23
+  case Instruction::UncondBr:
+  case Instruction::CondBr:
+#else
   case Instruction::Br:
-    printBranchInstruction(cast<BranchInst>(Inst));
+#endif
+    printBranchInstruction(Inst);
     return;
   case Instruction::Unreachable:
     out() << "\tldstr\t\"unreachable\"\n";
@@ -2775,7 +3162,9 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
       printVectorCmp(cast<FCmpInst>(Inst)->getPredicate(), Op0, Op1, RTy,
                      /*IsFP=*/true);
     else
-      printFCmp(cast<FCmpInst>(Inst)->getPredicate(), Op0, Op1);
+      printFCmp(
+          cast<FCmpInst>(Inst)->getPredicate(), [&] { printValueLoad(Op0); },
+          [&] { printValueLoad(Op1); });
     return;
   case Instruction::Select: {
     if (auto *VTy = dyn_cast<VectorType>(Ty)) {
@@ -2855,8 +3244,16 @@ void MSILWriter::printInstruction(const Instruction *Inst) {
                          cast<CastInst>(Inst)->getDestTy());
     return;
   case Instruction::Call:
-  case Instruction::Invoke:
     printCallInstruction(cast<CallBase>(Inst));
+    return;
+  case Instruction::Invoke:
+    printInvoke(cast<InvokeInst>(Inst));
+    return;
+  case Instruction::LandingPad:
+    printLandingPad(cast<LandingPadInst>(Inst));
+    return;
+  case Instruction::Resume:
+    printResume(cast<ResumeInst>(Inst));
     return;
   case Instruction::VAArg: {
     // Front ends expand va_arg into plain IR for the triples this backend
@@ -3123,10 +3520,16 @@ void MSILWriter::printFunction(const Function &F) {
         out() << "\tlocalloc\n\tstloc\t'" << getValueName(AI) << "'\n";
       }
 
+  bool HasInvoke = any_of(F, [](const BasicBlock &BB) {
+    return isa<InvokeInst>(BB.getTerminator());
+  });
+  if (HasInvoke)
+    ExtraLocals.emplace_back("void*", ExceptionLocal);
+
   for (const BasicBlock &BB : F) {
     out() << getLabelName(&BB) << ":\n";
     for (const Instruction &I : BB) {
-      out() << "\n// " << I << '\n';
+      out() << '\n' << asILComment(I) << '\n';
       printInstruction(&I);
       if (I.getType()->isVoidTy() || isa<PHINode>(&I) || isa<AllocaInst>(&I) ||
           I.isTerminator())
@@ -3330,6 +3733,36 @@ bool MSILWriter::lowerExpandedIntrinsic(CallInst *CI) {
     CI->eraseFromParent();
     return true;
   }
+  case Intrinsic::frexp:
+  case Intrinsic::modf: {
+    // both return a pair the C spelling hands back through a pointer. a float
+    // goes through the double function, which is exact for both, since msvcrt
+    // has no frexpf
+    Value *X = CI->getArgOperand(0);
+    Type *FTy = X->getType();
+    if (!FTy->isFloatTy() && !FTy->isDoubleTy())
+      return false;
+    bool IsFrexp = ID == Intrinsic::frexp;
+    auto *PairTy = cast<StructType>(Ty);
+    Type *DoubleTy = B.getDoubleTy();
+    Type *OutTy = IsFrexp ? PairTy->getElementType(1) : DoubleTy;
+    BasicBlock &Entry = CI->getFunction()->getEntryBlock();
+    IRBuilder<> EntryB(&Entry, Entry.getFirstInsertionPt());
+    AllocaInst *Out = EntryB.CreateAlloca(OutTy);
+    FunctionCallee FC = CI->getModule()->getOrInsertFunction(
+        IsFrexp ? "frexp" : "modf",
+        FunctionType::get(DoubleTy, {DoubleTy, B.getPtrTy()}, false));
+    Value *Wide = B.CreateFPExt(X, DoubleTy);
+    Value *First = B.CreateFPTrunc(B.CreateCall(FC, {Wide, Out}), FTy);
+    Value *Second = B.CreateLoad(OutTy, Out);
+    if (!IsFrexp)
+      Second = B.CreateFPTrunc(Second, FTy);
+    Value *Pair = B.CreateInsertValue(PoisonValue::get(PairTy), First, 0);
+    Pair = B.CreateInsertValue(Pair, Second, 1);
+    CI->replaceAllUsesWith(Pair);
+    CI->eraseFromParent();
+    return true;
+  }
   case Intrinsic::fptosi_sat:
   case Intrinsic::fptoui_sat: {
     // Convert, then clamp to the target's range: the compare has to happen in
@@ -3420,7 +3853,9 @@ bool MSILWriter::lowerExpandedIntrinsic(CallInst *CI) {
   }
   case Intrinsic::ptrmask:
   case Intrinsic::launder_invariant_group:
+#if LLVM_VERSION_MAJOR < 24
   case Intrinsic::strip_invariant_group:
+#endif
     // A pointer's bits are its address, and the invariant-group markers only
     // exist to give the optimiser something to reason about. Masking the
     // address integer and converting back is the ptrmask definition, and the
@@ -3569,6 +4004,24 @@ void MSILWriter::dropStdioWrappers() {
 namespace {
 /// Intrinsics the emitter discards: a debugger or allocator cannot use them
 /// here, and they carry no value.
+// asm("" ...) is only a compiler barrier, which test harnesses and benchmarks
+// use to keep a value alive; "+r"(x) hands x back unchanged
+bool lowerEmptyInlineAsm(CallInst *CI) {
+  auto *Asm = dyn_cast<InlineAsm>(CI->getCalledOperand());
+  if (!Asm || !StringRef(Asm->getAsmString()).trim().empty())
+    return false;
+  if (!CI->getType()->isVoidTy()) {
+    auto Same = find_if(CI->args(), [CI](const Use &Arg) {
+      return Arg->getType() == CI->getType();
+    });
+    if (Same == CI->arg_end())
+      return false;
+    CI->replaceAllUsesWith(Same->get());
+  }
+  CI->eraseFromParent();
+  return true;
+}
+
 bool isDiscardableIntrinsic(Intrinsic::ID ID) {
   return ID == Intrinsic::lifetime_start || ID == Intrinsic::lifetime_end ||
          ID == Intrinsic::dbg_declare || ID == Intrinsic::dbg_value ||
@@ -3596,6 +4049,63 @@ void MSILWriter::lowerLinkedFunctions() {
     if (!F.isDeclaration())
       FPM.run(F);
   FPM.doFinalization();
+}
+
+// the doubled-width check would need i256 once the operands are i128
+static Value *addSubOverflowed(IRBuilder<> &B, bool Signed, bool Sub,
+                               Value *A, Value *C, Value *Res) {
+  if (!Signed)
+    return Sub ? B.CreateICmpULT(A, C) : B.CreateICmpULT(Res, A);
+  Value *Zero = Constant::getNullValue(A->getType());
+  Value *ResLeftA = B.CreateXor(A, Res);
+  Value *SecondCondition = Sub ? B.CreateXor(A, C) : B.CreateXor(C, Res);
+  Value *SignBitSet = B.CreateAnd(ResLeftA, SecondCondition);
+  return B.CreateICmpSLT(SignBitSet, Zero);
+}
+
+static Value *mulOverflowed(IRBuilder<> &B, bool Signed, Value *A, Value *C,
+                            Value *Res) {
+  Type *Ty = A->getType();
+  unsigned N = Ty->getIntegerBitWidth();
+  Value *Zero = ConstantInt::get(Ty, 0);
+  Value *One = ConstantInt::get(Ty, 1);
+  Value *AIsZero = B.CreateICmpEQ(A, Zero);
+  if (!Signed) {
+    Value *Divisor = B.CreateSelect(AIsZero, One, A);
+    Value *Quotient = B.CreateUDiv(Res, Divisor);
+    Value *Mismatch = B.CreateICmpNE(Quotient, C);
+    return B.CreateAnd(B.CreateNot(AIsZero), Mismatch);
+  }
+  // MIN / -1 traps, so -1 is checked on its own
+  Value *MinusOne = ConstantInt::getAllOnesValue(Ty);
+  Value *Min = ConstantInt::get(Ty, APInt::getSignedMinValue(N));
+  Value *AIsMinusOne = B.CreateICmpEQ(A, MinusOne);
+  Value *Trivial = B.CreateOr(AIsZero, AIsMinusOne);
+  Value *Divisor = B.CreateSelect(Trivial, One, A);
+  Value *Quotient = B.CreateSDiv(Res, Divisor);
+  Value *Mismatch = B.CreateICmpNE(Quotient, C);
+  Value *MinusOneOverflow = B.CreateICmpEQ(C, Min);
+  Value *General = B.CreateAnd(B.CreateNot(Trivial), Mismatch);
+  Value *ByMinusOne = B.CreateAnd(AIsMinusOne, MinusOneOverflow);
+  return B.CreateOr(General, ByMinusOne);
+}
+
+static Value *saturatingAddSub(IRBuilder<> &B, bool Signed, bool Sub,
+                               Value *A, Value *C) {
+  Type *Ty = A->getType();
+  unsigned N = Ty->getIntegerBitWidth();
+  Value *Res = Sub ? B.CreateSub(A, C) : B.CreateAdd(A, C);
+  Value *Overflow = addSubOverflowed(B, Signed, Sub, A, C, Res);
+  Value *Limit = nullptr;
+  if (Signed) {
+    Value *Zero = ConstantInt::get(Ty, 0);
+    Value *Min = ConstantInt::get(Ty, APInt::getSignedMinValue(N));
+    Value *Max = ConstantInt::get(Ty, APInt::getSignedMaxValue(N));
+    Limit = B.CreateSelect(B.CreateICmpSLT(A, Zero), Min, Max);
+  } else {
+    Limit = Sub ? ConstantInt::get(Ty, 0) : ConstantInt::getAllOnesValue(Ty);
+  }
+  return B.CreateSelect(Overflow, Limit, Res);
 }
 
 void MSILWriter::lowerIntrinsics(Function &F) {
@@ -3664,6 +4174,8 @@ void MSILWriter::lowerIntrinsics(Function &F) {
         Instruction *I = &*It++;
         auto *CI = dyn_cast<CallInst>(I);
         if (!CI)
+          continue;
+        if (lowerEmptyInlineAsm(CI))
           continue;
         // getCalledFunction returns null when the call's function type differs
         // from the callee's, which is what a vararg intrinsic call site or a
@@ -3810,16 +4322,26 @@ void MSILWriter::lowerIntrinsics(Function &F) {
                       RID == Intrinsic::smul_with_overflow;
         bool Sub = RID == Intrinsic::usub_with_overflow ||
                    RID == Intrinsic::ssub_with_overflow;
-        Type *Wide = B.getIntNTy(N * 2);
-        Value *WA = Signed ? B.CreateSExt(A, Wide) : B.CreateZExt(A, Wide);
-        Value *WC = Signed ? B.CreateSExt(C, Wide) : B.CreateZExt(C, Wide);
         bool Mul = RID == Intrinsic::umul_with_overflow ||
                    RID == Intrinsic::smul_with_overflow;
-        Value *W = Mul ? B.CreateMul(WA, WC)
-                       : Sub ? B.CreateSub(WA, WC) : B.CreateAdd(WA, WC);
-        Value *Res = B.CreateTrunc(W, IT);
-        Value *WRes = Signed ? B.CreateSExt(Res, Wide) : B.CreateZExt(Res, Wide);
-        Value *Overflow = B.CreateICmpNE(W, WRes);
+        Value *Res = nullptr;
+        Value *Overflow = nullptr;
+        if (N * 2 > 128) {
+          Res = Mul ? B.CreateMul(A, C)
+                    : Sub ? B.CreateSub(A, C) : B.CreateAdd(A, C);
+          Overflow = Mul ? mulOverflowed(B, Signed, A, C, Res)
+                         : addSubOverflowed(B, Signed, Sub, A, C, Res);
+        } else {
+          Type *Wide = B.getIntNTy(N * 2);
+          Value *WA = Signed ? B.CreateSExt(A, Wide) : B.CreateZExt(A, Wide);
+          Value *WC = Signed ? B.CreateSExt(C, Wide) : B.CreateZExt(C, Wide);
+          Value *W = Mul ? B.CreateMul(WA, WC)
+                         : Sub ? B.CreateSub(WA, WC) : B.CreateAdd(WA, WC);
+          Res = B.CreateTrunc(W, IT);
+          Value *WRes =
+              Signed ? B.CreateSExt(Res, Wide) : B.CreateZExt(Res, Wide);
+          Overflow = B.CreateICmpNE(W, WRes);
+        }
         Value *Pair = UndefValue::get(CI->getType());
         Pair = B.CreateInsertValue(Pair, Res, 0);
         Pair = B.CreateInsertValue(Pair, Overflow, 1);
@@ -3994,14 +4516,19 @@ void MSILWriter::lowerIntrinsics(Function &F) {
         }
         Value *A = CI->getArgOperand(0), *C = CI->getArgOperand(1);
         unsigned N = A->getType()->getIntegerBitWidth();
-        Type *Wide = B.getIntNTy(N * 2);
-        Value *WA = B.CreateSExt(A, Wide);
-        Value *WC = B.CreateSExt(C, Wide);
-        Value *W = nullptr;
         bool Signed = Callee->getIntrinsicID() == Intrinsic::ssub_sat ||
                       Callee->getIntrinsicID() == Intrinsic::sadd_sat;
         bool Sub = Callee->getIntrinsicID() == Intrinsic::usub_sat ||
                    Callee->getIntrinsicID() == Intrinsic::ssub_sat;
+        if (N * 2 > 128) {
+          CI->replaceAllUsesWith(saturatingAddSub(B, Signed, Sub, A, C));
+          CI->eraseFromParent();
+          break;
+        }
+        Type *Wide = B.getIntNTy(N * 2);
+        Value *WA = B.CreateSExt(A, Wide);
+        Value *WC = B.CreateSExt(C, Wide);
+        Value *W = nullptr;
         if (!Signed) {
           WA = B.CreateZExt(A, Wide);
           WC = B.CreateZExt(C, Wide);
@@ -4134,6 +4661,12 @@ void MSILWriter::lowerIntrinsics(Function &F) {
           }
         }
         CI->replaceAllUsesWith(Acc);
+        CI->eraseFromParent();
+        break;
+      }
+      case Intrinsic::eh_typeid_for: {
+        unsigned TypeId = getEHTypeId(CI->getArgOperand(0));
+        CI->replaceAllUsesWith(ConstantInt::get(CI->getType(), TypeId));
         CI->eraseFromParent();
         break;
       }
@@ -4314,14 +4847,24 @@ void MSILWriter::collectTypes() {
               getAggregateName(CV->getType());
 
   // llvm.global_ctors holds {priority, function, data} triples; the functions
-  // are called from $MSIL_Startup in the order they appear.
-  if (const GlobalVariable *Ctors = Mod->getNamedGlobal("llvm.global_ctors"))
-    if (const auto *Arr = dyn_cast_or_null<ConstantArray>(Ctors->getInitializer()))
+  // are called from $MSIL_Startup, lowest priority first and in order of
+  // appearance within one priority (libc++ sets up iostreams at 100).
+  std::vector<std::pair<uint64_t, const Function *>> Ctors;
+  if (const GlobalVariable *CtorsVar = Mod->getNamedGlobal("llvm.global_ctors"))
+    if (const auto *Arr = dyn_cast_or_null<ConstantArray>(CtorsVar->getInitializer()))
       for (const Use &U : Arr->operands())
         if (const auto *CS = dyn_cast<ConstantStruct>(U.get()))
           if (const auto *Fn = dyn_cast<Function>(CS->getOperand(1)->stripPointerCasts()))
-            if (!Fn->isDeclaration())
-              GlobalCtors.push_back(Fn);
+            if (!Fn->isDeclaration()) {
+              uint64_t Priority =
+                  cast<ConstantInt>(CS->getOperand(0))->getZExtValue();
+              Ctors.emplace_back(Priority, Fn);
+            }
+  llvm::stable_sort(Ctors, [](const auto &A, const auto &B) {
+    return A.first < B.first;
+  });
+  for (const auto &Ctor : Ctors)
+    GlobalCtors.push_back(Ctor.second);
 }
 
 void MSILWriter::printAggregateDeclarations() {
@@ -4482,13 +5025,16 @@ void MSILWriter::resolveLibExports() {
     if (!Obj)
       report_fatal_error(Twine("MSIL: -msil-lib '") + Spec +
                          "' is not an object file with an export table");
+    std::string Dll = sys::path::filename(Path).str();
+    if (const auto *Elf = dyn_cast<object::ELFObjectFileBase>(Obj)) {
+      addElfExports(*Elf, Dll);
+      continue;
+    }
     const object::COFFObjectFile *Coff =
         dyn_cast<object::COFFObjectFile>(Obj);
     if (!Coff)
       report_fatal_error(Twine("MSIL: -msil-lib '") + Spec +
-                         "' is not a COFF library (the CIL target imports from "
-                         "Windows DLLs)");
-    std::string Dll = sys::path::filename(Path).str();
+                         "' is neither a COFF DLL nor an ELF shared object");
     // First library to export a symbol wins, so an earlier -msil-lib can
     // shadow a later one exactly as an earlier -l would.
     for (const object::ExportDirectoryEntryRef &E :
@@ -4498,6 +5044,29 @@ void MSILWriter::resolveLibExports() {
         continue;
       LibExports.try_emplace(Name.str(), Dll);
     }
+  }
+}
+
+void MSILWriter::addElfExports(const object::ELFObjectFileBase &Elf,
+                               StringRef Dll) {
+  for (const object::ELFSymbolRef &Sym : Elf.getDynamicSymbolIterators()) {
+    Expected<uint32_t> Flags = Sym.getFlags();
+    if (!Flags) {
+      consumeError(Flags.takeError());
+      continue;
+    }
+    if (*Flags & object::SymbolRef::SF_Undefined)
+      continue;
+    if (!(*Flags & object::SymbolRef::SF_Global))
+      continue;
+    Expected<StringRef> Name = Sym.getName();
+    if (!Name) {
+      consumeError(Name.takeError());
+      continue;
+    }
+    if (Name->empty())
+      continue;
+    LibExports.try_emplace(Name->str(), Dll.str());
   }
 }
 
@@ -4568,6 +5137,17 @@ bool MSILWriter::getManagedTarget(const Function *F, ManagedType &Out) const {
   // so it keeps its pinvoke thunk.
   if (F->getFunctionType()->isVarArg())
     return false;
+  bool RuntimeHook = UsesCxxRuntime && isRuntimeHookFunction(F->getName());
+  // The exception machinery always binds. The allocation operators and the
+  // exit-time hooks only do when the runtime is already in use, so a program
+  // that throws pays for the DLL but a program that just calls `new` keeps
+  // binding to the C library as it did before.
+  if (isCxxRuntimeFunction(F->getName()) ||
+      (UsesCxxRuntime && isCxxSupportFunction(F->getName())) || RuntimeHook) {
+    Out = {CxxRuntimeAssembly, CxxAbiTypeName,
+           getCxxRuntimeMember(F->getName()).str(), ""};
+    return true;
+  }
   // Held by value: getCName returns a temporary, and a StringRef over it
   // would dangle before the first use below.
   std::string Name = getCName(F);
@@ -5208,10 +5788,19 @@ void MSILWriter::linkPortableCxxRt() {
 #ifdef MSIL_HAVE_CXXRT
   LLVMContext &Ctx = Mod->getContext();
   SMDiagnostic Err;
+  // Which copy is right is the C++ ABI's question, not the object format's:
+  // a mingw triple is COFF and still Itanium-mangled, but its `size_t` is
+  // `unsigned long long`, so its operators are `_Znwy`, not `_Znwm`. Each
+  // triple therefore has its own copy.
+  Triple TT(Mod->getTargetTriple());
   const char *IR = PortableCxxRtIR;
 #ifdef MSIL_HAVE_CXXRT_SYSV
-  if (Triple(Mod->getTargetTriple()).isOSBinFormatELF())
+  if (TT.isOSBinFormatELF())
     IR = PortableCxxRtIRSysV;
+#endif
+#ifdef MSIL_HAVE_CXXRT_MINGW
+  if (TT.isWindowsGNUEnvironment())
+    IR = PortableCxxRtIRMingw;
 #endif
   std::unique_ptr<MemoryBuffer> Buf =
       MemoryBuffer::getMemBuffer(IR, "portable-cxxrt", false);
@@ -5486,9 +6075,9 @@ StringRef MSILWriter::getLibraryForExports(StringRef Symbol) {
 }
 
 StringRef MSILWriter::getLibraryForCRT(StringRef Symbol) {
-  // On an ELF target the C runtime is libc.so.6 (and libm, but glibc 2.34+
-  // merged libm into libc, and the loader resolves through libc either way).
-  // The split below is a Windows fact.
+  // glibc keeps libm separate, so a program using it passes
+  // -msil-lib=<its libm.so.6> and the export table decides. The split below
+  // is a Windows fact.
   if (Triple(Mod->getTargetTriple()).isOSBinFormatELF())
     return "libc.so.6";
   // The C runtime is split: msvcrt.dll has the C89 functions, and every C99
@@ -5648,8 +6237,12 @@ void MSILWriter::printExternals() {
     if (G.isThreadLocal())
       report_fatal_error("MSIL: external thread-local '" + G.getName() +
                          "' is not supported; define it in this module");
-    out() << ".field static private " << getTypeName(G.getType()) << " '"
-          << G.getName() << "'\n";
+    // A global the C++ runtime owns is a field the module's own code stores
+    // into from $MSIL_Init, so it has to be visible to the assembly; anything
+    // else stays private.
+    const char *Visibility = bindsExternalGlobal(G) ? "assembly" : "private";
+    out() << ".field static " << Visibility << " " << getTypeName(G.getType())
+          << " '" << G.getName() << "'\n";
     AnyExternVar = true;
   }
   if (AnyExternVar)
@@ -5676,13 +6269,26 @@ void MSILWriter::printStaticConstant(const Constant *C, uint64_t &Offset,
 
   // Only contiguous null bytes mean "all zero"; a zeroed aggregate with
   // poisoned padding or bitcast elements must still be walked.
+  bool ScalarZeroBytes = C->isNullValue() || isa<UndefValue>(C);
   if (isa<ConstantAggregateZero>(C) ||
-      (C->isNullValue() && !Ty->isAggregateType())) {
+      (ScalarZeroBytes && !Ty->isAggregateType())) {
     uint64_t Size = DL->getTypeAllocSize(Ty).getFixedValue();
     if (!Buffer.empty())
       Buffer += ", ";
     Buffer += "int8 (0) [" + utostr(Size) + "]";
     Offset += Size;
+    return;
+  }
+  if (isLaneConstant(C)) {
+    auto *VTy = cast<FixedVectorType>(Ty);
+    uint64_t ElemSize =
+        DL->getTypeAllocSize(VTy->getElementType()).getFixedValue();
+    uint64_t Start = Offset;
+    for (unsigned I = 0, E = VTy->getNumElements(); I != E; ++I) {
+      PadTo(Start + I * ElemSize);
+      printStaticConstant(C->getAggregateElement(I), Offset, Buffer);
+    }
+    PadTo(Start + VTy->getNumElements() * ElemSize);
     return;
   }
   if (const auto *CI = dyn_cast<ConstantInt>(C)) {
@@ -5840,14 +6446,13 @@ void MSILWriter::printThreadLocalAccessor(const GlobalImage &Image) {
     // A constant global cannot be stored through on any thread, so every
     // thread's slot points at the one read-only image. Comparing the address
     // of the same variable across threads then still compares equal.
-    out() << "\tldsflda\t" << Tpl << "\n\tconv.u8\n";
+    printImageAddress(G, Image.Template);
     if (pointersAsInt64())
       out() << "\tconv.u8\n";
     out() << "\tstsfld\t" << getTypeName(G.getType()) << " '" << Name << "'\n";
   } else {
     // The same bytes $MSIL_Init would have produced, but for this thread.
-    out() << "\tldc.i8\t" << (Size ? Size : 1) << "\n";
-    out() << "\tcall\tvoid* " << ClassPrefix() << "'$MSIL_Alloc'(int64)\n";
+    printGlobalAlloc(G);
     if (pointersAsInt64())
       out() << "\tconv.u8\n";
     out() << "\tstloc\t'p'\n";
@@ -5891,6 +6496,8 @@ void MSILWriter::printThreadLocalAccessor(const GlobalImage &Image) {
         << "'\n\tret\n}\n";
 }
 
+static constexpr uint64_t MallocAlign = 16;
+
 void MSILWriter::printAllocHelper() {
   out() << "\n.method static " << HelperVis()
         << " void* '$MSIL_Alloc'(int64 size) cil managed\n{\n";
@@ -5899,14 +6506,82 @@ void MSILWriter::printAllocHelper() {
   out() << "\tcall\tnative int [mscorlib]System.Runtime.InteropServices.Marshal::"
          "AllocHGlobal(native int)\n";
   out() << "\tret\n}\n";
+
+  // malloc already gives 16, so only a stricter global pays for the slack
+  out() << "\n.method static " << HelperVis()
+        << " void* '$MSIL_AllocAligned'(int64 size, int64 align) cil managed\n"
+           "{\n";
+  out() << "\t.maxstack\t3\n";
+  out() << "\tldarg.1\n\tldc.i8\t" << MallocAlign << "\n\tbgt.un\tIL_slack\n";
+  out() << "\tldarg.0\n";
+  out() << "\tcall\tvoid* " << ClassPrefix() << "'$MSIL_Alloc'(int64)\n";
+  out() << "\tret\n";
+  out() << "IL_slack:\n";
+  out() << "\tldarg.0\n\tldarg.1\n\tadd\n\tldc.i8\t1\n\tsub\n";
+  out() << "\tcall\tvoid* " << ClassPrefix() << "'$MSIL_Alloc'(int64)\n";
+  out() << "\tconv.u8\n\tldarg.1\n\tadd\n\tldc.i8\t1\n\tsub\n";
+  out() << "\tldarg.1\n\tneg\n\tand\n";
+  out() << "\tret\n}\n";
+
+  // ilasm packs .data blobs back to back, so a constant's image is only
+  // usable in place when it happens to land aligned
+  out() << "\n.method static " << HelperVis()
+        << " void* '$MSIL_PlaceImage'(void* image, int64 size, int64 align) "
+           "cil managed\n{\n";
+  out() << "\t.maxstack\t3\n";
+  out() << "\t.locals init (void* 'p')\n";
+  out() << "\tldarg.0\n\tconv.u8\n\tldarg.2\n\tldc.i8\t1\n\tsub\n\tand\n";
+  out() << "\tbrtrue\tIL_copy\n";
+  out() << "\tldarg.0\n\tret\n";
+  out() << "IL_copy:\n";
+  out() << "\tldarg.1\n\tldarg.2\n";
+  out() << "\tcall\tvoid* " << ClassPrefix()
+        << "'$MSIL_AllocAligned'(int64, int64)\n";
+  out() << "\tstloc\t'p'\n";
+  out() << "\tldloc\t'p'\n\tldarg.0\n\tldarg.1\n\tconv.u4\n\tcpblk\n";
+  out() << "\tldloc\t'p'\n\tret\n}\n";
+}
+
+uint64_t MSILWriter::getGlobalAlign(const GlobalVariable &G) const {
+  Align Alignment =
+      G.getAlign().value_or(DL->getABITypeAlign(G.getValueType()));
+  return Alignment.value();
+}
+
+void MSILWriter::printImageAddress(const GlobalVariable &G,
+                                   StringRef Template) {
+  uint64_t Size = DL->getTypeAllocSize(G.getValueType()).getFixedValue();
+  uint64_t Alignment = getGlobalAlign(G);
+  out() << "\tldsflda\tvaluetype '" << getAggregateName(G.getValueType())
+        << "' '" << Template << "'\n";
+  out() << "\tconv.u8\n";
+  if (Alignment <= 1)
+    return;
+  out() << "\tldc.i8\t" << Size << "\n\tldc.i8\t" << Alignment << "\n";
+  out() << "\tcall\tvoid* " << ClassPrefix()
+        << "'$MSIL_PlaceImage'(void*, int64, int64)\n";
+}
+
+void MSILWriter::printGlobalAlloc(const GlobalVariable &G) {
+  uint64_t Size = DL->getTypeAllocSize(G.getValueType()).getFixedValue();
+  uint64_t Alignment = getGlobalAlign(G);
+  out() << "\tldc.i8\t" << (Size ? Size : 1) << "\n";
+  if (Alignment <= MallocAlign) {
+    out() << "\tcall\tvoid* " << ClassPrefix() << "'$MSIL_Alloc'(int64)\n";
+    return;
+  }
+  out() << "\tldc.i8\t" << Alignment << "\n";
+  out() << "\tcall\tvoid* " << ClassPrefix()
+        << "'$MSIL_AllocAligned'(int64, int64)\n";
 }
 
 void MSILWriter::printInitializer() {
-  if (Templates.empty())
+  if (!needsInitializer())
     return;
   out() << "\n.method static " << HelperVis()
         << " void '$MSIL_Init'() cil managed\n{\n";
   out() << "\t.maxstack\t8\n";
+  printCxxRuntimeSymbols();
   for (auto &T : Templates) {
     // A thread-local's slot belongs to each thread, so its accessor fills it
     // on first use rather than this one-time startup pass.
@@ -5919,9 +6594,9 @@ void MSILWriter::printInitializer() {
       // A constant global is never stored through, so the image is the
       // storage. `ldsflda` still gives each global its own address, so
       // address comparisons stay distinct.
-      out() << "\tldsflda\tvaluetype '" << getAggregateName(G.getValueType())
-          << "' '" << T.Template << "'\n";
-      out() << "\tconv.u8\n";
+      printImageAddress(G, T.Template);
+      if (pointersAsInt64())
+        out() << "\tconv.u8\n";
       out() << "\tstsfld\t" << getTypeName(G.getType()) << " '"
             << G.getName() << "'\n";
       continue;
@@ -5929,8 +6604,7 @@ void MSILWriter::printInitializer() {
     // Allocate the real, writable storage. A zero-sized global still needs a
     // distinct address: LLVM gives every global its own, so comparing two of
     // them must not compare equal.
-    out() << "\tldc.i8\t" << (Size ? Size : 1) << "\n";
-    out() << "\tcall\tvoid* " << ClassPrefix() << "'$MSIL_Alloc'(int64)\n";
+    printGlobalAlloc(G);
     if (pointersAsInt64())
       out() << "\tconv.u8\n";
     out() << "\tstsfld\t" << getTypeName(G.getType()) << " '" << G.getName()
@@ -5971,6 +6645,7 @@ void MSILWriter::printInitializer() {
     }
     out() << "\tstind.i\n";
   }
+  printAbiVTableRegistrations();
   out() << "\tret\n}\n";
 
   for (const GlobalImage &T : Templates)
@@ -5991,7 +6666,7 @@ void MSILWriter::printLibraryInitializer() {
   out() << "\tbrtrue\tIL_msil_init_done\n";
   out() << "\tldc.i4.1\n";
   out() << "\tstsfld\tbool " << C << "'$MSIL_Initialized'\n";
-  if (!Templates.empty())
+  if (needsInitializer())
     out() << "\tcall\tvoid " << C << "'$MSIL_Init'()\n";
   for (const Function *Ctor : GlobalCtors)
     out() << "\tcall\t" << getTypeName(Ctor->getReturnType()) << " "
@@ -6011,7 +6686,7 @@ void MSILWriter::printModuleStartup() {
   // and every helper it reaches has to be named through the class.
   std::string C = ExternClassName.empty() ? "" : "'" + ExternClassName + "'::";
 
-  if (!Templates.empty())
+  if (needsInitializer())
     out() << "\tcall\tvoid " << C << "'$MSIL_Init'()\n";
 
   // __attribute__((constructor)) functions, in priority order, before main.
@@ -6104,6 +6779,84 @@ void MSILWriter::printArgHelper() {
   out() << "IL_args_done:\n\tret\n}\n";
 }
 
+static Value *convertIntegerOperand(IRBuilder<> &B, Value *V, Type *To) {
+  if (V->getType() == To)
+    return V;
+  if (To->isIntegerTy(1))
+    return B.CreateICmpNE(V, Constant::getNullValue(V->getType()));
+  return B.CreateZExtOrTrunc(V, To);
+}
+
+static bool onlyIntegerWidthsDiffer(FunctionType *Site, FunctionType *Callee) {
+  if (Site->getNumParams() != Callee->getNumParams() ||
+      Site->isVarArg() != Callee->isVarArg())
+    return false;
+  auto Compatible = [](Type *A, Type *B) {
+    return A == B || (A->isIntegerTy() && B->isIntegerTy());
+  };
+  if (!Compatible(Site->getReturnType(), Callee->getReturnType()))
+    return false;
+  for (unsigned I = 0, E = Site->getNumParams(); I != E; ++I)
+    if (!Compatible(Site->getParamType(I), Callee->getParamType(I)))
+      return false;
+  return true;
+}
+
+// clang declares the generic __atomic_* libcalls returning bool, while
+// compiler-rt defines them returning int. a method is called by its exact
+// signature, so the call has to use the definition's
+static void matchCallsToDefinitions(Function &F) {
+  SmallVector<CallInst *, 4> Mismatched;
+  for (Instruction &I : instructions(F)) {
+    auto *Call = dyn_cast<CallInst>(&I);
+    if (!Call)
+      continue;
+    auto *Callee = dyn_cast<Function>(Call->getCalledOperand());
+    if (!Callee || Callee->isDeclaration())
+      continue;
+    FunctionType *SiteTy = Call->getFunctionType();
+    FunctionType *CalleeTy = Callee->getFunctionType();
+    if (SiteTy != CalleeTy && onlyIntegerWidthsDiffer(SiteTy, CalleeTy))
+      Mismatched.push_back(Call);
+  }
+  for (CallInst *Call : Mismatched) {
+    auto *Callee = cast<Function>(Call->getCalledOperand());
+    FunctionType *CalleeTy = Callee->getFunctionType();
+    IRBuilder<> B(Call);
+    SmallVector<Value *, 8> Args;
+    for (unsigned I = 0, E = Call->arg_size(); I != E; ++I)
+      Args.push_back(convertIntegerOperand(B, Call->getArgOperand(I),
+                                           CalleeTy->getParamType(I)));
+    CallInst *Matched = B.CreateCall(CalleeTy, Callee, Args);
+    Matched->setCallingConv(Call->getCallingConv());
+    Value *Result = convertIntegerOperand(B, Matched, Call->getType());
+    if (!Call->getType()->isVoidTy())
+      Call->replaceAllUsesWith(Result);
+    Call->eraseFromParent();
+  }
+}
+
+// ilasm rejects a name over 1023 characters, and deeply nested templates get
+// there. The hash keeps it the same in every module that defines or imports it.
+static constexpr size_t MaxILNameLength = 1000;
+
+static void shortenLongName(GlobalValue &GV) {
+  StringRef Name = GV.getName();
+  if (GV.isDeclaration() || Name.size() <= MaxILNameLength)
+    return;
+  std::string Hash = utohexstr(xxh3_64bits(Name), true, 16);
+  std::string Short =
+      (Name.take_front(MaxILNameLength - Hash.size() - 1) + "$" + Hash).str();
+  GV.setName(Short);
+}
+
+static void shortenLongNames(Module &M) {
+  for (Function &F : M)
+    shortenLongName(F);
+  for (GlobalVariable &G : M.globals())
+    shortenLongName(G);
+}
+
 bool MSILWriter::runOnModule(Module &M) {
   Mod = &M;
   DL = &M.getDataLayout();
@@ -6136,6 +6889,8 @@ bool MSILWriter::runOnModule(Module &M) {
   for (GlobalAlias &A : M.aliases())
     A.replaceAllUsesWith(A.getAliasee());
 
+  shortenLongNames(M);
+
   // The link added functions after the target machine's prep passes ran, so
   // the constructs that need lowering for IL are still there: switches,
   // allocas, and unwinds. Run that subset again over the definitions the link
@@ -6145,10 +6900,15 @@ bool MSILWriter::runOnModule(Module &M) {
   lowerLinkedFunctions();
 
   for (Function &F : M)
-    if (!F.isDeclaration())
+    if (!F.isDeclaration()) {
+      matchCallsToDefinitions(F);
+      promoteWideIntegers(F);
       lowerIntrinsics(F);
+      splitOddWidthAccesses(F);
+    }
 
   collectTypes();
+  UsesCxxRuntime = usesCxxRuntime();
 
   // The assembly table has to be written before any body, so a Math binding
   // has to be discovered here rather than when its forwarder is emitted
@@ -6176,6 +6936,8 @@ bool MSILWriter::runOnModule(Module &M) {
     out() << ".assembly extern '" << LibcType.Assembly << "' {}\n";
   if (!AllocType.Type.empty())
     out() << ".assembly extern '" << AllocType.Assembly << "' {}\n";
+  if (UsesCxxRuntime)
+    out() << ".assembly extern '" << CxxRuntimeAssembly << "' {}\n";
   // Whether any body needs Vector<T> is only known once they are all written,
   // so settle that before emitting the header.
   UsesVector = vectorNeeded(M);

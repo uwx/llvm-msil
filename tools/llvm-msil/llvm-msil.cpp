@@ -12,6 +12,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/LegacyPassManager.h"
+#include "llvm/InitializePasses.h"
+#include "llvm/PassRegistry.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -40,6 +42,14 @@ int main(int argc, char **argv) {
   LLVMInitializeMSILTargetInfo();
   LLVMInitializeMSILTarget();
 
+  PassRegistry &Registry = *PassRegistry::getPassRegistry();
+  initializeCore(Registry);
+  initializeAnalysis(Registry);
+  initializeCodeGen(Registry);
+  initializeScalarOpts(Registry);
+  initializeTransformUtils(Registry);
+  initializeTarget(Registry);
+
   cl::ParseCommandLineOptions(argc, argv, "LLVM to MSIL translator\n");
 
   LLVMContext Context;
@@ -52,7 +62,8 @@ int main(int argc, char **argv) {
 
   // MSIL is selected by name rather than by triple.
   std::string Error;
-  const Target *TheTarget = TargetRegistry::lookupTarget("msil", Error);
+  Triple TargetName("msil");
+  const Target *TheTarget = TargetRegistry::lookupTarget(TargetName, Error);
   if (!TheTarget) {
     errs() << argv[0] << ": " << Error << "\n";
     return 1;
@@ -65,9 +76,10 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  // The backend sizes every type with the module's layout, and modules from
-  // `-emit-llvm -S` may omit the datalayout line entirely.
-  M->setDataLayout(TM->createDataLayout());
+  // clang has already folded struct offsets and pointer widths into the IR
+  // with its own layout, so only a module that has none gets the MSIL one.
+  if (M->getDataLayoutStr().empty())
+    M->setDataLayout(TM->createDataLayout());
 
   if (OutputFilename.empty()) {
     if (InputFilename == "-")

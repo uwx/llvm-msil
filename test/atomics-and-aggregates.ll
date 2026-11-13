@@ -15,6 +15,8 @@ define i32 @atomic_rmw() {
 ; CHECK: ldsfld void* 'ctr'
 ; CHECK-NEXT: ldc.i4 5
 ; CHECK-NEXT: call int32 [mscorlib]System.Threading.Interlocked::Add(int32&, int32)
+; CHECK-NEXT: ldc.i4 5
+; CHECK-NEXT: sub
 ; CHECK-NOT: ldind
   %old = atomicrmw add ptr @ctr, i32 5 seq_cst, align 4
   ret i32 %old
@@ -26,6 +28,8 @@ define i32 @atomic_sub() {
 ; CHECK: ldc.i4 3
 ; CHECK-NEXT: neg
 ; CHECK-NEXT: call int32 [mscorlib]System.Threading.Interlocked::Add(int32&, int32)
+; CHECK-NEXT: ldc.i4 3
+; CHECK-NEXT: add
   %old = atomicrmw sub ptr @ctr, i32 3 seq_cst, align 4
   ret i32 %old
 }
@@ -51,6 +55,35 @@ define i32 @atomic_xor() {
 ; CHECK: bne.un IL_rmw
   %old = atomicrmw xor ptr @ctr, i32 2 seq_cst, align 4
   ret i32 %old
+}
+
+; min/max ride the same loop, keeping the old value when it already wins.
+define i32 @atomic_max() {
+; CHECK-LABEL: .method static {{.*}} 'atomic_max'
+; CHECK: IL_rmw
+; CHECK: cgt
+; CHECK-NEXT: brtrue IL_keepold
+; CHECK: call int32 [mscorlib]System.Threading.Interlocked::CompareExchange(int32&, int32, int32)
+  %old = atomicrmw max ptr @ctr, i32 2 seq_cst, align 4
+  ret i32 %old
+}
+
+define i32 @atomic_umin() {
+; CHECK-LABEL: .method static {{.*}} 'atomic_umin'
+; CHECK: clt.un
+; CHECK-NEXT: brtrue IL_keepold
+  %old = atomicrmw umin ptr @ctr, i32 2 seq_cst, align 4
+  ret i32 %old
+}
+
+; a narrow signed max compares sign-extended, not the zero-extended locals
+define i16 @narrow_max() {
+; CHECK-LABEL: .method static {{.*}} 'narrow_max'
+; CHECK: conv.i2
+; CHECK: conv.i2
+; CHECK-NEXT: cgt
+  %old = atomicrmw max ptr @narrow, i16 -1 seq_cst, align 2
+  ret i16 %old
 }
 
 ; A fence is a full barrier on its own.
