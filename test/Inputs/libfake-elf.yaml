@@ -1,0 +1,23 @@
+--- !ELF
+FileHeader:
+  Class:   ELFCLASS64
+  Data:    ELFDATA2LSB
+  Type:    ET_DYN
+  Machine: EM_X86_64
+Sections:
+  - Name:  .text
+    Type:  SHT_PROGBITS
+    Flags: [ SHF_ALLOC, SHF_EXECINSTR ]
+    Size:  16
+DynamicSymbols:
+  - Name:    lgamma_r
+    Type:    STT_FUNC
+    Section: .text
+    Binding: STB_GLOBAL
+  - Name:    weak_export
+    Type:    STT_FUNC
+    Section: .text
+    Binding: STB_WEAK
+  - Name:    imported_here
+    Type:    STT_FUNC
+    Binding: STB_GLOBAL

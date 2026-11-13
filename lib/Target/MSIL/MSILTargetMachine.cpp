@@ -10,19 +10,54 @@
 #include "MSILWriter.h"
 #include "TargetInfo/MSILTargetInfo.h"
 #include "llvm/CodeGen/Passes.h"
+#include "llvm/IR/EHPersonalities.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Pass.h"
 #include "llvm/Target/TargetLoweringObjectFile.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 namespace llvm {
+
+namespace {
+// itanium landing pads are emitted as try regions by the writer, any other
+// personality just loses its unwind edges
+class MSILLowerForeignInvokes : public FunctionPass {
+public:
+  static char ID;
+  MSILLowerForeignInvokes() : FunctionPass(ID) {}
+
+  StringRef getPassName() const override {
+    return "MSIL lower non-Itanium invokes";
+  }
+
+  bool runOnFunction(Function &F) override {
+    if (!F.hasPersonalityFn())
+      return false;
+    EHPersonality Personality = classifyEHPersonality(F.getPersonalityFn());
+    if (Personality == EHPersonality::GNU_CXX ||
+        Personality == EHPersonality::GNU_C)
+      return false;
+    bool Changed = false;
+    for (BasicBlock &BB : F)
+      if (auto *II = dyn_cast<InvokeInst>(BB.getTerminator())) {
+        changeToCall(II);
+        Changed = true;
+      }
+    return Changed;
+  }
+};
+char MSILLowerForeignInvokes::ID = 0;
+} // namespace
 
 // IL pointers are native ints of the host machine, so the module is compiled
 // for the 64-bit CLR that ilasm and the runtime default to.
 // shortcut: 64-bit CLR only; add a 32-bit layout if it is ever needed.
 static const char *const MSILDataLayout =
-    "e-m:e-i64:64-f80:128-n8:16:32:64-S128-p:64:64:64:32";
+    "e-m:e-p:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128";
 
 MSILTargetMachine::MSILTargetMachine(const Target &T, const Triple &TT,
                                      StringRef CPU, StringRef FS,
@@ -39,14 +74,15 @@ bool MSILTargetMachine::addPassesToEmitFile(
   if (FileType != CodeGenFileType::AssemblyFile)
     return true;
 
-  // Prepare the IR for the constructs IL can express: no invoke/switch/EH,
-  // canonical CFG, atomics lowered to libcalls, and SSA locals.
+  // Prepare the IR for the constructs IL can express: no switch, no EH other
+  // than Itanium landing pads, canonical CFG, atomics lowered to libcalls, and
+  // SSA locals.
   //
   // The writer links the portable C library, and that happens after these
   // passes have run, so the library's own switches and allocas would reach it
   // unlowered. The writer therefore re-runs this subset on everything the
   // link added; the summary is in MSILWriter::lowerLinkedFunctions.
-  PM.add(createLowerInvokePass());
+  PM.add(new MSILLowerForeignInvokes());
   PM.add(createUnreachableBlockEliminationPass());
   PM.add(createLowerSwitchPass());
   PM.add(createCFGSimplificationPass());

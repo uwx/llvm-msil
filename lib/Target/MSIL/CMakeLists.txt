@@ -127,16 +127,22 @@ endif()
 
 set(MSIL_CXXRT_INCS)
 if (MSIL_CXXRT_CLANGXX AND MSIL_CXXRT_LLVM_LINK)
-  # The same two-ABI split the C library uses: the mangled names of the
-  # allocation operators follow the target's C++ ABI (Itanium vs MSVC), so a
-  # program compiled for one triple cannot link the other's copy.
-  set(MSIL_CXXRT_TRIPLES x86_64-pc-windows-msvc x86_64-unknown-linux-gnu)
-  set(MSIL_CXXRT_SUFFIXES win sysv)
+  # The mangled names of the allocation operators follow the target's C++
+  # ABI, not its object format. Three triples are needed because two of them
+  # share Itanium mangling with different type spellings: on mingw
+  # `size_t` is `unsigned long long`, so `operator new(size_t)` is `_Znwy`
+  # and not `_Znwm`. A program compiled for one triple cannot link another's
+  # copy, so each gets its own.
+  set(MSIL_CXXRT_TRIPLES
+      x86_64-pc-windows-msvc x86_64-unknown-linux-gnu x86_64-w64-windows-gnu)
+  set(MSIL_CXXRT_SUFFIXES win sysv mingw)
+  set(MSIL_CXXRT_SYMBOLS PortableCxxRtIR PortableCxxRtIRSysV PortableCxxRtIRMingw)
   list(LENGTH MSIL_CXXRT_TRIPLES NTRIPLES)
   math(EXPR LAST_TRIPLE "${NTRIPLES} - 1")
   foreach(I RANGE ${LAST_TRIPLE})
     list(GET MSIL_CXXRT_TRIPLES ${I} TRIPLE)
     list(GET MSIL_CXXRT_SUFFIXES ${I} SUFFIX)
+    list(GET MSIL_CXXRT_SYMBOLS ${I} SYMBOL)
     set(MSIL_CXXRT_OBJS)
     foreach(SRC IN LISTS MSIL_CXXRT_SOURCES)
       get_filename_component(NAME "${SRC}" NAME_WE)
@@ -163,11 +169,7 @@ if (MSIL_CXXRT_CLANGXX AND MSIL_CXXRT_LLVM_LINK)
       DEPENDS ${MSIL_CXXRT_OBJS}
       COMMENT "Linking portable C++ runtime IR (${TRIPLE})"
       VERBATIM)
-    if(SUFFIX STREQUAL "win")
-      list(APPEND MSIL_CXXRT_EMBEDS "${IR}=cxxrt-win=PortableCxxRtIR")
-    else()
-      list(APPEND MSIL_CXXRT_EMBEDS "${IR}=cxxrt-sysv=PortableCxxRtIRSysV")
-    endif()
+    list(APPEND MSIL_CXXRT_EMBEDS "${IR}=cxxrt-${SUFFIX}=${SYMBOL}")
   endforeach()
 
   foreach(ENTRY IN LISTS MSIL_CXXRT_EMBEDS)
@@ -227,7 +229,8 @@ endif()
 # LLVMMSILCodeGen (when that LLVM was itself built with this project in-tree),
 # so the target gets a suffix while the artifact keeps its name.
 if (USE_SYSTEM_LLVM)
-  add_library(${MSIL_CODEGEN_TARGET} STATIC MSILTargetMachine.cpp MSILWriter.cpp)
+  add_library(${MSIL_CODEGEN_TARGET} STATIC MSILTargetMachine.cpp MSILWriter.cpp
+              MSILWideIntegers.cpp)
   set_target_properties(${MSIL_CODEGEN_TARGET}
     PROPERTIES OUTPUT_NAME LLVMMSILCodeGen)
   # add_library does not apply LLVM's -fno-rtti/-fno-exceptions the way
@@ -244,6 +247,7 @@ else()
   # registration; this target is built as a component library instead.
   add_llvm_component_library(LLVMMSILCodeGen
     MSILTargetMachine.cpp
+    MSILWideIntegers.cpp
     MSILWriter.cpp
 
     LINK_COMPONENTS

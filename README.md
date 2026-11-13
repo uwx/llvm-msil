@@ -129,6 +129,7 @@ built for the other, which is why the libc is built twice (see below).
 | `-msil-alloc=<asm>:<type>` | Route `malloc`/`free`/`calloc`/`realloc` to methods of that name on your type, so unmanaged allocations can be instrumented. |
 | `-msil-math=0` | Do not bind libm to `System.Math`/`System.MathF`; pinvoke the CRT instead. |
 | `-msil-lib-map='SDL_*=SDL2.dll'` | Bind matching imports to a native library. `*` matches any suffix, and the option repeats. |
+| `-msil-lib=<dll or .so>` | Bind imported symbols to this library if it exports them, e.g. `ucrtbase.dll` or `libm.so.6` (or a path to either). Unlike `-msil-lib-map` this names no symbol: the export table is read from the file itself, which is what a linker does, so no symbol list is needed. Both COFF DLLs and ELF shared objects are understood. The option repeats, and the libraries are searched in the order given, before the C runtime heuristic. glibc keeps `libm` in its own object -- 2.34 merged `libpthread`, `libdl` and `librt`, not `libm` -- so a Linux program that calls `atan2` or `lgamma_r` needs `-msil-lib=libm.so.6` or the call becomes an `EntryPointNotFoundException` from `libc.so.6`. |
 | `-msil-library` | Emit a library instead of a program: no `.entrypoint`, and a public `MSILInitialize` static method runs `llvm.global_ctors` behind a one-shot guard. Requires `-msil-class-name`. |
 | `-msil-assembly-name=Name` | Name the emitted assembly (default `MSIL`). |
 | `-msil-fp80=double` | Map `x86_fp80` (`long double` on the x86 ELF target) to binary64 instead of rejecting it. Lossy: 53 mantissa bits and an 11-bit exponent instead of 64 and 15, so a value round-trips changed or overflows to infinity. The 16-byte slot, the field offsets and `sizeof` are unchanged; only the value stored in the slot is a `float64`. A long-double libm call with no `System.Math` binding, or a `long double` passed through a vararg, is rejected by name rather than pinvoked with a mismatched signature. |
@@ -139,7 +140,7 @@ built for the other, which is why the libc is built twice (see below).
 | IR | IL |
 |----|-----|
 | `i1` | `bool` |
-| `i2`, `i8`, `i16`, `i32` | `int2`, `int8`, `int16`, `int32` in globals and signatures; `int32` in locals |
+| `i2` ... `i32` | the smallest of `int8`, `int16`, `int32` that holds it in globals and signatures; `int32` in locals |
 | `i33` ... `i64` | `int64` |
 | `i128` | `System.Int128` from `System.Runtime` |
 | `float`, `double` | `float32`, `float64` |
@@ -152,8 +153,14 @@ built for the other, which is why the libc is built twice (see below).
 `i1`/`i8`/`i16` are normalized to their declared width at every store, and any
 integer narrower than its CLR register is normalized before a compare, so
 unsigned comparisons see the right high bits. Widths with no CLR type (`i24`
-and friends) cannot be masked by a `conv`; their loads mask to the declared
-width (see below) while their stores stay `int32`.
+and friends) cannot be masked by a `conv`, so they are handled a different way
+in each direction. A load of 3, 5, 6 or 7 bytes is split into power-of-two
+pieces that sum to the width (an `i24` load is a 2-byte and a 1-byte load,
+combined), which never reads the byte past the object; a store is likewise
+split, so a narrow store cannot clobber a neighbouring field. A load of any
+other odd width (an `i33`, say) is read at the next wider CLR type and masked
+to the declared width, since sign- and zero-extension are the two cases a
+`conv` can express and everything else needs the mask.
 
 ## Library mode
 
@@ -486,10 +493,11 @@ because the module has one thread.
 
 ### What it does not do
 
-* **No exceptions and no RTTI.** The backend does not emit landing pads or
-  image-relative type information, so a `throw` reaches the CLR as an
-  `SEHException` and terminates the program (see "Known limitations"). Compile
-  with `-fno-exceptions -fno-rtti`.
+* **No exceptions support of its own.** This runtime is the allocation and
+  static-initialisation half of a C++ implementation, not the unwinder. C++
+  `throw`/`catch` on an Itanium-ABI triple comes from `runtime/MSIL.Runtime`
+  instead (see "Exceptions"); on an MSVC triple neither exists, so compile
+  with `-fno-exceptions` there.
 * **No `std::` library.** This is the runtime, not the standard library. The
   container/algorithm half comes from libc++'s headers, which must be built for
   this target; LLVM 22's libc++ headers additionally need a clang that provides
@@ -498,6 +506,54 @@ because the module has one thread.
 * **No thread safety.** Guards do not synchronise, because there is no thread
   to synchronise with. A program that starts threads and initializes a local
   static from more than one is outside what this supports.
+
+## Exceptions
+
+A C++ `throw` works on an Itanium-ABI triple: it propagates across frames,
+typed and `catch (...)` handlers match (including base classes, virtual bases
+and pointer upcasts), cleanups run while unwinding, and `rethrow` works. This
+is not the personality-routine model -- the CLR has no per-function hook -- but
+it does not need to be, because the Itanium shape (`invoke`, `landingpad`,
+`resume`) has a direct IL equivalent:
+
+* `MSILLowerForeignInvokes` replaces `LowerInvoke` and drops unwind edges only
+  in functions whose personality is *not* `GNU_C`/`GNU_CXX`. MSVC funclet IR
+  behaves exactly as it did before.
+* Each `invoke` gets its own `.try` around the call and the result store. The
+  handler catches only `MSIL.Runtime.CxxException`, keeps the exception header
+  in a per-method `'$exn'` local, and `leave`s to a trampoline that does the
+  unwind edge's phi copies and branches to the landing pad; the normal edge
+  gets a second trampoline. No region spans more than one call, so the IR's
+  block order is preserved and the IL stack is always empty between
+  instructions.
+* `landingpad` evaluates its clauses in order against the runtime matcher, and
+the first match sets the selector to that typeinfo's id. The ids come from one
+module-wide map, which `llvm.eh.typeid.for` is lowered with too, starting at 1,
+so 0 means nothing matched (a cleanup, or fallen through to `resume`).
+* `resume` calls the runtime's `Resume` and `throw`s the result.
+* `__cxa_*`, `std::terminate`, `__cxa_pure_virtual` and the basic
+  `operator new`/`delete` bind to `MSIL.Runtime.CxxAbi` through the ordinary
+  managed-forwarder path. External RTTI (the `_ZTVN10__cxxabiv1*` vtables and
+the fundamental `_ZTI*` typeinfos) is bound in `$MSIL_Init` by
+`CxxAbi.Symbol(name)`, which hands out stable unmanaged storage.
+
+Catching only `CxxException` is deliberate: `abort`, `unreachable` and a
+managed fault do not become catchable C++ exceptions.
+
+`runtime/MSIL.Runtime` is C# (`net9.0`), built with `dotnet build`, and follows
+libc++abi's semantics: a 48-byte exception header in front of the thrown
+object, a `[ThreadStatic]` caught-exception stack, a negated handler count on
+rethrow, and base-class matching through `__si_`/`__vmi_class_type_info`. Its
+`MSIL.Runtime.dll` has to be next to the assembled program; `test/programs`
+and the gate's `cxx_eh.sh`/`cxx_eh_runtime.sh` do that.
+
+### What it costs
+
+**One-phase unwinding.** Every frame catches and resumes, so a cleanup runs
+even when nothing further up will catch. Natively the search phase can find no
+handler and `std::terminate` may run without unwinding at all. An uncaught
+C++ exception therefore ends as an unhandled `CxxException` rather than a
+`std::terminate`/`abort`.
 
 ## Math
 
@@ -676,27 +732,50 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   one, which returns a wrong number rather than failing. Convert to `double`
   at the call site; the writer names the symbol in the error.
 * **One ELF-only construct is still unsupported.** An ELF C++ vtable holds
-  `ptrtoint` function addresses as constant expressions, which the constant
-  writer does not fold. `cbe_port.py` reports the tests that need it as skipped
-  rather than failed, matching on the backend's own error message so it cannot
-  hide a different failure. `llvm.global_ctors`
-  (`__attribute__((constructor))`) is supported: those run from `$MSIL_Startup`
-  before `main`.
+  `ptrtoint` function addresses as constant expressions, and the constant
+  writer folds only the shapes it knows. `cbe_port.py` reports the tests that
+  need a shape it does not as skipped rather than failed, matching on the
+  backend's own error message so it cannot hide a different failure.
+  `llvm.global_ctors` (`__attribute__((constructor))`) is supported: those run
+  from `$MSIL_Startup` before `main`, in priority order.
 * **`<N x i128>` vectors are broken.** The aggregate class has no valid IL type
   name, so the output does not assemble. There is a `report_fatal_error` on
   element extract/insert, but a vector-typed parameter or return reaches the
   emitter first and produces empty type names instead. Plain scalars `i128`
   and arrays of `i128` are fine. This should be a single fatal check on any
   i128 vector type.
-* **Integers between 65 and 127 bits** are truncated to `int64` (`i128` itself
-  maps to `Int128`).
-* **Exceptions** raised by `unreachable` / `abort` go through
-  `System.Exception`. Landing pads are not implemented, which is why the C++
-  exception tests in `cbe_port.py` are xfail. A C++ `throw` arrives at the CLR
-  as `SEHException` and terminates the program. This is not a gap that can be
-  closed incrementally: the funclet/personality model has no IL equivalent,
-  and typed catch needs image-relative RTTI this backend does not emit. The
-  reasoning is in `NOTES-unwinding.md`.
+* **Integers between 65 and 127 bits** are promoted to `System.Int128`
+  (`MSILWideIntegers.cpp`), so `_BitInt(65)` and `_BitInt(100)` arithmetic
+  works. What is still fatal is a value wider than 128 bits (`i129` and up),
+  and a call or parameter whose type is one of the odd widths before
+  promotion: the promotion happens inside a function, so a signature that
+  names `i65` has no IL type to print.
+* **C++ exceptions work on an Itanium-ABI triple, and only there.** A C++
+  `throw` propagates, typed and `catch (...)` handlers match, cleanups run on
+  the unwind path, and `rethrow` works, at every optimization level. What makes
+  it possible is that `invoke`/`landingpad`/`resume` have a direct IL shape:
+  each `invoke` becomes its own `.try` around the call and the result store,
+  the handler catches `MSIL.Runtime.CxxException` and stores the exception
+  header, a `landingpad` evaluates its clauses with the runtime's own matcher,
+  and `resume` rethrows. The runtime half lives in `runtime/MSIL.Runtime` (C#,
+  built with `dotnet build`), which follows libc++abi's semantics -- exception
+  header, `[ThreadStatic]` caught-exception stack, base-class matching through
+  `__si_`/`__vmi_class_type_info`. See `NOTES-unwinding.md` for the design and
+  for the list of remaining gaps.
+
+  The limit is the **MSVC** model. Funclets, `__CxxFrameHandler3` and
+  `ThrowInfo` RVAs have no IL equivalent, so a `x86_64-pc-windows-msvc` module
+  has its unwind edges dropped and a `throw` there still arrives at the CLR as
+  `SEHException` and terminates the program. Compile for
+  `x86_64-w64-windows-gnu` or `x86_64-unknown-linux-gnu` to get exceptions.
+  `MSIL.Runtime.dll` has to sit next to the assembled program.
+
+  Not implemented, and no test covers them: `__dynamic_cast`,
+  `std::exception_ptr`/`std::uncaught_exceptions`, the libc++ exception
+  classes, and nested pointer-qualification conversions (`T**` to
+  `const T* const*`). An external typeinfo the runtime does not know
+  (`_ZTISt9exception`) is synthesized as a plain class with that name, so it
+  matches only itself.
 * **Thread-locals** are per-thread and lazily initialized, as described under
   "Globals". Two limits remain: an external (declaration-only) thread-local is
   rejected, and a thread's copy is never freed when the thread ends, because

@@ -116,6 +116,8 @@ jobs:
           curl -fsSL -o FileCheck.cpp "$base/FileCheck/FileCheck.cpp"
           curl -fsSL -o not.cpp "$base/not/not.cpp"
           curl -fsSL -o count.c "$base/count/count.c"
+          curl -fsSL -o yaml2obj.cpp \
+            "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-${LLVM_VERSION}/llvm/tools/yaml2obj/yaml2obj.cpp"
           libs=$("$llvm/bin/llvm-config" --link-static --libs filecheck support demangle)
           ldflags=$("$llvm/bin/llvm-config" --ldflags)
           for t in FileCheck not; do
@@ -123,6 +125,11 @@ jobs:
               $ldflags $libs $sys -o "lit-tools/$t$ext"
           done
           "$llvm/bin/clang" -O2 count.c -I"$llvm/include" -o "lit-tools/count$ext"
+          # yaml2obj synthesises ELF/DLL fixtures for tests that need a binary
+          # object as input. It links against more of LLVM than FileCheck does.
+          "$llvm/bin/clang++" -std=c++17 -fno-rtti -O2 yaml2obj.cpp -I"$llvm/include" \
+            $ldflags $("$llvm/bin/llvm-config" --link-static --libs objectyaml support) \
+            $sys -o "lit-tools/yaml2obj$ext"
           "./lit-tools/FileCheck$ext" --version
           echo "LLVM_TOOLS_DIR=$RUNNER_TEMP/lit-tools" >> "$GITHUB_ENV"
 
