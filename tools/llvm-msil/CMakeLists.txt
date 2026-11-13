@@ -15,6 +15,7 @@ else()
     CodeGen
     Core
     IRReader
+    Linker
     MC
     MSILCodeGen
     MSILInfo
