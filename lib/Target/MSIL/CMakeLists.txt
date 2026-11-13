@@ -129,7 +129,8 @@ set_source_files_properties(MSILWriter.cpp PROPERTIES OBJECT_DEPENDS
 # LLVMMSILCodeGen (when that LLVM was itself built with this project in-tree),
 # so the target gets a suffix while the artifact keeps its name.
 if (USE_SYSTEM_LLVM)
-  add_library(${MSIL_CODEGEN_TARGET} STATIC MSILTargetMachine.cpp MSILWriter.cpp)
+  add_library(${MSIL_CODEGEN_TARGET} STATIC MSILTargetMachine.cpp MSILWriter.cpp
+              MSILWideIntegers.cpp)
   set_target_properties(${MSIL_CODEGEN_TARGET}
     PROPERTIES OUTPUT_NAME LLVMMSILCodeGen)
   # add_library does not apply LLVM's -fno-rtti/-fno-exceptions the way
@@ -146,6 +147,7 @@ else()
   # registration; this target is built as a component library instead.
   add_llvm_component_library(LLVMMSILCodeGen
     MSILTargetMachine.cpp
+    MSILWideIntegers.cpp
     MSILWriter.cpp
 
     LINK_COMPONENTS

@@ -1,5 +1,94 @@
 # Stack unwinding on the CLR: what works, what cannot
 
+## Update 2026-11-12: Itanium landing pads work
+
+Everything below this section was written about the **MSVC** model (funclets,
+`__CxxFrameHandler3`, `ThrowInfo` RVAs), which is what clang emits for the
+`x86_64-pc-windows-msvc` triple. Compile for an Itanium-ABI triple instead
+(`x86_64-unknown-linux-gnu`, or `x86_64-w64-windows-gnu` on a Windows host) and
+the picture is different: `invoke`/`landingpad`/`resume` map onto CIL with no
+block reordering, and typed catch works.
+
+How it is emitted:
+
+* `MSILLowerForeignInvokes` replaces `LowerInvoke` in the pipeline. It only
+  drops unwind edges in functions whose personality is not GNU C/C++
+  (`classifyEHPersonality`), so MSVC funclet IR behaves exactly as before.
+* Each `invoke` gets its own `.try` around the call and the result store. The
+  handler catches only `MSIL.Runtime.CxxException`, stores the exception
+  header pointer in a per-method `'$exn'` local, and `leave`s to a trampoline
+  that does the unwind edge's phi copies and branches to the landing pad. The
+  normal edge `leave`s to a second trampoline. No region spans more than one
+  call, so the IR's block order is kept. Blocker 3 below was wrong: a lexical
+  try region per invoke is enough, and the IL stack is always empty between
+  instructions because every result is stored.
+* `landingpad` evaluates its clauses in order with `CxxAbi.Matches(header,
+  typeinfo)`, and the first match sets the selector to that typeinfo's id. The
+  ids come from one module-wide map that `llvm.eh.typeid.for` is lowered with
+  too, starting at 1, so 0 means nothing matched (cleanup, or fall through to
+  `resume`). Filter clauses (dynamic exception specs) are a fatal error.
+* `resume` calls `CxxAbi.Resume(header)` and `throw`s the result.
+* `__cxa_*`, `std::terminate`, `__cxa_pure_virtual` and the basic
+  `operator new`/`delete` bind to `MSIL.Runtime.CxxAbi` through the existing
+  managed-forwarder path. External RTTI (`_ZTVN10__cxxabiv1*` vtables,
+  fundamental `_ZTI*` typeinfos) is bound in `$MSIL_Init` by
+  `CxxAbi.Symbol(name)`, which hands out stable unmanaged storage.
+
+The runtime (`runtime/MSIL.Runtime`, C#, net9.0) follows libcxxabi's
+semantics:
+
+* An exception header (48 bytes) sits in front of the thrown object.
+* The caught-exception stack is `[ThreadStatic]`.
+* `handlerCount` is negated on rethrow, which is how `__cxa_end_catch` tells a
+  rethrown exception from a finished one.
+* Type kinds are recognised by comparing a typeinfo's vtable pointer with the
+  address points of the runtime's own vtable anchors.
+* Matching covers:
+  * exact type, by address or by mangled name
+  * public, unambiguous base classes through `__si_` and `__vmi_class_type_info`,
+    virtual bases included
+  * pointer-to-class upcasts, `void*` catches, and adding (but not dropping)
+    cv-qualifiers on a pointer catch
+  * `catch (...)`
+* For a pointer catch, `__cxa_begin_catch` returns the pointer value; for
+  anything else, the object's address. Checked against clang's IR for both.
+
+Measured on Windows, .NET 9.0.21, Framework `ilasm` 4.0, LLVM 24 trunk:
+
+* `test/programs/cxx_eh.cpp` matches a native MSVC-ABI build at -O0 to -O3,
+  for both `x86_64-w64-windows-gnu` and `x86_64-unknown-linux-gnu` (the
+  latter with `-msil-lib-map=*=msvcrt.dll`, since this host has no
+  `libc.so.6`).
+* `test/cxx-eh.ll` checks the emitted shape.
+* The Linux host has not been run.
+
+Known differences from native:
+
+* **One-phase unwinding.** Every frame catches and resumes, so cleanups run
+  even when nothing up the stack will catch the exception. Natively the search
+  phase finds no handler and `std::terminate` may run without unwinding
+  (implementation-defined per [except.handle]). An uncaught exception ends as
+  an unhandled
+  `CxxException` on the CLR rather than `abort()`.
+* **Managed exceptions skip C++ handlers.** `catch (...)` and cleanups do not
+  see a `System.Exception` (`abort`, `unreachable`, a managed fault). Natively
+  a foreign exception would run cleanups. Deliberate: `abort` must not be
+  catchable.
+* **Not implemented:**
+  * `__cxa_atexit`/`__dso_handle` (static destructors on ELF)
+  * `__cxa_guard_*`
+  * `__dynamic_cast`
+  * `std::exception_ptr`, `std::uncaught_exceptions`
+  * the libc++ exception classes
+  * nested pointer qualification conversions (`T**` to `const T* const*`)
+* **Unknown external typeinfos.** An external class typeinfo the runtime does
+  not know (`_ZTISt9exception`) is synthesized as a plain class with that name,
+  so it matches only itself.
+* **Deployment.** `MSIL.Runtime.dll` has to sit next to the program. It is
+  built with `dotnet build`, not CMake.
+
+## The MSVC model
+
 Question: can LLVM `landingpad` / `invoke` / `resume` / `__cxa_throw` semantics
 be mapped onto CIL exception handling (`try`/`catch`/`filter`/`finally`,
 `leave`, `throw`, `rethrow`) well enough to pass the C++ exception tests?

@@ -61,7 +61,7 @@ llvm_config.use_default_substitutions()
 llvm_config.add_tool_substitutions(
     ["llvm-msil"], [msil_dir])
 llvm_config.add_tool_substitutions(
-    ["FileCheck", "not", "count"], [config.llvm_tools_dir])
+    ["FileCheck", "not", "count", "yaml2obj"], [config.llvm_tools_dir])
 
 if not os.path.exists(os.path.join(msil_dir,
                                    "llvm-msil" + config.llvm_exe_ext)):

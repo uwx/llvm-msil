@@ -18,6 +18,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
@@ -28,15 +29,21 @@
 
 namespace llvm {
 
+namespace object {
+class ELFObjectFileBase;
+} // namespace object
+
 class IntrinsicLowering;
 class CallBase;
 class IntrinsicInst;
-class BranchInst;
 class BasicBlock;
 class Instruction;
 class VectorType;
 class AtomicRMWInst;
 class AtomicCmpXchgInst;
+class InvokeInst;
+class LandingPadInst;
+class ResumeInst;
 
 /// Emits a whole module as CIL text suitable for `ilasm`.
 ///
@@ -107,6 +114,7 @@ private:
   void printValueLoadAsInt(const Value *V, bool Signed);
 
   void printConstLoad(const Constant *C);
+  void printVectorConstant(const Constant *C);
   void printConstantExpr(const ConstantExpr *CE);
 
   void printPtrLoad(uint64_t N);
@@ -128,6 +136,7 @@ private:
   void printVectorBinary(StringRef Op, const Instruction *Inst,
                         bool ZeroExtLanes = false, bool ShiftOp = false);
   void printVectorCast(unsigned Op, const Value *V, Type *Ty);
+  void printVectorBitcast(const Value *V, Type *Ty);
   void printVectorCmp(unsigned Pred, const Value *L, const Value *R,
                       VectorType *ResTy, bool IsFP);
 
@@ -178,12 +187,12 @@ private:
   /// Leave the va_list slot's cursor on the stack as a native int.
   void printVaCursor(const Value *Ptr);
   void printIntrinsicCall(const IntrinsicInst *II);
-  void printBranchInstruction(const BranchInst *Inst);
+  void printBranchInstruction(const Instruction *Inst);
   void printPHICopy(const BasicBlock *From, const BasicBlock *To);
   void printICmp(unsigned Predicate, const Value *L, const Value *R,
                  bool EmitOperands = true);
-  void printFCmp(unsigned Predicate, const Value *L, const Value *R,
-                 bool EmitOperands = true);
+  void printFCmp(unsigned Predicate, function_ref<void()> LoadL,
+                 function_ref<void()> LoadR);
 
   /// Emit a fresh IL local of \p Ty, used for bitcast punning.
   std::string newTempLocal(Type *Ty);
@@ -199,6 +208,9 @@ private:
 
   /// Emit an `atomicrmw`, leaving the previous value on the stack.
   void printAtomicRMW(const AtomicRMWInst *RMW);
+  /// Leave min/max of two same-typed locals on the stack, as \p Op picks.
+  void printMinMaxOf(AtomicRMWInst::BinOp Op, const std::string &Old,
+                     const std::string &Val, Type *Ty);
   void printAtomicCmpXchg(const AtomicCmpXchgInst *CX);
 
   /// Run \p Body with `$MSIL::atomicLock` held.
@@ -214,6 +226,24 @@ private:
   void printAtomicLock();
 
   //===------------------------------------------------------------------===//
+  // C++ exceptions (Itanium landing pads, runtime in MSIL.Runtime).
+  //===------------------------------------------------------------------===//
+  void printInvoke(const InvokeInst *II);
+  void printLandingPad(const LandingPadInst *LP);
+  void printResume(const ResumeInst *RI);
+  unsigned getEHTypeId(const Value *TypeInfo);
+  static bool isCxxRuntimeFunction(StringRef Name);
+  static bool isRuntimeHookFunction(StringRef Name);
+  static bool isThreadHookFunction(StringRef Name);
+  static bool isCxxRuntimeGlobal(const GlobalVariable &G);
+  bool bindsExternalGlobal(const GlobalVariable &G) const;
+  bool hasCxxRuntimeGlobals() const;
+  bool usesCxxRuntime() const;
+  bool needsInitializer() const;
+  void printCxxRuntimeSymbols();
+  void printAbiVTableRegistrations();
+
+  //===------------------------------------------------------------------===//
   // Module emission.
   //===------------------------------------------------------------------===//
   void lowerIntrinsics(Function &F);
@@ -225,6 +255,7 @@ private:
   StringRef getLibraryForCRT(StringRef Symbol);
   StringRef getLibraryForExports(StringRef Symbol);
   void resolveLibExports();
+  void addElfExports(const object::ELFObjectFileBase &Elf, StringRef Dll);
   void collectPInvokes();
   /// True when any type in \p M needs the Vector<T> assembly reference.
   bool vectorNeeded(Module &M);
@@ -308,6 +339,11 @@ private:
   void printFunctions();
   void printFunction(const Function &F);
   void printAllocHelper();
+  uint64_t getGlobalAlign(const GlobalVariable &G) const;
+  /// Leave the address of a constant global's read-only image on the stack,
+  /// moved to an aligned copy if ilasm placed it short of its alignment.
+  void printImageAddress(const GlobalVariable &G, StringRef Template);
+  void printGlobalAlloc(const GlobalVariable &G);
   void printArgHelper();
   void printModuleStartup();
   void printInitializer();
@@ -411,6 +447,9 @@ private:
 
   /// Set when a narrow atomic access needed `$MSIL::atomicLock`.
   bool NeedsAtomicLock = false;
+
+  DenseMap<const Value *, unsigned> EHTypeIds;
+  bool UsesCxxRuntime = false;
 };
 
 } // namespace llvm

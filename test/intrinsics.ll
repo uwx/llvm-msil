@@ -103,7 +103,7 @@ declare double @llvm.powi.f64.i32(double, i32)
 declare double @llvm.ldexp.f64.i32(double, i32)
 declare i32 @llvm.fptosi.sat.i32.f64(double)
 declare i32 @llvm.scmp.i32.i32(i32, i32)
-declare i32 @llvm.ptrmask.p0.i64(ptr, i64)
+declare ptr @llvm.ptrmask.p0.i64(ptr, i64)
 
 ; powi converts the exponent and calls pow, rather than looping: Math.Pow
 ; keeps the libm accuracy the intrinsic promises.
@@ -146,8 +146,8 @@ define i32 @scmp(i32 %a, i32 %b) {
 ; CHECK: and
 ; CHECK: conv.u
 define ptr @pmask(ptr %p, i64 %m) {
-  %r = call i32 @llvm.ptrmask.p0.i64(ptr %p, i64 %m)
-  ret ptr %p
+  %r = call ptr @llvm.ptrmask.p0.i64(ptr %p, i64 %m)
+  ret ptr %r
 }
 
 declare double @llvm.canonicalize.f64(double)

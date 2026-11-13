@@ -128,6 +128,7 @@ built for the other, which is why the libc is built twice (see below).
 | `-msil-alloc=<asm>:<type>` | Route `malloc`/`free`/`calloc`/`realloc` to methods of that name on your type, so unmanaged allocations can be instrumented. |
 | `-msil-math=0` | Do not bind libm to `System.Math`/`System.MathF`; pinvoke the CRT instead. |
 | `-msil-lib-map='SDL_*=SDL2.dll'` | Bind matching imports to a native library. `*` matches any suffix, and the option repeats. |
+| `-msil-lib=<dll or .so>` | TODO(wam): describe, binds imports a COFF DLL or ELF shared object exports (glibc needs `-msil-lib=libm.so.6`) |
 | `-msil-library` | Emit a library instead of a program: no `.entrypoint`, and a public `MSILInitialize` static method runs `llvm.global_ctors` behind a one-shot guard. Requires `-msil-class-name`. |
 | `-msil-assembly-name=Name` | Name the emitted assembly (default `MSIL`). |
 | `-msil-fp80=double` | Map `x86_fp80` (`long double` on the x86 ELF target) to binary64 instead of rejecting it. Lossy: 53 mantissa bits and an 11-bit exponent instead of 64 and 15, so a value round-trips changed or overflows to infinity. The 16-byte slot, the field offsets and `sizeof` are unchanged; only the value stored in the slot is a `float64`. A long-double libm call with no `System.Math` binding, or a `long double` passed through a vararg, is rejected by name rather than pinvoked with a mismatched signature. |
@@ -137,7 +138,7 @@ built for the other, which is why the libc is built twice (see below).
 | IR | IL |
 |----|-----|
 | `i1` | `bool` |
-| `i2`, `i8`, `i16`, `i32` | `int2`, `int8`, `int16`, `int32` in globals and signatures; `int32` in locals |
+| `i2` ... `i32` | the smallest of `int8`, `int16`, `int32` that holds it in globals and signatures; `int32` in locals |
 | `i33` ... `i64` | `int64` |
 | `i128` | `System.Int128` from `System.Runtime` |
 | `float`, `double` | `float32`, `float64` |
@@ -152,6 +153,7 @@ integer narrower than its CLR register is normalized before a compare, so
 unsigned comparisons see the right high bits. Widths with no CLR type (`i24`
 and friends) cannot be masked by a `conv`; their loads mask to the declared
 width (see below) while their stores stay `int32`.
+TODO(wam): rewrite, a 3/5/6/7-byte load or store is now split into power-of-two pieces (splitOddWidthAccesses), so it never touches the byte past it
 
 ## Library mode
 
@@ -593,6 +595,7 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   hide a different failure. `llvm.global_ctors`
   (`__attribute__((constructor))`) is supported: those run from `$MSIL_Startup`
   before `main`.
+  TODO(wam): recheck, a ptrtoint leaf in an aggregate constant (member function pointers) now loads through printConstantExpr
 * **`<N x i128>` vectors are broken.** The aggregate class has no valid IL type
   name, so the output does not assemble. There is a `report_fatal_error` on
   element extract/insert, but a vector-typed parameter or return reaches the
@@ -601,6 +604,7 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   i128 vector type.
 * **Integers between 65 and 127 bits** are truncated to `int64` (`i128` itself
   maps to `Int128`).
+  TODO(wam): rewrite, these are now promoted to Int128 (MSILWideIntegers.cpp); calls/params and i129+ are still fatal
 * **Exceptions** raised by `unreachable` / `abort` go through
   `System.Exception`. Landing pads are not implemented, which is why the C++
   exception tests in `cbe_port.py` are xfail. A C++ `throw` arrives at the CLR
@@ -608,6 +612,7 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   closed incrementally: the funclet/personality model has no IL equivalent,
   and typed catch needs image-relative RTTI this backend does not emit. The
   reasoning is in `NOTES-unwinding.md`.
+  TODO(wam): rewrite for Itanium landing pads via runtime/MSIL.Runtime (works, MSVC triple still as above), see NOTES-unwinding.md
 * **Thread-locals** are per-thread and lazily initialized, as described under
   "Globals". Two limits remain: an external (declaration-only) thread-local is
   rejected, and a thread's copy is never freed when the thread ends, because

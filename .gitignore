@@ -1,2 +1,4 @@
 .lit_test_times.txt
 build/
+runtime/*/bin/
+runtime/*/obj/
