@@ -61,7 +61,7 @@ if (MSIL_LIBC_CLANG AND MSIL_LIBC_LLVM_LINK)
       add_custom_command(
         OUTPUT "${OBJ}"
         COMMAND "${MSIL_LIBC_CLANG}" -target ${TRIPLE}
-                -ffreestanding -nostdinc -fno-builtin
+                -ffreestanding -nostdinc -fno-builtin -fno-pic
                 -O2 -fno-vectorize -fno-slp-vectorize
                 -S -emit-llvm -w -fno-discard-value-names
                 -o "${OBJ}" "${CMAKE_CURRENT_SOURCE_DIR}/libc/${SRC}"
@@ -144,7 +144,7 @@ if (MSIL_CXXRT_CLANGXX AND MSIL_CXXRT_LLVM_LINK)
       add_custom_command(
         OUTPUT "${OBJ}"
         COMMAND "${MSIL_CXXRT_CLANGXX}" -target ${TRIPLE}
-                -std=c++17 -ffreestanding -nostdinc -nostdinc++
+                -std=c++17 -ffreestanding -nostdinc -nostdinc++ -fno-pic
                 -fno-builtin -fno-exceptions -fno-rtti -fno-threadsafe-statics
                 -O2 -fno-vectorize -fno-slp-vectorize
                 -S -emit-llvm -w -fno-discard-value-names

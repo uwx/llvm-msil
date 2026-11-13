@@ -32,7 +32,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 for f in ctype string stdlib stdio; do
   "$CLANG" -target x86_64-pc-windows-msvc -ffreestanding -nostdinc \
-           -fno-builtin -O2 -fno-vectorize -fno-slp-vectorize \
+           -fno-builtin -fno-pic -O2 -fno-vectorize -fno-slp-vectorize \
            -S -emit-llvm -w -fno-discard-value-names \
            -o "$TMP/$f.ll" "$LIBC/$f.c"
 done

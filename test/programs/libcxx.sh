@@ -11,8 +11,13 @@ set -eu
 MSIL=${1:?usage: libcxx.sh <llvm-msil>}
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/../platform.sh"
-CLANGXX=${CLANGXX:-I:/Downloads/llvm-project-18.1.7/bin/clang++.exe}
 CLANG=${CLANG:-I:/Downloads/llvm-project-18.1.7/bin/clang.exe}
+# The C++ compiler is the one beside the chosen C compiler: CI sets only CLANG,
+# and the two have to be the same build or the native reference means nothing.
+if [ -z "${CLANGXX:-}" ]; then
+  CLANGXX="${CLANG%clang*}clang++"
+  case "$CLANG" in *.exe) CLANGXX="$CLANGXX.exe" ;; esac
+fi
 ILASM=${ILASM:-/tmp/tools/ilasm-core.exe}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
