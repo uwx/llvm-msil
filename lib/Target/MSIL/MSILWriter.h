@@ -55,6 +55,11 @@ public:
 
   explicit MSILWriter(raw_pwrite_stream &Out);
 
+  /// Set once a module has been emitted that references MSIL.Runtime, so the
+  /// driver knows to place the DLL beside the output. A property of the last
+  /// run rather than of the pass, because the pass manager owns the instance.
+  bool emittedRuntimeReference() const { return UsesCxxRuntime; }
+
   bool runOnModule(Module &M) override;
 
 private:
@@ -133,6 +138,11 @@ private:
   void printIndirectSave(const Value *Ptr, const Value *Val);
   void printCastInstruction(unsigned Op, const Value *V, Type *Ty);
   void printWideBinary(unsigned Op, const Value *L, const Value *R);
+  /// The same with the operands pushed by the caller, for a value that lives
+  /// in an IL local rather than in the IR. \p WideR says the right operand is
+  /// an i128 rather than a narrow shift count.
+  void printWideBinaryOn(unsigned Op, function_ref<void()> LoadL,
+                         function_ref<void()> LoadR, bool WideR);
   void printWideICmp(unsigned Pred, const Value *L, const Value *R);
   void printGepInstruction(const User *GEP);
   void printVectorGep(const GEPOperator *GEP);

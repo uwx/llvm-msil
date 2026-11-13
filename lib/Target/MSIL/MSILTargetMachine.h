@@ -18,6 +18,8 @@
 
 namespace llvm {
 
+class MSILWriter;
+
 class MSILTargetMachine : public TargetMachine {
 public:
   MSILTargetMachine(const Target &T, const Triple &TT, StringRef CPU,
@@ -37,7 +39,15 @@ public:
     return &TLOF;
   }
 
+  /// Whether the module emitted last referenced MSIL.Runtime, which decides
+  /// whether the driver has to place its DLL beside the output.
+  bool emittedRuntimeReference() const;
+
 private:
+  /// The writer added by addPassesToEmitFile, so a caller can ask it what the
+  /// emitted module needs. Owned by the pass manager once added.
+  MSILWriter *Writer = nullptr;
+
   /// MSIL emits text, so the section/relocation hooks are never reached; the
   /// few pure virtuals only need to exist.
   class MSILObjectFile : public TargetLoweringObjectFile {

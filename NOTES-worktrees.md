@@ -1,8 +1,27 @@
 # Working on several things at once
 
-The whole backend is one file, so parallel work collides in the same functions.
-Two things make it tractable: a standalone build that takes seconds, and a
-single test gate everyone agrees on.
+The emitter is split by area, so two people working on different parts of it do
+not collide:
+
+| File | Holds |
+|---|---|
+| `MSILWriter.cpp` | the options, `runOnModule`, and the naming/type helpers every area uses |
+| `MSILWriterInstructions.cpp` | values, constants, memory, casts, GEP, comparisons, calls, `printInstruction` |
+| `MSILWriterSIMD.cpp` | the `Vector<T>` lowering and the lane-by-lane fallback |
+| `MSILWriterAtomics.cpp` | `Interlocked`, the CompareExchange loop, the module lock |
+| `MSILWriterEH.cpp` | Itanium landing pads and the `MSIL.Runtime` seam |
+| `MSILWriterFunctions.cpp` | one function's method declaration and body |
+| `MSILWriterIntrinsics.cpp` | the pre-emission IR rewrites |
+| `MSILWriterGlobals.cpp` | type collection, globals, `$MSIL_Init`, `$MSIL_Startup` |
+| `MSILWriterRuntime.cpp` | managed forwarders, the portable libc/C++ runtime link, pinvokes |
+
+`MSILWriter.h` is the class; `MSILWriterShared.h` holds what more than one file
+needs (the options, the IL type spellings, the small type predicates). Anything
+added to the shared header is a dependency between areas, so prefer a member
+function unless the helper is genuinely stateless.
+
+Two things make parallel work tractable: a standalone build that takes seconds,
+and a single test gate everyone agrees on.
 
 ## Setup
 
@@ -51,20 +70,19 @@ taking either side.
 
 ## Gotchas
 
-* A failing `report_fatal_error` raises `abort()`, and the Windows CRT answers
-  that with a modal dialog: the process blocks instead of exiting. Wrap runs in
-  a timeout. LLVM here is built with `LLVM_ENABLE_ASSERTIONS=OFF`, so `assert`
-  cannot fire — the message you want is the `LLVM ERROR:` line on stderr,
-  printed before the dialog appears.
+* A rejection is `llvm-msil: error: <message>` and exit 1: the driver installs
+  its own fatal-error handler, so `report_fatal_error` no longer aborts, raises
+  a modal dialog, or prints a compiler backtrace. LLVM here is built with
+  `LLVM_ENABLE_ASSERTIONS=OFF`, so `assert` cannot fire — an abort from the
+  writer is then a real bug rather than an expected rejection.
 * `llvm-lit` resolves `%llvm-msil` by name in the LLVM tool directory, which is
   not necessarily the binary you are testing. Pass `-D llvm-msil=<binary>` (the
   gate does this) or you will test the wrong build.
 * A build directory whose `CMAKE_CXX_FLAGS_RELEASE` is empty has no `/DNDEBUG`,
   so LLVM's `assert`s are live in *our* code too, even though the LLVM library
   it links was built with assertions off. `assert` then aborts before the
-  `LLVM ERROR:` line and before any dialog, and a pre-existing latent assert in
-  the writer (a bad `cast<>` on some IR) looks like a regression from whatever
-  you last changed. Check `grep CMAKE_CXX_FLAGS_RELEASE build/CMakeCache.txt`
+  diagnostic, and a pre-existing latent assert in the writer (a bad `cast<>`
+  on some IR) looks like a regression from whatever you last changed. Check `grep CMAKE_CXX_FLAGS_RELEASE build/CMakeCache.txt`
   before believing a crash. The stock configure line above produces
   `/O2 /Ob2 /DNDEBUG`; if the cache was made by some other means and reads
   empty, delete `build/` and configure again. Prefer that to matching it, so

@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "MSILWideIntegers.h"
+#include "MSILWriterShared.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallVector.h"
@@ -55,7 +56,7 @@ bool touchesWide(const Instruction &I) {
 [[noreturn]] void unsupported(const Instruction &I) {
   std::string Text;
   raw_string_ostream(Text) << I;
-  report_fatal_error("MSIL: unsupported operation on an integer wider than 64 "
+  fatalError("unsupported operation on an integer wider than 64 "
                      "bits: " +
                      Twine(Text));
 }
@@ -98,7 +99,7 @@ Value *WidePromoter::promoted(Value *V) {
   if (It == Promoted.end()) {
     std::string Text;
     raw_string_ostream(Text) << *V;
-    report_fatal_error("MSIL: a wide integer has no i128 form yet: " +
+    fatalError("a wide integer has no i128 form yet: " +
                        Twine(Text));
   }
   return It->second;
@@ -298,7 +299,7 @@ bool WidePromoter::run() {
       Any |= touchesWide(I);
   for (Argument &A : F.args())
     if (wideWidth(A.getType()))
-      report_fatal_error("MSIL: a parameter wider than 64 bits and narrower "
+      fatalError("a parameter wider than 64 bits and narrower "
                          "than 128 is not supported in " +
                          F.getName());
   if (!Any)

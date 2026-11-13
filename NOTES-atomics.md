@@ -112,6 +112,37 @@ accessibility is checked against its declaring type, and a private `<Module>`
 field is not reachable from inside a class when `-msil-class-name` wraps the
 module's members.
 
+### 16-byte values (i128)
+
+`System.Int128` is a value type, not a primitive: it has no `ldind`/`stind`
+form, and no `Interlocked` overload takes it. `Interlocked` does have a generic
+`CompareExchange<T>(T&, T, T)`, but the JIT rejects the `Int128` instantiation
+with `InvalidProgramException: Common Language Runtime detected an invalid
+program`, so it cannot be used.
+
+| IR | IL |
+|---|---|
+| atomic `load i128` | `volatile. ldobj Int128` |
+| atomic `store i128` | `volatile. stobj Int128` |
+| `atomicrmw xchg/add/sub/and/or/xor` | monitor; the value type's own operators |
+| `cmpxchg` | monitor; `op_Equality` for the compare |
+
+`ldobj`/`stobj` of a type 16 bytes or smaller is a single access by the CLR's
+definition, and the JIT lowers it to one `movups` — a lock `cmpxchg16b` when
+the access is atomic. That is what the native code would use. The monitor is
+the honest fallback for the read-modify-write forms, with the same limit the
+narrow path has: atomic only against other accesses that take the same lock.
+
+What this replaced was worse than slow: `printAtomicLoad` emitted
+`ldind.` with an empty suffix, because `getMemSuffix` returns `""` for a type
+that moves as a blob. That is not IL, so `ilasm` rejected the whole module.
+`has-128-bit-atomics` probed false for the same reason.
+
+clang emits a 16-byte `cmpxchg`/`atomicrmw` only with `-mcx16`. Without it the
+C `__atomic_*` builtins become `__atomic_compare_exchange` and friends, which
+are ordinary external declarations — the program has to link libatomic, on the
+native side too, so this is not a gap in the backend.
+
 ## What "atomic" does and does not cover here
 
 `Interlocked` and `volatile.` are genuinely atomic and ordered, so i32/i64/ptr

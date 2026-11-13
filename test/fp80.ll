@@ -1,8 +1,8 @@
-; RUN: not --crash llvm-msil %s -o - 2>&1 | FileCheck %s --check-prefix=DEFAULT
+; RUN: not llvm-msil %s -o - 2>&1 | FileCheck %s --check-prefix=DEFAULT
 ; RUN: llvm-msil %s -o - -msil-fp80=double | FileCheck %s --check-prefix=FP80
-; RUN: not --crash llvm-msil %S/Inputs/fp80-pinvoke.ll -o - -msil-fp80=double \
+; RUN: not llvm-msil %S/Inputs/fp80-pinvoke.ll -o - -msil-fp80=double \
 ; RUN:   2>&1 | FileCheck %s --check-prefix=PINVOKE
-; RUN: not --crash llvm-msil %S/Inputs/fp80-vararg.ll -o - -msil-fp80=double \
+; RUN: not llvm-msil %S/Inputs/fp80-vararg.ll -o - -msil-fp80=double \
 ; RUN:   2>&1 | FileCheck %s --check-prefix=VARARG
 
 ; x86_fp80 is `long double` on the x86 ELF target, and the CLR has no 80-bit
@@ -20,7 +20,7 @@ target triple = "x86_64-unknown-linux-gnu"
 ; Only the type named in the slot changes.
 %struct.P = type { i32, x86_fp80, i8 }
 
-; DEFAULT: LLVM ERROR: MSIL: unsupported type x86_fp80
+; DEFAULT: error: unsupported type x86_fp80
 
 ; FP80-LABEL: .class value explicit ansi sealed 'struct.P'
 ; FP80: .pack 1
@@ -93,5 +93,5 @@ define i32 @after(ptr %0) {
 ; `float64`. glibc's takes an x87 80-bit value, so that would return a wrong
 ; number rather than fail; the writer refuses instead. See Inputs/.
 ;
-; PINVOKE: LLVM ERROR: MSIL: external 'frexpl' takes or returns x86_fp80
-; VARARG: LLVM ERROR: MSIL: external 'printf' is called with an x86_fp80
+; PINVOKE: error: external 'frexpl' takes or returns x86_fp80
+; VARARG: error: external 'printf' is called with an x86_fp80

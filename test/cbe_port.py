@@ -30,21 +30,26 @@ EXE = ".exe"
 RUNTIMECONFIG = ('{"runtimeOptions":{"tfm":"net9.0","framework":'
                  '{"name":"Microsoft.NETCore.App","version":"9.0.0"}}}')
 
-# Constructs the backend rejects with a deliberate fatal error. A test that
+# Constructs the backend rejects with a deliberate diagnostic. A test that
 # needs one is skipped, not failed: it is a documented gap in the README, not a
 # regression. The message is matched, so the list cannot hide a crash.
+#
+# The backend reports these as `llvm-msil: error: <message>` and exits 1; the
+# old `LLVM ERROR:` prefix and the abort that came with it are gone.
 KNOWN_UNSUPPORTED = (
-    "MSIL: unsupported constant: i64 ptrtoint",  # ptrtoint in a vtable
+    "unsupported constant: i64 ptrtoint",  # ptrtoint in a vtable
     # x86_fp80 (long double). -msil-fp80=double handles it, but the gate runs
     # without the flag so the default stays what it was; the ELF gate has one
     # such test at -O0 (test_declare_long_double), and it passes with the flag.
-    "MSIL: unsupported memory type",
-    "MSIL: unsupported instruction llvm.load.relative",  # ELF PIC switch table
+    "unsupported memory type",
+    "unsupported instruction llvm.load.relative",  # ELF PIC switch table
 )
 
-# A backend failure can raise a Windows error dialog (report_fatal_error calls
-# abort(), and the default CRT puts up a modal box), which would otherwise
-# block this process forever. Time out instead and report it as a failure.
+# A backend failure used to raise a Windows error dialog (report_fatal_error
+# called abort(), and the default CRT puts up a modal box), which blocked this
+# process forever. The driver installs its own fatal-error handler now, so a
+# rejection is one line and exit 1; the timeout stays as a guard for a genuine
+# hang rather than as the expected path.
 RUN_TIMEOUT = int(os.environ.get("MSIL_TEST_TIMEOUT", "120"))
 
 

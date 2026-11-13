@@ -218,19 +218,34 @@ foreach(ENTRY IN LISTS MSIL_LIBC_EMBEDS)
   list(APPEND MSIL_LIBC_INCS "${INC}")
 endforeach()
 add_custom_target(MSILLibcIRInc DEPENDS ${MSIL_LIBC_INCS})
-set_source_files_properties(MSILWriter.cpp PROPERTIES OBJECT_DEPENDS
-                            "${MSIL_LIBC_INCS}")
-if (MSIL_CXXRT_INCS)
-  set_source_files_properties(MSILWriter.cpp PROPERTIES OBJECT_DEPENDS
-                              "${MSIL_CXXRT_INCS}")
-endif()
+
+# The emitter is several translation units: the entry point and the option
+# parsing in MSILWriter.cpp, and one per emission area beside it. They all see
+# the same state through MSILWriter.h and the shared helpers through
+# MSILWriterShared.h.
+set(MSIL_WRITER_SOURCES
+    MSILWriter.cpp
+    MSILWriterAtomics.cpp
+    MSILWriterEH.cpp
+    MSILWriterFunctions.cpp
+    MSILWriterGlobals.cpp
+    MSILWriterInstructions.cpp
+    MSILWriterIntrinsics.cpp
+    MSILWriterRuntime.cpp
+    MSILWriterSIMD.cpp)
+
+# The embedded IR is included by the two units that link the portable
+# libraries, so both have to be rebuilt when it changes.
+set(MSIL_EMBEDDED_INCS ${MSIL_LIBC_INCS} ${MSIL_CXXRT_INCS})
+set_source_files_properties(MSILWriterRuntime.cpp PROPERTIES OBJECT_DEPENDS
+                            "${MSIL_EMBEDDED_INCS}")
 
 # A standalone build links against an LLVM whose export file may already define
 # LLVMMSILCodeGen (when that LLVM was itself built with this project in-tree),
 # so the target gets a suffix while the artifact keeps its name.
 if (USE_SYSTEM_LLVM)
-  add_library(${MSIL_CODEGEN_TARGET} STATIC MSILTargetMachine.cpp MSILWriter.cpp
-              MSILWideIntegers.cpp)
+  add_library(${MSIL_CODEGEN_TARGET} STATIC MSILTargetMachine.cpp
+              ${MSIL_WRITER_SOURCES} MSILWideIntegers.cpp)
   set_target_properties(${MSIL_CODEGEN_TARGET}
     PROPERTIES OUTPUT_NAME LLVMMSILCodeGen)
   # add_library does not apply LLVM's -fno-rtti/-fno-exceptions the way
@@ -248,7 +263,7 @@ else()
   add_llvm_component_library(LLVMMSILCodeGen
     MSILTargetMachine.cpp
     MSILWideIntegers.cpp
-    MSILWriter.cpp
+    ${MSIL_WRITER_SOURCES}
 
     LINK_COMPONENTS
     AsmParser

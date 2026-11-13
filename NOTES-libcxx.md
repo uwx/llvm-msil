@@ -147,12 +147,15 @@ Found by the first full run:
 
 ## Known gaps
 
-* 16-byte atomics: atomic load/store and the locked `cmpxchg`/RMW path all
-  assume `ldind`, so `has-128-bit-atomics` probes false.
-* `_BitInt` wider than 128 bits is a fatal error.
-* `<N x i128>` vectors are fatal. libc++'s vectorized `find` makes
+* 16-byte atomics work (see `NOTES-atomics.md`), but clang emits a 16-byte
+  `cmpxchg` only with `-mcx16`, so `has-128-bit-atomics` still probes false
+  for a default build. A libc++ compiled for this backend should pass
+  `-mcx16`.
+* `_BitInt` wider than 128 bits is rejected by name, not miscompiled.
+* `<N x i128>` vectors are rejected by name. libc++'s vectorized `find` makes
   `<1 x i128>` for `__int128` elements, and `experimental::simd` tests use
-  them throughout (21 tests).
+  them throughout (21 tests). A lane of one has no IL type name, so this needs
+  a lane-by-lane lowering of its own rather than a type-mapping fix.
 * Native code calling a managed function pointer on a thread the CLR doesn't
   know. `pthread_create`, `pthread_key_create` and `pthread_key_delete` are
   bound to MSIL.Runtime in modules that use it, which covers `std::thread`

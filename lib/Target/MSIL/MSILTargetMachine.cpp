@@ -94,8 +94,13 @@ bool MSILTargetMachine::addPassesToEmitFile(
   PM.add(createAtomicExpandLegacyPass());
   PM.add(createExpandReductionsPass());
   PM.add(createPromoteMemoryToRegisterPass());
-  PM.add(new MSILWriter(Out));
+  Writer = new MSILWriter(Out);
+  PM.add(Writer);
   return false;
+}
+
+bool MSILTargetMachine::emittedRuntimeReference() const {
+  return Writer && Writer->emittedRuntimeReference();
 }
 
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMSILTarget() {

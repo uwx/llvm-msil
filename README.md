@@ -97,16 +97,35 @@ dotnet prog.exe
 `-exe`/`-output:` is the .NET Core `ilasm` spelling and works on both hosts;
 the PowerShell `.NET Framework` assembler wants `/exe`/`/output:` instead.
 
-`dotnet prog.exe` needs a `prog.runtimeconfig.json` next to the assembly naming
-`Microsoft.NETCore.App`; without it `dotnet` cannot find the framework. On
-Windows a bare `./prog.exe` also runs, binding the .NET Framework where
-`mscorlib` resolves, and there it needs no runtimeconfig (on Linux there is no
-launcher for a managed PE, so `dotnet` is the only way). Types this backend
-emits (`System.Int128`, `System.Numerics.Vector<T>`, `System.Math`) are modern
-.NET types, so the runtimeconfig is what you want in practice.
+`llvm-msil` writes the two files `dotnet prog.exe` needs beside the `.il`, so
+the recipe above is the whole procedure:
+
+* **`prog.runtimeconfig.json`**, naming `Microsoft.NETCore.App` 9.0. Without it
+  `dotnet` reports that `hostpolicy.dll` is missing, and on Windows a bare
+  `./prog.exe` instead binds the .NET Framework's `mscorlib`, which has neither
+  `Int128` nor `Vector<T>`. The version is a floor: `dotnet` rolls forward to
+  whatever compatible runtime is installed.
+* **`MSIL.Runtime.dll`**, only for a module that uses C++ exceptions. It is
+  copied from beside `llvm-msil` itself (a standalone build puts it there) or
+  from `MSIL_RUNTIME_DIR`. A module that needs it and cannot find it gets a
+  warning, since the assembled program would otherwise fail at run time.
+
+Both are skipped when the output is `-` (stdout), where there is no directory
+to write them into.
 
 The input IR needs a target triple with a data layout, or the writer cannot
 size any aggregate type.
+
+A construct the backend cannot express is one line on stderr and exit 1:
+
+```
+llvm-msil: error: a vector of 128-bit integers has no IL type: <2 x i128>
+```
+
+The message names the symbol or type that caused it. There is no crash banner,
+no stack dump and no dialog: `tools/llvm-msil/llvm-msil.cpp` installs a
+fatal-error handler, so a rejection is a diagnostic rather than an abort. (A
+genuine compiler bug still aborts, which is the distinction worth keeping.)
 
 The IL is the same whichever host emitted it, but three choices do follow the
 module's *triple* rather than the host: which library an unbound import pinvokes
@@ -544,8 +563,9 @@ managed fault do not become catchable C++ exceptions.
 libc++abi's semantics: a 48-byte exception header in front of the thrown
 object, a `[ThreadStatic]` caught-exception stack, a negated handler count on
 rethrow, and base-class matching through `__si_`/`__vmi_class_type_info`. Its
-`MSIL.Runtime.dll` has to be next to the assembled program; `test/programs`
-and the gate's `cxx_eh.sh`/`cxx_eh_runtime.sh` do that.
+`MSIL.Runtime.dll` has to be next to the assembled program, and `llvm-msil`
+puts it there: a standalone build compiles the DLL beside the tool and the
+driver copies it to the output's directory when the module references it.
 
 ### What it costs
 
@@ -618,6 +638,22 @@ on a module-wide monitor. That is atomic against other narrow accesses in the
 same assembly, not against native code or a thread bypassing it. See
 `NOTES-atomics.md`.
 
+**16-byte values** (`i128`, and a struct the data layout rounds to 16 bytes) are
+the same story with a different reason: `Int128` is a value type, not a
+primitive, so it moves with `ldobj`/`stobj` rather than `ldind`/`stind`, and no
+`Interlocked` overload takes it — the generic `CompareExchange<T>` exists but
+the JIT rejects the instantiation as an invalid program. Atomic loads and
+stores are therefore `volatile. ldobj`/`stobj`, which the CLR defines as a
+single access and lowers to one `movups` (a lock `cmpxchg16b` when it is
+atomic); `atomicrmw` and `cmpxchg` take the module-wide monitor, with the
+value type's own operators computing the new value. `test/programs/atomics128`
+compares all of it against a native build.
+
+clang emits those instructions only with `-mcx16`; without it a 16-byte
+`__atomic_*` becomes a `__atomic_compare_exchange` libcall, which is an
+unresolved declaration here as it is for any program that does not link
+libatomic.
+
 ## Tests
 
 `test/` is its own lit suite; `test/run_tests.sh` is the gate, and runs three
@@ -633,7 +669,9 @@ things:
 The end-to-end programs are the ones that find real bugs; the hand-written IR
 tests only cover the cases someone thought to write. They sweep `-O0` to `-O3`,
 which matters: the bugs they have caught so far each appeared at a single
-level. `int128.sh` and `sdl.sh` are self-contained. `sdl.sh` needs SDL2
+level. `atomics128.sh` needs `-mcx16` on both sides, so clang emits a real
+`cmpxchg i128` rather than a libatomic call. `int128.sh` and `sdl.sh` are
+self-contained. `sdl.sh` needs SDL2
 development files: set `SDL2_DIR` to a directory with `include/SDL2` and
 `lib/SDL2.lib`, and `SDL2_BIN` to `SDL2.dll` if it is not in `lib/`. Without
 them the test reports `sdl: skipped` and the gate still passes; it is also
@@ -738,18 +776,18 @@ Both sides of that suite only compare exit codes, so it ports over unchanged.
   backend's own error message so it cannot hide a different failure.
   `llvm.global_ctors` (`__attribute__((constructor))`) is supported: those run
   from `$MSIL_Startup` before `main`, in priority order.
-* **`<N x i128>` vectors are broken.** The aggregate class has no valid IL type
-  name, so the output does not assemble. There is a `report_fatal_error` on
-  element extract/insert, but a vector-typed parameter or return reaches the
-  emitter first and produces empty type names instead. Plain scalars `i128`
-  and arrays of `i128` are fine. This should be a single fatal check on any
-  i128 vector type.
+* **`<N x i128>` vectors are rejected.** A lane of one has no IL type name, so
+  the check is in `getTypeName`, on the vector type itself: a vector-typed
+  parameter or return used to reach the emitter first and produce an empty
+  name, and the per-instruction checks on extract/insert could not see it. The
+  message names the type. Plain scalars `i128` and arrays of `i128` are fine.
 * **Integers between 65 and 127 bits** are promoted to `System.Int128`
   (`MSILWideIntegers.cpp`), so `_BitInt(65)` and `_BitInt(100)` arithmetic
-  works. What is still fatal is a value wider than 128 bits (`i129` and up),
-  and a call or parameter whose type is one of the odd widths before
-  promotion: the promotion happens inside a function, so a signature that
-  names `i65` has no IL type to print.
+  works. What is still rejected is a value wider than 128 bits (`i129` and up),
+  which `getTypeName` refuses by name rather than letting it fall into the
+  int64 slot and be silently truncated, and a call or parameter whose type is
+  one of the odd widths before promotion: the promotion happens inside a
+  function, so a signature that names `i65` has no IL type to print.
 * **C++ exceptions work on an Itanium-ABI triple, and only there.** A C++
   `throw` propagates, typed and `catch (...)` handlers match, cleanups run on
   the unwind path, and `rethrow` works, at every optimization level. What makes
