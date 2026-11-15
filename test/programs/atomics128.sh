@@ -19,7 +19,10 @@ ILASM=${ILASM:-/tmp/tools/ilasm-core.exe}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-"$CLANG" -mcx16 -O1 -w -fno-pic -o "$TMP/native$EXE" "$HERE/atomics128.c"
+# The native reference is a normal hosted build, so it takes no MSIL_CFLAGS:
+# -fno-pic is for the IR the backend consumes, and on Linux it stops a
+# position-dependent object from linking into a PIE executable.
+"$CLANG" -mcx16 -O1 -w -o "$TMP/native$EXE" "$HERE/atomics128.c"
 "$TMP/native$EXE" | tr -d "\r" > "$TMP/want.txt"
 
 fail=0
