@@ -29,6 +29,7 @@
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Target/TargetMachine.h"
 #include "MSILTargetMachine.h"
+#include <cstdlib>
 #include <memory>
 
 using namespace llvm;
@@ -103,8 +104,14 @@ static void writeDeploymentFiles(StringRef ILPath, bool NeedsRuntime) {
   // The runtime is a build artifact of this project, not of the module, so it
   // is located rather than embedded: beside the tool (CMake puts it there for
   // a standalone build), then in MSIL_RUNTIME_DIR.
-  SmallString<256> Exe = sys::fs::getMainExecutable(
-      "", reinterpret_cast<void *>(&writeDeploymentFiles));
+  //
+  // getMainExecutable returns std::string and SmallString's only converting
+  // constructor takes a StringRef, so the intermediate has to be named:
+  // copy-initialization from the std::string would need two user-defined
+  // conversions, which is ill-formed. MSVC accepts it anyway; GCC rejects it,
+  // which is what broke the Linux build.
+  SmallString<256> Exe(StringRef(sys::fs::getMainExecutable(
+      "", reinterpret_cast<void *>(&writeDeploymentFiles))));
   sys::path::remove_filename(Exe);
   SmallVector<SmallString<256>, 3> Dirs;
   Dirs.push_back(Exe);
